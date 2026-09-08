@@ -1,0 +1,14 @@
+# AI Council - Dependencies
+# Install with: pip install -r requirements.txt
+
+# Core (required)
+httpx>=0.25.0      # Async HTTP client for Grok/Gemini APIs
+
+# OpenAI (for GPT-4 reviews)
+openai>=1.0.0
+
+# File watching (optional - for daemon mode)
+watchdog>=3.0.0
+
+# Future: Google Gemini
+# google-generativeai>=0.3.0
