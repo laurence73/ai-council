@@ -211,6 +211,32 @@ python ai_council.py watch --path "C:\your\project"
 | `--power` | `-p` | Use premium models (higher cost) |
 | `--html` | | Generate HTML report |
 | `--output` | `-o` | Custom output path for HTML |
+| `--issues` | | Create GitHub issues for consensus findings |
+| `--issues-all` | | Create GitHub issues for ALL findings |
+| `--repo` | | Target repo for issues (default: current git repo) |
+
+---
+
+## Auto-Create GitHub Issues
+
+Automatically create GitHub issues for problems found during code review:
+
+```bash
+# Create issues in current repo (consensus findings only)
+python ai_council.py review myfile.cs --issues
+
+# Create issues in a specific repo
+python ai_council.py review myfile.cs --issues --repo owner/repo
+
+# Create issues for ALL findings (not just consensus)
+python ai_council.py review myfile.cs --issues-all
+```
+
+Issues are created with:
+- Severity-based labels (critical, high, medium, low)
+- File path and line number
+- Full description and recommendation
+- List of models that found the issue
 
 ---
 
