@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Council Review - StatusBadge.razor</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🤖</text></svg>">
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+        :root {
+            --indigo-500: #6366f1; --indigo-400: #818cf8; --purple-500: #a855f7;
+            --cyan-500: #06b6d4; --cyan-400: #22d3ee; --zinc-900: #18181b;
+            --zinc-800: #27272a; --zinc-700: #3f3f46; --zinc-600: #52525b;
+            --zinc-500: #71717a; --zinc-400: #a1a1aa; --emerald-500: #10b981;
+            --emerald-400: #34d399; --rose-500: #f43f5e; --amber-500: #f59e0b;
+            --bg-dark: #09090b; --text-primary: #fafafa; --text-secondary: #a1a1aa;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Inter', -apple-system, sans-serif;
+            background: var(--bg-dark); color: var(--text-primary);
+            line-height: 1.7; font-size: 16px; padding: 2rem;
+        }
+        .container { max-width: 900px; margin: 0 auto; }
+        .header {
+            background: linear-gradient(135deg, var(--zinc-900), var(--zinc-800));
+            border: 1px solid var(--zinc-700); border-radius: 16px;
+            padding: 2rem; margin-bottom: 2rem; position: relative; overflow: hidden;
+        }
+        .header::before {
+            content: ''; position: absolute; top: 0; left: 0; right: 0; height: 4px;
+            background: linear-gradient(90deg, var(--indigo-500), var(--purple-500), var(--cyan-500));
+        }
+        .header h1 {
+            font-size: 1.75rem; font-weight: 700; margin-bottom: 0.5rem;
+            background: linear-gradient(135deg, var(--indigo-400), var(--cyan-400));
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+        }
+        .header .meta { color: var(--zinc-400); font-size: 0.875rem; }
+        .score-grid {
+            display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem; margin-bottom: 2rem;
+        }
+        .score-card {
+            background: var(--zinc-800); border: 1px solid var(--zinc-700);
+            border-radius: 12px; padding: 1.5rem; text-align: center;
+        }
+        .score-card.gpt { border-top: 4px solid #10a37f; }
+        .score-card.grok { border-top: 4px solid #1da1f2; }
+        .score-card.gemini { border-top: 4px solid #8e44ad; }
+        .score-card.consensus { border-top: 4px solid var(--indigo-500); }
+        .score-card h3 { font-size: 0.875rem; color: var(--zinc-400); margin-bottom: 0.5rem; }
+        .score-card .score { font-size: 2.5rem; font-weight: 700; }
+        .score-card .score.good { color: var(--emerald-400); }
+        .score-card .score.medium { color: var(--amber-500); }
+        .score-card .score.bad { color: var(--rose-500); }
+        .section {
+            background: var(--zinc-800); border: 1px solid var(--zinc-700);
+            border-radius: 12px; padding: 1.5rem; margin-bottom: 1.5rem;
+        }
+        .section h2 {
+            font-size: 1.1rem; font-weight: 600; margin-bottom: 1rem;
+            padding-bottom: 0.5rem; border-bottom: 1px solid var(--zinc-700);
+            display: flex; align-items: center; gap: 0.5rem;
+        }
+        .issue {
+            background: var(--zinc-900); border-radius: 8px; padding: 1rem;
+            margin-bottom: 0.75rem; border-left: 4px solid var(--zinc-600);
+        }
+        .issue.critical { border-left-color: #dc2626; }
+        .issue.high { border-left-color: #ea580c; }
+        .issue.medium { border-left-color: var(--amber-500); }
+        .issue.low { border-left-color: var(--cyan-500); }
+        .issue.info { border-left-color: var(--zinc-500); }
+        .issue-header { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.5rem; }
+        .badge {
+            display: inline-block; padding: 0.2em 0.6em; font-size: 0.7rem;
+            font-weight: 600; border-radius: 4px; text-transform: uppercase;
+        }
+        .badge.critical { background: #dc2626; color: white; }
+        .badge.high { background: #ea580c; color: white; }
+        .badge.medium { background: var(--amber-500); color: black; }
+        .badge.low { background: var(--cyan-500); color: white; }
+        .badge.info { background: var(--zinc-600); color: var(--text-secondary); }
+        .issue-line { font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; color: var(--zinc-400); }
+        .issue-desc { color: var(--text-secondary); font-size: 0.9rem; }
+        .issue-rec { color: var(--emerald-400); font-size: 0.85rem; margin-top: 0.5rem; font-style: italic; }
+        .model-tag {
+            font-size: 0.65rem; padding: 0.15em 0.4em; border-radius: 3px;
+            background: var(--zinc-700); color: var(--zinc-400);
+        }
+        .summary { color: var(--text-secondary); font-size: 0.9rem; margin-bottom: 1rem; }
+        .footer { text-align: center; margin-top: 2rem; color: var(--zinc-500); font-size: 0.8rem; }
+        code { font-family: 'JetBrains Mono', monospace; background: var(--zinc-900); padding: 0.1em 0.3em; border-radius: 3px; font-size: 0.85em; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🤖 AI Council Review</h1>
+            <div class="meta">
+                <strong>StatusBadge.razor</strong> &bull; 2026-09-09 11:55:45
+            </div>
+        </div>
+
+        <div class="score-grid">
+
+            <div class="score-card gpt">
+                <h3>GPT-4</h3>
+                <div class="score good">7/10</div>
+                <div style="color: var(--zinc-400); font-size: 0.8rem;">7 issues</div>
+            </div>
+
+            <div class="score-card grok">
+                <h3>GROK</h3>
+                <div class="score medium">5/10</div>
+                <div style="color: var(--zinc-400); font-size: 0.8rem;">5 issues</div>
+            </div>
+
+            <div class="score-card consensus">
+                <h3>CONSENSUS</h3>
+                <div class="score medium">6.0/10</div>
+                <div style="color: var(--zinc-400); font-size: 0.8rem;">0 agreed issues</div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>🧠 GPT-4 Review</h2>
+            <div class="summary">The component handles badge display with customizable parameters for text, icons, size, and shape. While it generally follows good practices for a UI component, there are concerns regarding potential XSS vulnerabilities, default parameter values, and scalability of CSS class management. Improvements in input validation, documentation, and dynamic class handling could enhance maintainability and security.</div>
+
+            <div class="issue medium">
+                <div class="issue-header">
+                    <span class="badge medium">MEDIUM</span>
+                    <span class="issue-line">Line 6</span>
+                </div>
+                <div class="issue-desc">Potential XSS vulnerability due to direct use of user input in class attribute.</div>
+                <div class='issue-rec'>💡 Sanitize and validate the 'Icon' parameter to ensure it does not contain malicious content or use a predefined list of allowed icons.</div>
+            </div>
+
+            <div class="issue low">
+                <div class="issue-header">
+                    <span class="badge low">LOW</span>
+                    <span class="issue-line">Line 6</span>
+                </div>
+                <div class="issue-desc">Icon size class is hardcoded and may not be consistent with other design elements.</div>
+                <div class='issue-rec'>💡 Use a more flexible approach for defining icon sizes, possibly through CSS classes or a style configuration object.</div>
+            </div>
+
+            <div class="issue low">
+                <div class="issue-header">
+                    <span class="badge low">LOW</span>
+                    <span class="issue-line">Line 14</span>
+                </div>
+                <div class="issue-desc">The default value of 'Status' might not be intuitive as it does not convey a specific visual representation.</div>
+                <div class='issue-rec'>💡 Consider using a more descriptive default status or document the default behavior clearly.</div>
+            </div>
+
+            <div class="issue info">
+                <div class="issue-header">
+                    <span class="badge info">INFO</span>
+                    <span class="issue-line">Line 21</span>
+                </div>
+                <div class="issue-desc">The 'Size' parameter defaults to 'Medium', which may not be expected in all use cases.</div>
+                <div class='issue-rec'>💡 Document the default size or provide a configuration option to set global defaults.</div>
+            </div>
+
+            <div class="issue info">
+                <div class="issue-header">
+                    <span class="badge info">INFO</span>
+                    <span class="issue-line">Line 28</span>
+                </div>
+                <div class="issue-desc">The 'Uppercase' parameter is false by default, which might not align with user expectations for badge components.</div>
+                <div class='issue-rec'>💡 Consider the typical use case and possibly default to true if uppercase is commonly expected, or document this behavior clearly.</div>
+            </div>
+
+            <div class="issue low">
+                <div class="issue-header">
+                    <span class="badge low">LOW</span>
+                    <span class="issue-line">Line 67</span>
+                </div>
+                <div class="issue-desc">The use of multiple CSS classes based on component state could lead to maintenance challenges as the number of states grows.</div>
+                <div class='issue-rec'>💡 Refactor to use a more scalable approach such as CSS-in-JS or a class management library to handle dynamic class names.</div>
+            </div>
+
+            <div class="issue low">
+                <div class="issue-header">
+                    <span class="badge low">LOW</span>
+                    <span class="issue-line">Line 107</span>
+                </div>
+                <div class="issue-desc">The method 'GetBadgeClasses' constructs a string of classes in a way that might include unnecessary spaces, leading to untidy HTML output.</div>
+                <div class='issue-rec'>💡 Refine the string construction to avoid leading or trailing spaces when some conditions do not add classes.</div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>⚡ GROK Review</h2>
+            <div class="summary">Functional component with significant maintainability issues due to nested enums and a monolithic switch. Minor code quality problems with string construction and default behavior. No critical bugs or security issues.</div>
+
+            <div class="issue medium">
+                <div class="issue-header">
+                    <span class="badge medium">MEDIUM</span>
+                    <span class="issue-line">Line 102</span>
+                </div>
+                <div class="issue-desc">Enums (BadgeStatus, BadgeSize, BadgeVariant) are defined inside the Razor component's @code block, making them nested types. This leads to verbose usage like StatusBadge.BadgeStatus.Active and prevents clean reuse outside the component.</div>
+                <div class='issue-rec'>💡 Move the three enums to a separate C# file (e.g. Enums/BadgeEnums.cs) in the project. Update the component to reference the top-level enums.</div>
+            </div>
+
+            <div class="issue medium">
+                <div class="issue-header">
+                    <span class="badge medium">MEDIUM</span>
+                    <span class="issue-line">Line 59</span>
+                </div>
+                <div class="issue-desc">GetBadgeClasses() contains a single massive switch expression (~35 cases) that hardcodes all status-to-CSS mappings. This is difficult to maintain, test, and extend.</div>
+                <div class='issue-rec'>💡 Extract the color mapping into a static dictionary, use enum member attributes with reflection, or create a small dedicated mapper class/service.</div>
+            </div>
+
+            <div class="issue low">
+                <div class="issue-header">
+                    <span class="badge low">LOW</span>
+                    <span class="issue-line">Line 99</span>
+                </div>
+                <div class="issue-desc">Class string is built via interpolation with optional values. When Uppercase=false or Class=null, this produces multiple consecutive spaces in the final class attribute.</div>
+                <div class='issue-rec'>💡 Use string.Join(" ", parts.Where(p => !string.IsNullOrWhiteSpace(p))) or a conditional builder to generate clean class strings.</div>
+            </div>
+
+            <div class="issue low">
+                <div class="issue-header">
+                    <span class="badge low">LOW</span>
+                    <span class="issue-line">Line 10</span>
+                </div>
+                <div class="issue-desc">When Text is null and Status is the default (BadgeStatus.Default), the component renders the literal text "Default", which is likely not intended for end users.</div>
+                <div class='issue-rec'>💡 Either change the default Status value, treat Default as empty, or add special handling in GetBadgeClasses() / the markup to suppress or customize the Default case.</div>
+            </div>
+
+            <div class="issue info">
+                <div class="issue-header">
+                    <span class="badge info">INFO</span>
+                    <span class="issue-line">Line 7</span>
+                </div>
+                <div class="issue-desc">The component mixes Bootstrap Icons (bi- prefix) with Tailwind utility classes. This creates a dependency on two different styling systems.</div>
+                <div class='issue-rec'>💡 Standardize on one framework (preferably Tailwind if the rest of the app uses it) or document the dual dependency clearly.</div>
+            </div>
+        </div>
+
+        <div class="footer">
+            Generated by AI Council &bull; Multi-Model Code Review System<br>
+            <a href="https://github.com/laurence73/ai-council" style="color: var(--indigo-400);">github.com/laurence73/ai-council</a>
+        </div>
+    </div>
+</body>
+</html>

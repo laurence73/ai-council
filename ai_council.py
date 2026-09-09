@@ -14,6 +14,20 @@ from datetime import datetime
 from typing import Optional
 import os
 
+# Load .env file if it exists
+def load_env_file():
+    env_path = Path(__file__).parent / ".env"
+    if env_path.exists():
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, value = line.split("=", 1)
+                    if key not in os.environ:  # Don't override existing env vars
+                        os.environ[key] = value
+
+load_env_file()
+
 # Optional imports - install as needed
 try:
     import openai
