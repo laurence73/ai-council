@@ -1,0 +1,977 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Council - Multi-Model Code Review System</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🤖</text></svg>">
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+        :root {
+            --indigo-500: #6366f1;
+            --indigo-400: #818cf8;
+            --indigo-600: #4f46e5;
+            --indigo-700: #4338ca;
+            --purple-500: #a855f7;
+            --purple-400: #c084fc;
+            --cyan-500: #06b6d4;
+            --cyan-400: #22d3ee;
+            --zinc-900: #18181b;
+            --zinc-800: #27272a;
+            --zinc-700: #3f3f46;
+            --zinc-600: #52525b;
+            --zinc-500: #71717a;
+            --zinc-400: #a1a1aa;
+            --zinc-300: #d4d4d8;
+            --emerald-500: #10b981;
+            --emerald-400: #34d399;
+            --rose-500: #f43f5e;
+            --rose-400: #fb7185;
+            --amber-500: #f59e0b;
+            --bg-dark: #09090b;
+            --bg-surface: #18181b;
+            --text-primary: #fafafa;
+            --text-secondary: #a1a1aa;
+            --text-muted: #71717a;
+            --border-subtle: rgba(255, 255, 255, 0.06);
+            --border-default: rgba(255, 255, 255, 0.1);
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--bg-dark);
+            color: var(--text-primary);
+            line-height: 1.7;
+            font-size: 16px;
+        }
+
+        .header {
+            background: linear-gradient(135deg, var(--zinc-900) 0%, var(--zinc-800) 100%);
+            border-bottom: 1px solid var(--border-default);
+            padding: 2rem 0;
+            position: relative;
+        }
+
+        .header::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 0; right: 0;
+            height: 4px;
+            background: linear-gradient(90deg, var(--indigo-600), var(--purple-500), var(--cyan-500));
+        }
+
+        .header-content {
+            max-width: 1100px;
+            margin: 0 auto;
+            padding: 0 2rem;
+            display: flex;
+            align-items: center;
+            gap: 1.5rem;
+        }
+
+        .logo-container {
+            width: 72px;
+            height: 72px;
+            background: linear-gradient(135deg, var(--indigo-500), var(--purple-500));
+            border-radius: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 2.5rem;
+            box-shadow: 0 8px 32px rgba(99, 102, 241, 0.3);
+        }
+
+        .brand-info h1 {
+            font-size: 2rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, var(--indigo-400) 0%, var(--cyan-400) 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .brand-info p {
+            color: var(--text-muted);
+            font-size: 1rem;
+            margin-top: 0.25rem;
+        }
+
+        .container {
+            max-width: 1100px;
+            margin: 0 auto;
+            padding: 2rem;
+        }
+
+        .hero {
+            text-align: center;
+            padding: 3rem 0;
+            border-bottom: 1px solid var(--border-subtle);
+            margin-bottom: 2rem;
+        }
+
+        .hero h2 {
+            font-size: 2.5rem;
+            font-weight: 700;
+            margin-bottom: 1rem;
+            background: linear-gradient(135deg, var(--text-primary) 0%, var(--zinc-400) 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .hero p {
+            font-size: 1.25rem;
+            color: var(--text-secondary);
+            max-width: 700px;
+            margin: 0 auto;
+        }
+
+        .model-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 1.5rem;
+            margin: 2rem 0;
+        }
+
+        .model-card {
+            background: var(--zinc-800);
+            border: 1px solid var(--zinc-700);
+            border-radius: 16px;
+            padding: 1.5rem;
+            text-align: center;
+            transition: all 0.3s ease;
+        }
+
+        .model-card:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+        }
+
+        .model-card.gpt { border-top: 4px solid #10a37f; }
+        .model-card.grok { border-top: 4px solid #1da1f2; }
+        .model-card.gemini { border-top: 4px solid #8e44ad; }
+
+        .model-icon {
+            width: 64px;
+            height: 64px;
+            margin: 0 auto 1rem;
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 2rem;
+        }
+
+        .model-card.gpt .model-icon { background: rgba(16, 163, 127, 0.2); }
+        .model-card.grok .model-icon { background: rgba(29, 161, 242, 0.2); }
+        .model-card.gemini .model-icon { background: rgba(142, 68, 173, 0.2); }
+
+        .model-card h3 {
+            font-size: 1.25rem;
+            font-weight: 600;
+            margin-bottom: 0.5rem;
+        }
+
+        .model-card p {
+            color: var(--text-muted);
+            font-size: 0.875rem;
+        }
+
+        .model-card .model-id {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.75rem;
+            color: var(--cyan-400);
+            background: var(--zinc-900);
+            padding: 0.25rem 0.5rem;
+            border-radius: 4px;
+            margin-top: 0.75rem;
+            display: inline-block;
+        }
+
+        h2 {
+            font-size: 1.5rem;
+            font-weight: 600;
+            padding-bottom: 0.5rem;
+            border-bottom: 2px solid var(--indigo-500);
+            margin-top: 3rem;
+            margin-bottom: 1rem;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        h2 .icon {
+            width: 32px;
+            height: 32px;
+            background: linear-gradient(135deg, var(--indigo-500), var(--purple-500));
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1rem;
+        }
+
+        h3 {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: var(--zinc-300);
+            margin-top: 1.5rem;
+            margin-bottom: 0.75rem;
+        }
+
+        p { margin-bottom: 0.75rem; color: var(--text-secondary); }
+        strong { color: var(--text-primary); font-weight: 600; }
+
+        .step-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 1.5rem;
+            margin: 1.5rem 0;
+        }
+
+        .step-card {
+            background: var(--zinc-800);
+            border: 1px solid var(--zinc-700);
+            border-radius: 12px;
+            padding: 1.5rem;
+            position: relative;
+        }
+
+        .step-number {
+            position: absolute;
+            top: -12px;
+            left: 20px;
+            width: 32px;
+            height: 32px;
+            background: linear-gradient(135deg, var(--indigo-500), var(--cyan-500));
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            font-size: 0.875rem;
+            box-shadow: 0 4px 12px rgba(99, 102, 241, 0.4);
+        }
+
+        .step-card h4 {
+            font-size: 1rem;
+            font-weight: 600;
+            margin-bottom: 0.5rem;
+            margin-top: 0.5rem;
+        }
+
+        .step-card p {
+            font-size: 0.875rem;
+            margin-bottom: 0;
+        }
+
+        pre {
+            background: var(--zinc-900);
+            border: 1px solid var(--zinc-700);
+            border-radius: 8px;
+            padding: 1rem;
+            overflow-x: auto;
+            margin: 1rem 0;
+            position: relative;
+        }
+
+        pre::before {
+            content: attr(data-lang);
+            position: absolute;
+            top: 0.5rem;
+            right: 0.75rem;
+            font-size: 0.65rem;
+            color: var(--zinc-500);
+            text-transform: uppercase;
+            font-weight: 600;
+        }
+
+        code {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.875rem;
+            color: var(--cyan-400);
+        }
+
+        pre code {
+            color: var(--text-secondary);
+        }
+
+        .code-comment { color: var(--zinc-500); }
+        .code-string { color: var(--emerald-400); }
+        .code-keyword { color: var(--purple-400); }
+        .code-function { color: var(--indigo-400); }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 1rem 0;
+            font-size: 0.875rem;
+            border-radius: 8px;
+            overflow: hidden;
+            border: 1px solid var(--zinc-700);
+        }
+
+        th {
+            background: linear-gradient(135deg, var(--indigo-500) 0%, var(--indigo-600) 100%);
+            color: white;
+            font-weight: 600;
+            text-align: left;
+            padding: 0.75rem 1rem;
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        td {
+            padding: 0.75rem 1rem;
+            border-bottom: 1px solid var(--zinc-700);
+            color: var(--text-secondary);
+            background: var(--zinc-800);
+        }
+
+        tr:hover td { background: var(--zinc-700); }
+
+        .badge {
+            display: inline-block;
+            padding: 0.2em 0.6em;
+            font-size: 0.7rem;
+            font-weight: 600;
+            border-radius: 4px;
+            text-transform: uppercase;
+        }
+
+        .badge.success { background: var(--emerald-500); color: white; }
+        .badge.warning { background: var(--amber-500); color: black; }
+        .badge.info { background: var(--cyan-500); color: white; }
+        .badge.muted { background: var(--zinc-600); color: var(--text-secondary); }
+
+        .command-box {
+            background: linear-gradient(135deg, rgba(99, 102, 241, 0.1) 0%, rgba(6, 182, 212, 0.05) 100%);
+            border: 1px solid var(--indigo-500);
+            border-radius: 12px;
+            padding: 1.25rem;
+            margin: 1rem 0;
+        }
+
+        .command-box h4 {
+            color: var(--indigo-400);
+            font-size: 0.875rem;
+            font-weight: 600;
+            margin-bottom: 0.75rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .command-box pre {
+            margin: 0;
+            background: var(--zinc-900);
+        }
+
+        .architecture {
+            background: var(--zinc-800);
+            border: 1px solid var(--zinc-700);
+            border-radius: 12px;
+            padding: 2rem;
+            margin: 2rem 0;
+        }
+
+        .arch-flow {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .arch-box {
+            background: var(--zinc-900);
+            border: 2px solid var(--zinc-600);
+            border-radius: 12px;
+            padding: 1rem 2rem;
+            text-align: center;
+            min-width: 200px;
+        }
+
+        .arch-box.primary {
+            border-color: var(--indigo-500);
+            box-shadow: 0 0 20px rgba(99, 102, 241, 0.2);
+        }
+
+        .arch-box h5 {
+            font-size: 0.875rem;
+            font-weight: 600;
+            margin-bottom: 0.25rem;
+        }
+
+        .arch-box p {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            margin: 0;
+        }
+
+        .arch-arrow {
+            color: var(--indigo-400);
+            font-size: 1.5rem;
+        }
+
+        .arch-row {
+            display: flex;
+            gap: 1.5rem;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+
+        .arch-row .arch-box {
+            flex: 1;
+            min-width: 150px;
+            max-width: 200px;
+        }
+
+        .arch-row .arch-box.gpt { border-color: #10a37f; }
+        .arch-row .arch-box.grok { border-color: #1da1f2; }
+        .arch-row .arch-box.gemini { border-color: #8e44ad; }
+
+        .feature-list {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 1rem;
+            margin: 1.5rem 0;
+        }
+
+        .feature-item {
+            display: flex;
+            gap: 0.75rem;
+            padding: 1rem;
+            background: var(--zinc-800);
+            border-radius: 8px;
+            border: 1px solid var(--zinc-700);
+        }
+
+        .feature-icon {
+            width: 40px;
+            height: 40px;
+            background: linear-gradient(135deg, var(--indigo-500), var(--purple-500));
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+        }
+
+        .feature-text h4 {
+            font-size: 0.9rem;
+            font-weight: 600;
+            margin-bottom: 0.25rem;
+        }
+
+        .feature-text p {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            margin: 0;
+        }
+
+        .tip-box {
+            background: rgba(16, 185, 129, 0.1);
+            border: 1px solid var(--emerald-500);
+            border-radius: 8px;
+            padding: 1rem;
+            margin: 1rem 0;
+            display: flex;
+            gap: 0.75rem;
+        }
+
+        .tip-box.warning {
+            background: rgba(245, 158, 11, 0.1);
+            border-color: var(--amber-500);
+        }
+
+        .tip-icon {
+            font-size: 1.25rem;
+            flex-shrink: 0;
+        }
+
+        .tip-content h4 {
+            font-size: 0.875rem;
+            font-weight: 600;
+            color: var(--emerald-400);
+            margin-bottom: 0.25rem;
+        }
+
+        .tip-box.warning .tip-content h4 {
+            color: var(--amber-500);
+        }
+
+        .tip-content p {
+            font-size: 0.875rem;
+            margin: 0;
+        }
+
+        .footer {
+            margin-top: 4rem;
+            padding: 2rem;
+            border-top: 1px solid var(--zinc-700);
+            background: var(--zinc-900);
+            text-align: center;
+        }
+
+        .footer-brand {
+            font-weight: 700;
+            font-size: 1.25rem;
+            background: linear-gradient(135deg, var(--indigo-400), var(--cyan-400));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-bottom: 0.5rem;
+        }
+
+        .footer-tagline { color: var(--text-muted); font-size: 0.875rem; margin-bottom: 1rem; }
+
+        .footer-links {
+            display: flex;
+            justify-content: center;
+            gap: 2rem;
+            margin-top: 1rem;
+        }
+
+        .footer-links a {
+            color: var(--indigo-400);
+            text-decoration: none;
+            font-size: 0.875rem;
+        }
+
+        .footer-links a:hover { text-decoration: underline; }
+
+        @media (max-width: 768px) {
+            .model-grid { grid-template-columns: 1fr; }
+            .feature-list { grid-template-columns: 1fr; }
+            .arch-row { flex-direction: column; align-items: center; }
+            .header-content { flex-direction: column; text-align: center; }
+        }
+
+        @media print {
+            body { background: white; color: #1a1a1a; }
+            .header { background: linear-gradient(135deg, #6366f1, #06b6d4) !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+            pre { border: 1px solid #d1d5db; background: #f9fafb; }
+            code { color: #1a1a1a; }
+        }
+    </style>
+</head>
+<body>
+    <header class="header">
+        <div class="header-content">
+            <div class="logo-container">🤖</div>
+            <div class="brand-info">
+                <h1>AI Council</h1>
+                <p>Multi-Model Code Review System</p>
+            </div>
+        </div>
+    </header>
+
+    <main class="container">
+        <section class="hero">
+            <h2>Get a Second (and Third) Opinion</h2>
+            <p>Run your code through GPT-4, Grok, and Gemini in parallel. When multiple AIs agree on an issue, you know it's worth fixing.</p>
+        </section>
+
+        <div class="model-grid">
+            <div class="model-card gpt">
+                <div class="model-icon">🧠</div>
+                <h3>GPT-4 Turbo</h3>
+                <p>OpenAI's flagship model. Excellent at design patterns, .NET/Java idioms, and architectural concerns.</p>
+                <span class="model-id">gpt-4-turbo</span>
+            </div>
+            <div class="model-card grok">
+                <div class="model-icon">⚡</div>
+                <h3>Grok Build</h3>
+                <p>xAI's code-optimized model. Direct feedback, less filtered, catches edge cases others miss.</p>
+                <span class="model-id">grok-build-0.1</span>
+            </div>
+            <div class="model-card gemini">
+                <div class="model-icon">💎</div>
+                <h3>Gemini Pro</h3>
+                <p>Google's model with different training data. Great for catching unique issues.</p>
+                <span class="model-id">gemini-pro</span>
+            </div>
+        </div>
+
+        <h2><span class="icon">🚀</span> Quick Start</h2>
+
+        <div class="step-grid">
+            <div class="step-card">
+                <div class="step-number">1</div>
+                <h4>Install Dependencies</h4>
+                <p>Clone the repo and install Python packages.</p>
+            </div>
+            <div class="step-card">
+                <div class="step-number">2</div>
+                <h4>Set API Keys</h4>
+                <p>Add your OpenAI and xAI keys as environment variables.</p>
+            </div>
+            <div class="step-card">
+                <div class="step-number">3</div>
+                <h4>Run Reviews</h4>
+                <p>Use the CLI to review files or enable watch mode.</p>
+            </div>
+        </div>
+
+        <h3>Step 1: Install</h3>
+        <pre data-lang="bash"><code><span class="code-comment"># Clone the repository</span>
+git clone https://github.com/laurence73/ai-council.git
+<span class="code-keyword">cd</span> ai-council
+
+<span class="code-comment"># Install Python dependencies</span>
+pip install -r requirements.txt</code></pre>
+
+        <h3>Step 2: Configure API Keys</h3>
+        <pre data-lang="powershell"><code><span class="code-comment"># PowerShell (permanent - restart terminal after)</span>
+[Environment]::SetEnvironmentVariable(<span class="code-string">"OPENAI_API_KEY"</span>, <span class="code-string">"sk-..."</span>, <span class="code-string">"User"</span>)
+[Environment]::SetEnvironmentVariable(<span class="code-string">"XAI_API_KEY"</span>, <span class="code-string">"xai-..."</span>, <span class="code-string">"User"</span>)</code></pre>
+
+        <table>
+            <tr>
+                <th>Model</th>
+                <th>Environment Variable</th>
+                <th>Get API Key</th>
+            </tr>
+            <tr>
+                <td><strong>GPT-4</strong></td>
+                <td><code>OPENAI_API_KEY</code></td>
+                <td><a href="https://platform.openai.com/api-keys" style="color: var(--indigo-400)">platform.openai.com/api-keys</a></td>
+            </tr>
+            <tr>
+                <td><strong>Grok</strong></td>
+                <td><code>XAI_API_KEY</code></td>
+                <td><a href="https://console.x.ai/" style="color: var(--indigo-400)">console.x.ai</a></td>
+            </tr>
+            <tr>
+                <td><strong>Gemini</strong></td>
+                <td><code>GOOGLE_API_KEY</code></td>
+                <td><a href="https://makersuite.google.com/app/apikey" style="color: var(--indigo-400)">makersuite.google.com</a></td>
+            </tr>
+        </table>
+
+        <h3>Step 3: Test It</h3>
+        <pre data-lang="bash"><code><span class="code-comment"># Check which reviewers are active</span>
+python ai_council.py status
+
+<span class="code-comment"># Review a file</span>
+python ai_council.py review <span class="code-string">"path/to/your/code.cs"</span>
+
+<span class="code-comment"># Force re-review (bypass cache)</span>
+python ai_council.py review <span class="code-string">"path/to/your/code.cs"</span> --force</code></pre>
+
+        <h2><span class="icon">💻</span> CLI Commands</h2>
+
+        <table>
+            <tr>
+                <th>Command</th>
+                <th>Description</th>
+            </tr>
+            <tr>
+                <td><code>python ai_council.py status</code></td>
+                <td>Show active reviewers and pending queue</td>
+            </tr>
+            <tr>
+                <td><code>python ai_council.py review &lt;file&gt;</code></td>
+                <td>Review a file with all active models</td>
+            </tr>
+            <tr>
+                <td><code>python ai_council.py review &lt;file&gt; --force</code></td>
+                <td>Force re-review (ignore cache)</td>
+            </tr>
+            <tr>
+                <td><code>python ai_council.py show &lt;file&gt;</code></td>
+                <td>Show cached reviews for a file</td>
+            </tr>
+            <tr>
+                <td><code>python ai_council.py queue &lt;file&gt;</code></td>
+                <td>Queue file for background review</td>
+            </tr>
+            <tr>
+                <td><code>python ai_council.py process</code></td>
+                <td>Process pending review queue</td>
+            </tr>
+            <tr>
+                <td><code>python ai_council.py watch --path &lt;dir&gt;</code></td>
+                <td>Watch directory for file changes</td>
+            </tr>
+        </table>
+
+        <h2><span class="icon">🔗</span> Claude Code Integration</h2>
+
+        <p>AI Council integrates with Claude Code in two ways:</p>
+
+        <div class="feature-list">
+            <div class="feature-item">
+                <div class="feature-icon">⚡</div>
+                <div class="feature-text">
+                    <h4>Hooks (Auto-Queue)</h4>
+                    <p>Automatically queue files for review when Claude edits them</p>
+                </div>
+            </div>
+            <div class="feature-item">
+                <div class="feature-icon">🔌</div>
+                <div class="feature-text">
+                    <h4>MCP Server</h4>
+                    <p>Let Claude query reviews directly in conversation</p>
+                </div>
+            </div>
+        </div>
+
+        <h3>Option A: Auto-Queue via Hooks</h3>
+        <p>Add to <code>~/.claude/settings.json</code>:</p>
+        <pre data-lang="json"><code>{
+  <span class="code-string">"hooks"</span>: {
+    <span class="code-string">"PostToolUse"</span>: [
+      {
+        <span class="code-string">"matcher"</span>: <span class="code-string">"^(Edit|Write)$"</span>,
+        <span class="code-string">"command"</span>: <span class="code-string">"python \"C:/AI COUNCIL/queue_review.py\" \"$TOOL_INPUT_file_path\""</span>
+      }
+    ]
+  }
+}</code></pre>
+
+        <div class="tip-box">
+            <div class="tip-icon">💡</div>
+            <div class="tip-content">
+                <h4>How it works</h4>
+                <p>Every time Claude uses Edit or Write tools, the file is automatically queued for GPT-4/Grok review. Run <code>python ai_council.py process</code> periodically to process the queue.</p>
+            </div>
+        </div>
+
+        <h3>Option B: MCP Server (Query Reviews)</h3>
+        <p>Add to <code>~/.claude/settings.json</code>:</p>
+        <pre data-lang="json"><code>{
+  <span class="code-string">"mcpServers"</span>: {
+    <span class="code-string">"ai-council"</span>: {
+      <span class="code-string">"command"</span>: <span class="code-string">"python"</span>,
+      <span class="code-string">"args"</span>: [<span class="code-string">"C:/AI COUNCIL/mcp_server.py"</span>],
+      <span class="code-string">"env"</span>: {
+        <span class="code-string">"OPENAI_API_KEY"</span>: <span class="code-string">"sk-..."</span>,
+        <span class="code-string">"XAI_API_KEY"</span>: <span class="code-string">"xai-..."</span>
+      }
+    }
+  }
+}</code></pre>
+
+        <p>Then Claude can call these MCP tools:</p>
+        <table>
+            <tr>
+                <th>MCP Tool</th>
+                <th>Purpose</th>
+            </tr>
+            <tr>
+                <td><code>mcp__ai-council__get_reviews</code></td>
+                <td>Get cached reviews for a file</td>
+            </tr>
+            <tr>
+                <td><code>mcp__ai-council__request_review</code></td>
+                <td>Request immediate review</td>
+            </tr>
+            <tr>
+                <td><code>mcp__ai-council__get_consensus</code></td>
+                <td>Get consensus summary</td>
+            </tr>
+            <tr>
+                <td><code>mcp__ai-council__council_status</code></td>
+                <td>Check active reviewers</td>
+            </tr>
+        </table>
+
+        <h2><span class="icon">🏗️</span> Architecture</h2>
+
+        <div class="architecture">
+            <div class="arch-flow">
+                <div class="arch-box primary">
+                    <h5>Your Editor / Claude Code</h5>
+                    <p>Edits files</p>
+                </div>
+                <div class="arch-arrow">↓</div>
+                <div class="arch-box">
+                    <h5>Git Repository</h5>
+                    <p>Source files</p>
+                </div>
+                <div class="arch-arrow">↓</div>
+                <div class="arch-box primary">
+                    <h5>AI Council Watcher</h5>
+                    <p>Detects changes, queues reviews</p>
+                </div>
+                <div class="arch-arrow">↓</div>
+                <div class="arch-row">
+                    <div class="arch-box gpt">
+                        <h5>GPT-4</h5>
+                        <p>OpenAI</p>
+                    </div>
+                    <div class="arch-box grok">
+                        <h5>Grok</h5>
+                        <p>xAI</p>
+                    </div>
+                    <div class="arch-box gemini">
+                        <h5>Gemini</h5>
+                        <p>Google</p>
+                    </div>
+                </div>
+                <div class="arch-arrow">↓</div>
+                <div class="arch-box">
+                    <h5>reviews.db</h5>
+                    <p>SQLite cache</p>
+                </div>
+                <div class="arch-arrow">↓</div>
+                <div class="arch-row">
+                    <div class="arch-box">
+                        <h5>CLI</h5>
+                        <p>Terminal</p>
+                    </div>
+                    <div class="arch-box">
+                        <h5>MCP Server</h5>
+                        <p>Claude queries</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <h2><span class="icon">📊</span> Understanding Reviews</h2>
+
+        <p>Each AI model returns a structured review with:</p>
+
+        <table>
+            <tr>
+                <th>Field</th>
+                <th>Description</th>
+            </tr>
+            <tr>
+                <td><strong>Quality Score</strong></td>
+                <td>1-10 rating of overall code quality</td>
+            </tr>
+            <tr>
+                <td><strong>Summary</strong></td>
+                <td>Brief assessment of the code</td>
+            </tr>
+            <tr>
+                <td><strong>Issues</strong></td>
+                <td>List of problems found with severity, line, and recommendation</td>
+            </tr>
+        </table>
+
+        <h3>Severity Levels</h3>
+        <table>
+            <tr>
+                <th>Severity</th>
+                <th>Meaning</th>
+                <th>Action</th>
+            </tr>
+            <tr>
+                <td><span class="badge" style="background: #dc2626;">CRITICAL</span></td>
+                <td>Security vulnerability, data loss risk</td>
+                <td>Fix immediately</td>
+            </tr>
+            <tr>
+                <td><span class="badge" style="background: #ea580c;">HIGH</span></td>
+                <td>Bug, logic error, significant issue</td>
+                <td>Fix before merge</td>
+            </tr>
+            <tr>
+                <td><span class="badge warning">MEDIUM</span></td>
+                <td>Code smell, maintainability concern</td>
+                <td>Should fix</td>
+            </tr>
+            <tr>
+                <td><span class="badge info">LOW</span></td>
+                <td>Style issue, minor improvement</td>
+                <td>Consider fixing</td>
+            </tr>
+            <tr>
+                <td><span class="badge muted">INFO</span></td>
+                <td>Suggestion, observation</td>
+                <td>Optional</td>
+            </tr>
+        </table>
+
+        <div class="tip-box">
+            <div class="tip-icon">🎯</div>
+            <div class="tip-content">
+                <h4>Consensus = Confidence</h4>
+                <p>When multiple models flag the same issue, it's almost certainly a real problem. Unique insights from a single model are worth investigating but may be false positives.</p>
+            </div>
+        </div>
+
+        <h2><span class="icon">💰</span> Cost Estimation</h2>
+
+        <table>
+            <tr>
+                <th>Model</th>
+                <th>~Cost Per Review</th>
+                <th>Monthly (30/day)</th>
+            </tr>
+            <tr>
+                <td>GPT-4 Turbo</td>
+                <td>~$0.05</td>
+                <td>~$45</td>
+            </tr>
+            <tr>
+                <td>Grok Build</td>
+                <td>~$0.03</td>
+                <td>~$27</td>
+            </tr>
+            <tr>
+                <td>Gemini Pro</td>
+                <td>~$0.02</td>
+                <td>~$18</td>
+            </tr>
+        </table>
+
+        <p><strong>Typical monthly cost:</strong> $50-90 for active development with 2 models.</p>
+
+        <div class="tip-box warning">
+            <div class="tip-icon">⚠️</div>
+            <div class="tip-content">
+                <h4>Cost Control Tips</h4>
+                <p>Reviews are cached by file hash - re-reviewing unchanged files is free. Use <code>--force</code> only when needed. Consider disabling expensive models for routine reviews.</p>
+            </div>
+        </div>
+
+        <h2><span class="icon">📁</span> File Reference</h2>
+
+        <table>
+            <tr>
+                <th>File</th>
+                <th>Purpose</th>
+            </tr>
+            <tr>
+                <td><code>ai_council.py</code></td>
+                <td>Main CLI and orchestrator</td>
+            </tr>
+            <tr>
+                <td><code>queue_review.py</code></td>
+                <td>Quick queue script for hooks</td>
+            </tr>
+            <tr>
+                <td><code>mcp_server.py</code></td>
+                <td>MCP server for Claude Code integration</td>
+            </tr>
+            <tr>
+                <td><code>reviews.db</code></td>
+                <td>SQLite database (auto-created, gitignored)</td>
+            </tr>
+            <tr>
+                <td><code>requirements.txt</code></td>
+                <td>Python dependencies</td>
+            </tr>
+        </table>
+    </main>
+
+    <footer class="footer">
+        <div class="footer-brand">AI Council</div>
+        <div class="footer-tagline">Multi-Model Code Review System</div>
+        <div class="footer-links">
+            <a href="https://github.com/laurence73/ai-council">GitHub Repository</a>
+            <a href="https://platform.openai.com/">OpenAI</a>
+            <a href="https://console.x.ai/">xAI Console</a>
+        </div>
+        <p style="margin-top: 1.5rem; font-size: 0.75rem; color: var(--text-muted);">&copy; 2024 AI Council. MIT License.</p>
+    </footer>
+</body>
+</html>
