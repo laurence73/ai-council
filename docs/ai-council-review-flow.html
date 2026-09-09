@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Council - Review Flow Architecture</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🤖</text></svg>">
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+        :root {
+            --indigo-500: #6366f1; --indigo-400: #818cf8; --purple-500: #a855f7;
+            --cyan-500: #06b6d4; --cyan-400: #22d3ee; --zinc-900: #18181b;
+            --zinc-800: #27272a; --zinc-700: #3f3f46; --zinc-600: #52525b;
+            --zinc-500: #71717a; --zinc-400: #a1a1aa; --emerald-500: #10b981;
+            --emerald-400: #34d399; --rose-500: #f43f5e; --amber-500: #f59e0b;
+            --bg-dark: #09090b; --text-primary: #fafafa; --text-secondary: #a1a1aa;
+            --gpt-color: #10a37f; --grok-color: #1da1f2; --claude-color: #d97706; --gemini-color: #8e44ad;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Inter', -apple-system, sans-serif;
+            background: var(--bg-dark); color: var(--text-primary);
+            line-height: 1.7; font-size: 16px; padding: 2rem;
+        }
+        .container { max-width: 1100px; margin: 0 auto; }
+        .header {
+            background: linear-gradient(135deg, var(--zinc-900), var(--zinc-800));
+            border: 1px solid var(--zinc-700); border-radius: 16px;
+            padding: 2rem; margin-bottom: 2rem; position: relative; overflow: hidden;
+            text-align: center;
+        }
+        .header::before {
+            content: ''; position: absolute; top: 0; left: 0; right: 0; height: 4px;
+            background: linear-gradient(90deg, var(--gpt-color), var(--grok-color), var(--claude-color), var(--gemini-color));
+        }
+        .header-content { display: flex; align-items: center; justify-content: center; gap: 1.5rem; }
+        .header-logo { flex-shrink: 0; }
+        .header-logo img { width: 100%; height: 100%; object-fit: contain; }
+        .header-text { text-align: left; }
+        .header h1 {
+            font-size: 2rem; font-weight: 700; margin-bottom: 0.5rem;
+            background: linear-gradient(135deg, var(--indigo-400), var(--cyan-400));
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+        }
+        .header .subtitle { color: var(--zinc-400); font-size: 1rem; }
+
+        .section {
+            background: var(--zinc-800); border: 1px solid var(--zinc-700);
+            border-radius: 12px; padding: 1.5rem; margin-bottom: 1.5rem;
+        }
+        .section h2 {
+            font-size: 1.2rem; font-weight: 600; margin-bottom: 1rem;
+            padding-bottom: 0.5rem; border-bottom: 1px solid var(--zinc-700);
+            display: flex; align-items: center; gap: 0.5rem;
+        }
+
+        /* Flow Diagram */
+        .flow-container { padding: 1rem 0; }
+        .flow-step {
+            display: flex; align-items: flex-start; gap: 1.5rem;
+            margin-bottom: 1.5rem; position: relative;
+        }
+        .flow-step:not(:last-child)::after {
+            content: ''; position: absolute; left: 24px; top: 60px; bottom: -20px;
+            width: 2px; background: linear-gradient(to bottom, var(--indigo-500), var(--zinc-700));
+        }
+        .flow-number {
+            width: 50px; height: 50px; border-radius: 50%;
+            background: linear-gradient(135deg, var(--indigo-500), var(--purple-500));
+            display: flex; align-items: center; justify-content: center;
+            font-weight: 700; font-size: 1.2rem; flex-shrink: 0;
+        }
+        .flow-content {
+            flex: 1; background: var(--zinc-900); border-radius: 8px;
+            padding: 1rem 1.25rem; border: 1px solid var(--zinc-700);
+        }
+        .flow-content h3 { font-size: 1rem; font-weight: 600; margin-bottom: 0.5rem; }
+        .flow-content p { color: var(--text-secondary); font-size: 0.9rem; margin-bottom: 0.5rem; }
+        .flow-content code {
+            font-family: 'JetBrains Mono', monospace; background: var(--zinc-800);
+            padding: 0.15em 0.4em; border-radius: 4px; font-size: 0.85em; color: var(--cyan-400);
+        }
+
+        /* Model Cards */
+        .model-grid {
+            display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 1rem; margin: 1rem 0;
+        }
+        .model-card {
+            background: var(--zinc-900); border-radius: 8px; padding: 1rem;
+            border: 1px solid var(--zinc-700); text-align: center;
+        }
+        .model-card.gpt { border-top: 3px solid var(--gpt-color); }
+        .model-card.grok { border-top: 3px solid var(--grok-color); }
+        .model-card.claude { border-top: 3px solid var(--claude-color); }
+        .model-card.gemini { border-top: 3px solid var(--gemini-color); }
+        .model-card .emoji { font-size: 2rem; margin-bottom: 0.5rem; }
+        .model-card h4 { font-size: 0.9rem; margin-bottom: 0.25rem; }
+        .model-card .status { font-size: 0.75rem; color: var(--emerald-400); }
+        .model-card .status.optional { color: var(--amber-500); }
+
+        /* Parallel indicator */
+        .parallel-box {
+            background: linear-gradient(135deg, rgba(99, 102, 241, 0.1), rgba(168, 85, 247, 0.1));
+            border: 2px dashed var(--indigo-500); border-radius: 12px;
+            padding: 1.5rem; margin: 1rem 0;
+        }
+        .parallel-box h4 {
+            color: var(--indigo-400); font-size: 0.85rem; text-transform: uppercase;
+            letter-spacing: 0.1em; margin-bottom: 1rem; text-align: center;
+        }
+
+        /* Data table */
+        .data-table { width: 100%; border-collapse: collapse; margin: 1rem 0; }
+        .data-table th, .data-table td {
+            padding: 0.75rem 1rem; text-align: left; border-bottom: 1px solid var(--zinc-700);
+        }
+        .data-table th { color: var(--zinc-400); font-weight: 500; font-size: 0.8rem; text-transform: uppercase; }
+        .data-table td { font-size: 0.9rem; }
+        .data-table code { background: var(--zinc-800); padding: 0.1em 0.3em; border-radius: 3px; font-size: 0.85em; }
+
+        /* JSON example */
+        .json-block {
+            background: var(--zinc-900); border-radius: 8px; padding: 1rem;
+            font-family: 'JetBrains Mono', monospace; font-size: 0.85rem;
+            overflow-x: auto; border: 1px solid var(--zinc-700);
+        }
+        .json-key { color: var(--cyan-400); }
+        .json-string { color: var(--emerald-400); }
+        .json-number { color: var(--amber-500); }
+
+        .footer { text-align: center; margin-top: 2rem; color: var(--zinc-500); font-size: 0.8rem; }
+        .footer a { color: var(--indigo-400); }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="header-content">
+                <div class="header-logo">
+                    <img src="https://cdn.jsdelivr.net/gh/laurence73/assets@main/logos/ai-council-logo.png" alt="AI Council Logo" />
+                </div>
+                <div class="header-text">
+                    <h1>Review Flow</h1>
+                    <div class="subtitle">Multi-Model Code Review Architecture</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>📋 Overview</h2>
+            <p style="color: var(--text-secondary); margin-bottom: 1rem;">
+                AI Council runs <strong>parallel code reviews</strong> using multiple AI models, then synthesizes their findings to identify <strong>consensus issues</strong> (high confidence) and <strong>unique insights</strong> from each model.
+            </p>
+
+            <div class="model-grid">
+                <div class="model-card gpt">
+                    <div class="emoji">🧠</div>
+                    <h4>GPT-4 Turbo</h4>
+                    <div class="status">✓ Default</div>
+                </div>
+                <div class="model-card grok">
+                    <div class="emoji">⚡</div>
+                    <h4>Grok Build</h4>
+                    <div class="status">✓ Default</div>
+                </div>
+                <div class="model-card claude">
+                    <div class="emoji">🔮</div>
+                    <h4>Claude Sonnet</h4>
+                    <div class="status">✓ Default</div>
+                </div>
+                <div class="model-card gemini">
+                    <div class="emoji">💎</div>
+                    <h4>Gemini Flash</h4>
+                    <div class="status optional">--gemini flag</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>🔄 Complete Review Flow</h2>
+            <div class="flow-container">
+
+                <div class="flow-step">
+                    <div class="flow-number">1</div>
+                    <div class="flow-content">
+                        <h3>📁 File Input</h3>
+                        <p>User provides file path via CLI or Claude Code skill</p>
+                        <code>/ai-council src/MyComponent.razor --html</code>
+                    </div>
+                </div>
+
+                <div class="flow-step">
+                    <div class="flow-number">2</div>
+                    <div class="flow-content">
+                        <h3>🔍 Cache Check</h3>
+                        <p>Compute file hash (SHA-256) and check SQLite cache for existing review</p>
+                        <p>If cached and not <code>--force</code>: return cached result instantly</p>
+                    </div>
+                </div>
+
+                <div class="flow-step">
+                    <div class="flow-number">3</div>
+                    <div class="flow-content">
+                        <h3>📖 File Reading</h3>
+                        <p>Read file contents, detect language from extension</p>
+                        <p>For large files (Grok): chunk at class/function boundaries (15KB max)</p>
+                    </div>
+                </div>
+
+                <div class="flow-step">
+                    <div class="flow-number">4</div>
+                    <div class="flow-content">
+                        <h3>⚡ Parallel Review Dispatch</h3>
+                        <div class="parallel-box">
+                            <h4>Concurrent Execution (asyncio.gather)</h4>
+                            <div class="model-grid">
+                                <div class="model-card gpt" style="padding: 0.75rem;">
+                                    <h4>🧠 GPT-4</h4>
+                                    <p style="font-size: 0.75rem; color: var(--zinc-400);">OpenAI API</p>
+                                </div>
+                                <div class="model-card grok" style="padding: 0.75rem;">
+                                    <h4>⚡ Grok</h4>
+                                    <p style="font-size: 0.75rem; color: var(--zinc-400);">xAI API (chunked)</p>
+                                </div>
+                                <div class="model-card claude" style="padding: 0.75rem;">
+                                    <h4>🔮 Claude</h4>
+                                    <p style="font-size: 0.75rem; color: var(--zinc-400);">Anthropic API</p>
+                                </div>
+                                <div class="model-card gemini" style="padding: 0.75rem;">
+                                    <h4>💎 Gemini</h4>
+                                    <p style="font-size: 0.75rem; color: var(--zinc-400);">Google API (optional)</p>
+                                </div>
+                            </div>
+                        </div>
+                        <p style="margin-top: 0.5rem;">Each model receives identical prompt requesting structured JSON output</p>
+                    </div>
+                </div>
+
+                <div class="flow-step">
+                    <div class="flow-number">5</div>
+                    <div class="flow-content">
+                        <h3>📊 Response Collection</h3>
+                        <p>Each model returns JSON with:</p>
+                        <div class="json-block">
+{
+  <span class="json-key">"issues"</span>: [
+    {
+      <span class="json-key">"severity"</span>: <span class="json-string">"HIGH"</span>,
+      <span class="json-key">"line"</span>: <span class="json-number">42</span>,
+      <span class="json-key">"description"</span>: <span class="json-string">"SQL injection vulnerability"</span>,
+      <span class="json-key">"recommendation"</span>: <span class="json-string">"Use parameterized queries"</span>,
+      <span class="json-key">"confidence"</span>: <span class="json-number">95</span>
+    }
+  ],
+  <span class="json-key">"summary"</span>: <span class="json-string">"Overall assessment..."</span>,
+  <span class="json-key">"quality_score"</span>: <span class="json-number">7</span>
+}
+                        </div>
+                    </div>
+                </div>
+
+                <div class="flow-step">
+                    <div class="flow-number">6</div>
+                    <div class="flow-content">
+                        <h3>🎯 Consensus Detection</h3>
+                        <p>Compare issues across models to find agreement:</p>
+                        <ul style="color: var(--text-secondary); font-size: 0.9rem; margin-left: 1.5rem;">
+                            <li>Same line number (±5 lines tolerance)</li>
+                            <li>Similar severity level</li>
+                            <li>Overlapping keywords in description</li>
+                        </ul>
+                        <p style="margin-top: 0.5rem;">Issues flagged by 2+ models = <strong style="color: var(--emerald-400);">High Confidence</strong></p>
+                    </div>
+                </div>
+
+                <div class="flow-step">
+                    <div class="flow-number">7</div>
+                    <div class="flow-content">
+                        <h3>💾 Cache Storage</h3>
+                        <p>Store results in SQLite with file hash as key</p>
+                        <p>Future reviews of unchanged files return instantly</p>
+                    </div>
+                </div>
+
+                <div class="flow-step">
+                    <div class="flow-number">8</div>
+                    <div class="flow-content">
+                        <h3>📄 Output Generation</h3>
+                        <p>Generate output based on flags:</p>
+                        <table class="data-table">
+                            <tr>
+                                <th>Flag</th>
+                                <th>Output</th>
+                            </tr>
+                            <tr>
+                                <td><code>--html</code></td>
+                                <td>Beautiful HTML report with logo, scores, issues</td>
+                            </tr>
+                            <tr>
+                                <td>(default)</td>
+                                <td>JSON to stdout + terminal summary</td>
+                            </tr>
+                        </table>
+                    </div>
+                </div>
+
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>⚙️ Environment Setup</h2>
+            <p style="color: var(--text-secondary); margin-bottom: 1rem;">Required API keys in <code>C:\AI COUNCIL\.env</code>:</p>
+            <div class="json-block">
+<span class="json-key">OPENAI_API_KEY</span>=sk-proj-...     <span style="color: var(--zinc-500)"># GPT-4 (required)</span>
+<span class="json-key">XAI_API_KEY</span>=xai-...            <span style="color: var(--zinc-500)"># Grok (required)</span>
+<span class="json-key">ANTHROPIC_API_KEY</span>=sk-ant-...  <span style="color: var(--zinc-500)"># Claude (required)</span>
+<span class="json-key">GOOGLE_API_KEY</span>=...            <span style="color: var(--zinc-500)"># Gemini (optional)</span>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>🚀 Usage Examples</h2>
+            <table class="data-table">
+                <tr>
+                    <th>Command</th>
+                    <th>Models Used</th>
+                </tr>
+                <tr>
+                    <td><code>python ai_council.py review file.py</code></td>
+                    <td>GPT-4 + Grok + Claude (3 models)</td>
+                </tr>
+                <tr>
+                    <td><code>python ai_council.py review file.py --gemini</code></td>
+                    <td>GPT-4 + Grok + Claude + Gemini (4 models)</td>
+                </tr>
+                <tr>
+                    <td><code>python ai_council.py review file.py --html</code></td>
+                    <td>3 models + HTML report</td>
+                </tr>
+                <tr>
+                    <td><code>python ai_council.py review file.py --force</code></td>
+                    <td>3 models, bypass cache</td>
+                </tr>
+            </table>
+        </div>
+
+        <div class="section">
+            <h2>📈 Timing Breakdown</h2>
+            <table class="data-table">
+                <tr>
+                    <th>Phase</th>
+                    <th>Duration</th>
+                    <th>Notes</th>
+                </tr>
+                <tr>
+                    <td>Cache check</td>
+                    <td>~5ms</td>
+                    <td>SQLite lookup by hash</td>
+                </tr>
+                <tr>
+                    <td>Parallel API calls</td>
+                    <td>10-30s</td>
+                    <td>Depends on file size, model speed</td>
+                </tr>
+                <tr>
+                    <td>Consensus detection</td>
+                    <td>~50ms</td>
+                    <td>In-memory comparison</td>
+                </tr>
+                <tr>
+                    <td>HTML generation</td>
+                    <td>~100ms</td>
+                    <td>Template rendering</td>
+                </tr>
+                <tr>
+                    <td style="font-weight: 600;">Cached review</td>
+                    <td style="color: var(--emerald-400);">&lt;100ms</td>
+                    <td>Instant for unchanged files</td>
+                </tr>
+            </table>
+        </div>
+
+        <div class="footer">
+            AI Council - Multi-Model Code Review System<br>
+            <a href="https://github.com/laurence73/ai-council">github.com/laurence73/ai-council</a>
+        </div>
+    </div>
+</body>
+</html>

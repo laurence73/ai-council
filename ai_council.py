@@ -13,6 +13,9 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional
 import os
+import time
+import sys
+import threading
 
 # Load .env file if it exists
 def load_env_file():
@@ -48,6 +51,12 @@ try:
 except ImportError:
     HAS_WATCHDOG = False
 
+try:
+    import anthropic
+    HAS_ANTHROPIC = True
+except ImportError:
+    HAS_ANTHROPIC = False
+
 
 # Configuration - uses script directory for database
 SCRIPT_DIR = Path(__file__).parent.resolve()
@@ -60,9 +69,126 @@ DEFAULT_CONFIG = {
     "models": {
         "gpt-4": {"enabled": True, "api_key_env": "OPENAI_API_KEY"},
         "grok": {"enabled": True, "api_key_env": "XAI_API_KEY"},
+        "claude": {"enabled": True, "api_key_env": "ANTHROPIC_API_KEY"},
         "gemini": {"enabled": False, "api_key_env": "GOOGLE_API_KEY"}
     }
 }
+
+# Model configurations: standard (fast/cheap) vs power (best/expensive)
+MODEL_CONFIGS = {
+    "standard": {
+        "gpt-4": "gpt-4-turbo",
+        "grok": "grok-3-mini",
+        "claude": "claude-sonnet-4-5",
+        "gemini": "gemini-2.0-flash",
+    },
+    "power": {
+        "gpt-4": "gpt-6-astra",
+        "grok": "grok-3",
+        "claude": "claude-fable-5-1",
+        "gemini": "gemini-2.5-pro-preview-06-05",
+    }
+}
+
+# API pricing per 1M tokens (as of 2024)
+API_PRICING = {
+    # Standard models
+    "gpt-4": {"input": 10.00, "output": 30.00},      # GPT-4 Turbo
+    "grok": {"input": 5.00, "output": 15.00},        # Grok (estimated)
+    "claude": {"input": 3.00, "output": 15.00},      # Claude Sonnet
+    "gemini": {"input": 0.075, "output": 0.30},      # Gemini 1.5 Flash
+}
+
+# Power model pricing (higher costs) - Sep 2026 prices
+API_PRICING_POWER = {
+    "gpt-4": {"input": 5.00, "output": 20.00},       # GPT-6 Astra (2.5x GPT-5.6 Sol)
+    "grok": {"input": 3.00, "output": 15.00},        # Grok-3
+    "claude": {"input": 10.00, "output": 50.00},     # Claude Fable 5.1
+    "gemini": {"input": 1.25, "output": 10.00},      # Gemini 2.5 Pro
+}
+
+
+def calculate_cost(model: str, input_tokens: int, output_tokens: int, power_mode: bool = False) -> float:
+    """Calculate cost in USD for a given model and token usage"""
+    pricing_table = API_PRICING_POWER if power_mode else API_PRICING
+    pricing = pricing_table.get(model, {"input": 0, "output": 0})
+    input_cost = (input_tokens / 1_000_000) * pricing["input"]
+    output_cost = (output_tokens / 1_000_000) * pricing["output"]
+    return input_cost + output_cost
+
+
+def format_usage_summary(usage_by_model: dict, power_mode: bool = False) -> str:
+    """Format token usage summary for console output"""
+    mode_label = " (POWER MODE)" if power_mode else ""
+    lines = [f"\n[Token Usage{mode_label}]"]
+    total_input = 0
+    total_output = 0
+    total_cost = 0.0
+
+    for model, usage in usage_by_model.items():
+        input_tokens = usage.get("input_tokens", 0)
+        output_tokens = usage.get("output_tokens", 0)
+        cost = calculate_cost(model, input_tokens, output_tokens, power_mode)
+        total_input += input_tokens
+        total_output += output_tokens
+        total_cost += cost
+        lines.append(f"  {model.upper():8s} {input_tokens:,} in / {output_tokens:,} out  (~${cost:.4f})")
+
+    lines.append("  " + "-" * 40)
+    lines.append(f"  {'TOTAL':8s} {total_input:,} in / {total_output:,} out  (~${total_cost:.4f})")
+    return "\n".join(lines)
+
+
+class ProgressTracker:
+    """Simple progress tracking for console output"""
+
+    def __init__(self, models: list):
+        self.models = models
+        self.model_status = {m: {"status": "pending", "start": None, "end": None, "score": None} for m in models}
+        self.start_time = time.time()
+
+    def start_model(self, model: str):
+        self.model_status[model]["status"] = "running"
+        self.model_status[model]["start"] = time.time()
+        print(f"  [~] {model.upper()} started...")
+
+    def complete_model(self, model: str, score: int = None, error: str = None):
+        self.model_status[model]["status"] = "error" if error else "done"
+        self.model_status[model]["end"] = time.time()
+        self.model_status[model]["score"] = score
+        elapsed = self._get_elapsed(model)
+
+        completed = sum(1 for m in self.model_status.values() if m["status"] in ("done", "error"))
+        total = len(self.models)
+
+        if error:
+            print(f"  [!] {model.upper()} ERROR ({elapsed}) [{completed}/{total}]")
+        else:
+            print(f"  [+] {model.upper()} Score: {score}/10 ({elapsed}) [{completed}/{total}]")
+
+    def _get_elapsed(self, model: str) -> str:
+        status = self.model_status[model]
+        if status["start"] is None:
+            return "--.-s"
+        end = status["end"] or time.time()
+        elapsed = end - status["start"]
+        return f"{elapsed:.1f}s"
+
+    def start_spinner(self):
+        """No-op for compatibility"""
+        pass
+
+    def stop_spinner(self):
+        """No-op for compatibility"""
+        pass
+
+    def print_summary(self):
+        """Print final summary"""
+        total_elapsed = time.time() - self.start_time
+        print(f"\n{'='*60}")
+        print(f"  Review Complete - Total Time: {total_elapsed:.1f}s")
+        print(f"{'='*60}")
+
 
 REVIEW_SYSTEM_PROMPT = """You are a senior code reviewer. Analyze this code for:
 
@@ -183,38 +309,53 @@ class ReviewDatabase:
 class GPTReviewer:
     """OpenAI GPT-4 reviewer"""
 
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, model: str = "gpt-4-turbo"):
         if not HAS_OPENAI:
             raise ImportError("openai package not installed. Run: pip install openai")
         self.client = openai.OpenAI(api_key=api_key)
+        self.model = model
 
     async def review(self, code: str, file_path: str) -> dict:
         try:
-            response = self.client.chat.completions.create(
-                model="gpt-4-turbo",
-                messages=[
-                    {"role": "system", "content": REVIEW_SYSTEM_PROMPT},
-                    {"role": "user", "content": f"File: {file_path}\n\n```\n{code}\n```"}
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.3
+            # Run synchronous API call in thread pool to avoid blocking event loop
+            loop = asyncio.get_event_loop()
+            model = self.model
+            response = await loop.run_in_executor(
+                None,
+                lambda: self.client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": REVIEW_SYSTEM_PROMPT},
+                        {"role": "user", "content": f"File: {file_path}\n\n```\n{code}\n```"}
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0.3
+                )
             )
-            return json.loads(response.choices[0].message.content)
+            result = json.loads(response.choices[0].message.content)
+            # Add token usage
+            if hasattr(response, 'usage') and response.usage:
+                result["_usage"] = {
+                    "input_tokens": response.usage.prompt_tokens,
+                    "output_tokens": response.usage.completion_tokens
+                }
+            return result
         except Exception as e:
             return {"error": str(e), "issues": [], "quality_score": 0}
 
 
 class GrokReviewer:
-    """xAI Grok reviewer - uses grok-build (code-optimized model)"""
+    """xAI Grok reviewer"""
 
     # Max characters per chunk (Grok works better with smaller contexts)
     MAX_CHUNK_SIZE = 15000
 
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, model: str = "grok-3-mini"):
         if not HAS_HTTPX:
             raise ImportError("httpx package not installed. Run: pip install httpx")
         self.api_key = api_key
         self.base_url = "https://api.x.ai/v1"
+        self.model = model
 
     def _chunk_code(self, code: str) -> list:
         """Split large files into reviewable chunks by function/class boundaries"""
@@ -281,7 +422,7 @@ class GrokReviewer:
                         "Content-Type": "application/json"
                     },
                     json={
-                        "model": "grok-build-0.1",
+                        "model": self.model,
                         "messages": [
                             {"role": "system", "content": REVIEW_SYSTEM_PROMPT + "\n\nIMPORTANT: You MUST respond with ONLY valid JSON, no markdown, no explanation."},
                             {"role": "user", "content": f"File: {file_path}{chunk_info}\n\n```\n{code}\n```"}
@@ -296,6 +437,9 @@ class GrokReviewer:
                     return {"error": str(data.get("error", "Unknown API error")), "issues": [], "quality_score": 0}
 
                 content = data["choices"][0]["message"]["content"]
+
+                # Capture token usage from response
+                usage_data = data.get("usage", {})
 
                 # Try to extract JSON from response (Grok sometimes wraps in markdown)
                 if "```json" in content:
@@ -319,7 +463,14 @@ class GrokReviewer:
                     else:
                         return {"error": f"No JSON found in response: {content[:200]}...", "issues": [], "quality_score": 0}
 
-                return json.loads(content)
+                result = json.loads(content)
+                # Add token usage
+                if usage_data:
+                    result["_usage"] = {
+                        "input_tokens": usage_data.get("prompt_tokens", 0),
+                        "output_tokens": usage_data.get("completion_tokens", 0)
+                    }
+                return result
 
         except json.JSONDecodeError as e:
             return {"error": f"JSON parse error: {e}. Response started with: {content[:100] if 'content' in dir() else 'N/A'}...", "issues": [], "quality_score": 0}
@@ -330,17 +481,18 @@ class GrokReviewer:
 class GeminiReviewer:
     """Google Gemini reviewer"""
 
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, model: str = "gemini-2.0-flash"):
         if not HAS_HTTPX:
             raise ImportError("httpx package not installed. Run: pip install httpx")
         self.api_key = api_key
         self.base_url = "https://generativelanguage.googleapis.com/v1beta"
+        self.model = model
 
     async def review(self, code: str, file_path: str) -> dict:
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.post(
-                    f"{self.base_url}/models/gemini-1.5-flash:generateContent?key={self.api_key}",
+                    f"{self.base_url}/models/{self.model}:generateContent?key={self.api_key}",
                     headers={"Content-Type": "application/json"},
                     json={
                         "contents": [{
@@ -360,12 +512,82 @@ class GeminiReviewer:
                 if "error" in data:
                     return {"error": data["error"].get("message", "Unknown API error"), "issues": [], "quality_score": 0}
                 content = data["candidates"][0]["content"]["parts"][0]["text"]
+                # Capture token usage
+                usage_metadata = data.get("usageMetadata", {})
+
                 # Try to extract JSON from response
                 if "```json" in content:
                     content = content.split("```json")[1].split("```")[0]
                 elif "```" in content:
                     content = content.split("```")[1].split("```")[0]
-                return json.loads(content)
+                result = json.loads(content)
+                # Add token usage
+                if usage_metadata:
+                    result["_usage"] = {
+                        "input_tokens": usage_metadata.get("promptTokenCount", 0),
+                        "output_tokens": usage_metadata.get("candidatesTokenCount", 0)
+                    }
+                return result
+        except Exception as e:
+            return {"error": str(e), "issues": [], "quality_score": 0}
+
+
+class ClaudeReviewer:
+    """Anthropic Claude reviewer"""
+
+    def __init__(self, api_key: str, model: str = "claude-sonnet-4-5"):
+        if not HAS_ANTHROPIC:
+            raise ImportError("anthropic package not installed. Run: pip install anthropic")
+        self.client = anthropic.Anthropic(api_key=api_key)
+        self.model = model
+
+    async def review(self, code: str, file_path: str) -> dict:
+        try:
+            # Run synchronous API call in thread pool
+            import asyncio
+            loop = asyncio.get_event_loop()
+            model = self.model
+            response = await loop.run_in_executor(
+                None,
+                lambda: self.client.messages.create(
+                    model=model,
+                    max_tokens=4096,
+                    messages=[
+                        {"role": "user", "content": f"{REVIEW_SYSTEM_PROMPT}\n\nFile: {file_path}\n\n```\n{code}\n```"}
+                    ]
+                )
+            )
+            content = response.content[0].text
+            # Capture token usage
+            usage_data = None
+            if hasattr(response, 'usage') and response.usage:
+                usage_data = {
+                    "input_tokens": response.usage.input_tokens,
+                    "output_tokens": response.usage.output_tokens
+                }
+
+            # Try to extract JSON from response
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0]
+            elif "```" in content:
+                parts = content.split("```")
+                for part in parts:
+                    part = part.strip()
+                    if part.startswith("{"):
+                        content = part
+                        break
+            # Clean and parse
+            content = content.strip()
+            if not content.startswith("{"):
+                start = content.find("{")
+                end = content.rfind("}") + 1
+                if start != -1 and end > start:
+                    content = content[start:end]
+            result = json.loads(content)
+            # Add token usage
+            if usage_data:
+                result["_usage"] = usage_data
+            return result
         except Exception as e:
             return {"error": str(e), "issues": [], "quality_score": 0}
 
@@ -373,24 +595,34 @@ class GeminiReviewer:
 class AICouncil:
     """Main orchestrator for multi-model reviews"""
 
-    def __init__(self, config: dict = None, enable_gemini: bool = False):
+    def __init__(self, config: dict = None, enable_gemini: bool = False, enable_claude: bool = False, power_mode: bool = False):
         self.config = config or DEFAULT_CONFIG.copy()
-        # Override gemini setting if requested
+        self.power_mode = power_mode
+        # Override model settings if requested
         if enable_gemini:
             self.config["models"]["gemini"]["enabled"] = True
+        if enable_claude:
+            self.config["models"]["claude"]["enabled"] = True
         self.db = ReviewDatabase(self.config["db_path"])
         self.reviewers = {}
         self._setup_reviewers()
 
     def _setup_reviewers(self):
         models = self.config.get("models", {})
+        mode = "power" if self.power_mode else "standard"
+        model_names = MODEL_CONFIGS[mode]
+
+        if self.power_mode:
+            print("\n[!] POWER MODE ENABLED - Using premium models (higher cost)")
+            print("    Estimated cost: ~$0.30-0.50 per review\n")
 
         if models.get("gpt-4", {}).get("enabled"):
             api_key = os.environ.get(models["gpt-4"]["api_key_env"])
             if api_key:
                 try:
-                    self.reviewers["gpt-4"] = GPTReviewer(api_key)
-                    print("[+] GPT-4 reviewer enabled")
+                    model_name = model_names["gpt-4"]
+                    self.reviewers["gpt-4"] = GPTReviewer(api_key, model=model_name)
+                    print(f"[+] GPT-4 reviewer enabled ({model_name})")
                 except ImportError as e:
                     print(f"[-] GPT-4 disabled: {e}")
 
@@ -398,8 +630,9 @@ class AICouncil:
             api_key = os.environ.get(models["grok"]["api_key_env"])
             if api_key:
                 try:
-                    self.reviewers["grok"] = GrokReviewer(api_key)
-                    print("[+] Grok reviewer enabled")
+                    model_name = model_names["grok"]
+                    self.reviewers["grok"] = GrokReviewer(api_key, model=model_name)
+                    print(f"[+] Grok reviewer enabled ({model_name})")
                 except ImportError as e:
                     print(f"[-] Grok disabled: {e}")
 
@@ -407,10 +640,21 @@ class AICouncil:
             api_key = os.environ.get(models["gemini"]["api_key_env"])
             if api_key:
                 try:
-                    self.reviewers["gemini"] = GeminiReviewer(api_key)
-                    print("[+] Gemini reviewer enabled")
+                    model_name = model_names["gemini"]
+                    self.reviewers["gemini"] = GeminiReviewer(api_key, model=model_name)
+                    print(f"[+] Gemini reviewer enabled ({model_name})")
                 except ImportError as e:
                     print(f"[-] Gemini disabled: {e}")
+
+        if models.get("claude", {}).get("enabled"):
+            api_key = os.environ.get(models["claude"]["api_key_env"])
+            if api_key:
+                try:
+                    model_name = model_names["claude"]
+                    self.reviewers["claude"] = ClaudeReviewer(api_key, model=model_name)
+                    print(f"[+] Claude reviewer enabled ({model_name})")
+                except ImportError as e:
+                    print(f"[-] Claude disabled: {e}")
 
         if not self.reviewers:
             print("[!] No reviewers configured. Set API keys in environment.")
@@ -418,7 +662,7 @@ class AICouncil:
     def get_file_hash(self, content: str) -> str:
         return hashlib.sha256(content.encode()).hexdigest()[:16]
 
-    async def review_file(self, file_path: str, force: bool = False) -> dict:
+    async def review_file(self, file_path: str, force: bool = False, show_progress: bool = True) -> dict:
         """Review a single file with all enabled models"""
         path = Path(file_path)
         if not path.exists():
@@ -433,12 +677,18 @@ class AICouncil:
             if existing:
                 return {"cached": True, "reviews": existing}
 
+        # Initialize progress tracker
+        tracker = None
+        if show_progress and self.reviewers:
+            tracker = ProgressTracker(list(self.reviewers.keys()))
+            tracker.start_spinner()
+
         # Run reviews in parallel
         results = {}
         tasks = []
 
         for model_name, reviewer in self.reviewers.items():
-            tasks.append(self._review_with_model(model_name, reviewer, content, file_path))
+            tasks.append(self._review_with_model(model_name, reviewer, content, file_path, tracker))
 
         if tasks:
             completed = await asyncio.gather(*tasks)
@@ -446,12 +696,24 @@ class AICouncil:
                 results[model_name] = review
                 self.db.add_review(str(file_path), file_hash, model_name, review)
 
-        return {"cached": False, "reviews": results}
+        # Stop spinner and print summary
+        if tracker:
+            tracker.stop_spinner()
+            tracker.print_summary()
 
-    async def _review_with_model(self, model_name: str, reviewer, content: str, file_path: str):
-        print(f"  [{model_name}] Reviewing...")
+        return {"cached": False, "reviews": results, "_tracker": tracker}
+
+    async def _review_with_model(self, model_name: str, reviewer, content: str, file_path: str, tracker: ProgressTracker = None):
+        if tracker:
+            tracker.start_model(model_name)
+
         review = await reviewer.review(content, file_path)
-        print(f"  [{model_name}] Done - Score: {review.get('quality_score', '?')}/10")
+        score = review.get('quality_score') if "error" not in review else None
+        error = review.get("error") if "error" in review else None
+
+        if tracker:
+            tracker.complete_model(model_name, score=score, error=error)
+
         return (model_name, review)
 
     def aggregate_reviews(self, reviews: dict) -> dict:
@@ -534,22 +796,26 @@ class AICouncil:
             print()
 
 
-def generate_html_report(file_path: str, reviews: dict, output_path: str = None) -> str:
+def generate_html_report(file_path: str, reviews: dict, output_path: str = None, power_mode: bool = False) -> str:
     """Generate a beautiful HTML report for the review results"""
     from datetime import datetime
 
     filename = Path(file_path).name
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # Calculate consensus
+    # Calculate consensus and collect token usage
     all_issues = []
     scores = []
+    usage_by_model = {}
     for model, review in reviews.items():
         if isinstance(review, dict) and "error" not in review:
             scores.append(review.get("quality_score", 0))
             for issue in review.get("issues", []):
                 issue["model"] = model
                 all_issues.append(issue)
+            # Collect token usage
+            if "_usage" in review:
+                usage_by_model[model] = review["_usage"]
 
     avg_score = sum(scores) / len(scores) if scores else 0
 
@@ -587,7 +853,7 @@ def generate_html_report(file_path: str, reviews: dict, output_path: str = None)
             background: var(--bg-dark); color: var(--text-primary);
             line-height: 1.7; font-size: 16px; padding: 2rem;
         }}
-        .container {{ max-width: 900px; margin: 0 auto; }}
+        .container {{ max-width: 1125px; margin: 0 auto; }}
         .header {{
             background: linear-gradient(135deg, var(--zinc-900), var(--zinc-800));
             border: 1px solid var(--zinc-700); border-radius: 16px;
@@ -597,6 +863,10 @@ def generate_html_report(file_path: str, reviews: dict, output_path: str = None)
             content: ''; position: absolute; top: 0; left: 0; right: 0; height: 4px;
             background: linear-gradient(90deg, var(--indigo-500), var(--purple-500), var(--cyan-500));
         }}
+        .header-content {{ display: flex; align-items: center; gap: 1.5rem; }}
+        .header-logo {{ flex-shrink: 0; }}
+        .header-logo img {{ width: 100%; height: 100%; object-fit: contain; }}
+        .header-text {{ flex: 1; }}
         .header h1 {{
             font-size: 1.75rem; font-weight: 700; margin-bottom: 0.5rem;
             background: linear-gradient(135deg, var(--indigo-400), var(--cyan-400));
@@ -614,6 +884,7 @@ def generate_html_report(file_path: str, reviews: dict, output_path: str = None)
         .score-card.gpt {{ border-top: 4px solid #10a37f; }}
         .score-card.grok {{ border-top: 4px solid #1da1f2; }}
         .score-card.gemini {{ border-top: 4px solid #8e44ad; }}
+        .score-card.claude {{ border-top: 4px solid #d97706; }}
         .score-card.consensus {{ border-top: 4px solid var(--indigo-500); }}
         .score-card h3 {{ font-size: 0.875rem; color: var(--zinc-400); margin-bottom: 0.5rem; }}
         .score-card .score {{ font-size: 2.5rem; font-weight: 700; }}
@@ -649,6 +920,7 @@ def generate_html_report(file_path: str, reviews: dict, output_path: str = None)
         .badge.low {{ background: var(--cyan-500); color: white; }}
         .badge.info {{ background: var(--zinc-600); color: var(--text-secondary); }}
         .issue-line {{ font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; color: var(--zinc-400); }}
+        .issue-file {{ font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; color: var(--cyan-400); margin-right: 0.5rem; }}
         .issue-desc {{ color: var(--text-secondary); font-size: 0.9rem; }}
         .issue-rec {{ color: var(--emerald-400); font-size: 0.85rem; margin-top: 0.5rem; font-style: italic; }}
         .model-tag {{
@@ -658,17 +930,89 @@ def generate_html_report(file_path: str, reviews: dict, output_path: str = None)
         .summary {{ color: var(--text-secondary); font-size: 0.9rem; margin-bottom: 1rem; }}
         .footer {{ text-align: center; margin-top: 2rem; color: var(--zinc-500); font-size: 0.8rem; }}
         code {{ font-family: 'JetBrains Mono', monospace; background: var(--zinc-900); padding: 0.1em 0.3em; border-radius: 3px; font-size: 0.85em; }}
+        .usage-card {{
+            background: linear-gradient(135deg, var(--zinc-800), var(--zinc-900));
+            border: 1px solid var(--zinc-700); border-radius: 12px;
+            padding: 1.25rem; margin-bottom: 2rem;
+        }}
+        .usage-card h3 {{
+            font-size: 0.9rem; font-weight: 600; color: var(--zinc-300);
+            margin-bottom: 0.75rem; display: flex; align-items: center; gap: 0.5rem;
+        }}
+        .usage-grid {{
+            display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 0.75rem;
+        }}
+        .usage-item {{
+            background: var(--zinc-900); border-radius: 8px; padding: 0.75rem;
+            display: flex; flex-direction: column; gap: 0.25rem;
+        }}
+        .usage-model {{ font-size: 0.75rem; font-weight: 600; color: var(--zinc-400); text-transform: uppercase; }}
+        .usage-model.gpt {{ color: #10a37f; }}
+        .usage-model.grok {{ color: #1da1f2; }}
+        .usage-model.claude {{ color: #d97706; }}
+        .usage-model.gemini {{ color: #8e44ad; }}
+        .usage-tokens {{ font-family: 'JetBrains Mono', monospace; font-size: 0.8rem; color: var(--text-secondary); }}
+        .usage-cost {{ font-size: 0.85rem; font-weight: 600; color: var(--emerald-400); }}
+        .usage-total {{ background: linear-gradient(135deg, var(--indigo-500), var(--purple-500)); border-radius: 8px; padding: 0.75rem; }}
+        .usage-total .usage-model {{ color: white; }}
+        .usage-total .usage-tokens {{ color: rgba(255,255,255,0.8); }}
+        .usage-total .usage-cost {{ color: white; font-size: 1rem; }}
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>🤖 AI Council Review</h1>
-            <div class="meta">
-                <strong>{filename}</strong> &bull; {timestamp}
+            <div class="header-content">
+                <div class="header-logo">
+                    <img src="https://cdn.jsdelivr.net/gh/laurence73/assets@main/logos/ai-council-logo.png" alt="AI Council Logo" />
+                </div>
+                <div class="header-text">
+                    <h1>Review</h1>
+                    <div class="meta">
+                        <strong>{filename}</strong> &bull; {timestamp}
+                    </div>
+                </div>
             </div>
         </div>
+'''
 
+    # Add token usage section if we have usage data
+    if usage_by_model:
+        total_input = sum(u.get("input_tokens", 0) for u in usage_by_model.values())
+        total_output = sum(u.get("output_tokens", 0) for u in usage_by_model.values())
+        total_cost = sum(calculate_cost(m, u.get("input_tokens", 0), u.get("output_tokens", 0), power_mode) for m, u in usage_by_model.items())
+
+        mode_label = " (POWER MODE)" if power_mode else ""
+        html += f'''
+        <div class="usage-card">
+            <h3>📊 Token Usage & Cost{mode_label}</h3>
+            <div class="usage-grid">
+'''
+        for model, usage in usage_by_model.items():
+            input_tokens = usage.get("input_tokens", 0)
+            output_tokens = usage.get("output_tokens", 0)
+            cost = calculate_cost(model, input_tokens, output_tokens, power_mode)
+            model_class = "gpt" if "gpt" in model.lower() else ("grok" if "grok" in model.lower() else ("claude" if "claude" in model.lower() else "gemini"))
+            html += f'''
+                <div class="usage-item">
+                    <span class="usage-model {model_class}">{model.upper()}</span>
+                    <span class="usage-tokens">{input_tokens:,} in / {output_tokens:,} out</span>
+                    <span class="usage-cost">${cost:.4f}</span>
+                </div>
+'''
+
+        html += f'''
+                <div class="usage-item usage-total">
+                    <span class="usage-model">TOTAL</span>
+                    <span class="usage-tokens">{total_input:,} in / {total_output:,} out</span>
+                    <span class="usage-cost">${total_cost:.4f}</span>
+                </div>
+            </div>
+        </div>
+'''
+
+    html += '''
         <div class="score-grid">
 '''
 
@@ -677,7 +1021,7 @@ def generate_html_report(file_path: str, reviews: dict, output_path: str = None)
         if isinstance(review, dict):
             score = review.get("quality_score", 0) if "error" not in review else "ERR"
             issues_count = len(review.get("issues", [])) if "error" not in review else 0
-            model_class = "gpt" if "gpt" in model.lower() else ("grok" if "grok" in model.lower() else "gemini")
+            model_class = "gpt" if "gpt" in model.lower() else ("grok" if "grok" in model.lower() else ("claude" if "claude" in model.lower() else "gemini"))
             score_class = "good" if isinstance(score, (int, float)) and score >= 7 else ("medium" if isinstance(score, (int, float)) and score >= 5 else "bad")
 
             html += f'''
@@ -710,6 +1054,7 @@ def generate_html_report(file_path: str, reviews: dict, output_path: str = None)
             <div class="issue {sev}">
                 <div class="issue-header">
                     <span class="badge {sev}">{issue.get("severity", "INFO")}</span>
+                    <span class="issue-file">{filename}</span>
                     <span class="issue-line">Line {issue.get("line", "?")}</span>
                 </div>
                 <div class="issue-desc">{issue.get("description", "")}</div>
@@ -723,8 +1068,8 @@ def generate_html_report(file_path: str, reviews: dict, output_path: str = None)
         if isinstance(review, dict) and "error" not in review:
             issues = review.get("issues", [])
             summary = review.get("summary", "")
-            model_class = "gpt" if "gpt" in model.lower() else ("grok" if "grok" in model.lower() else "gemini")
-            emoji = "🧠" if "gpt" in model.lower() else ("⚡" if "grok" in model.lower() else "💎")
+            model_class = "gpt" if "gpt" in model.lower() else ("grok" if "grok" in model.lower() else ("claude" if "claude" in model.lower() else "gemini"))
+            emoji = "🧠" if "gpt" in model.lower() else ("⚡" if "grok" in model.lower() else ("🔮" if "claude" in model.lower() else "💎"))
 
             html += f'''
         <div class="section">
@@ -737,6 +1082,7 @@ def generate_html_report(file_path: str, reviews: dict, output_path: str = None)
             <div class="issue {sev}">
                 <div class="issue-header">
                     <span class="badge {sev}">{issue.get("severity", "INFO")}</span>
+                    <span class="issue-file">{filename}</span>
                     <span class="issue-line">Line {issue.get("line", "?")}</span>
                 </div>
                 <div class="issue-desc">{issue.get("description", "")}</div>
@@ -807,6 +1153,8 @@ def main():
     review_parser.add_argument("file", help="File to review")
     review_parser.add_argument("--force", "-f", action="store_true", help="Force re-review")
     review_parser.add_argument("--gemini", "-g", action="store_true", help="Include Gemini in review")
+    review_parser.add_argument("--claude", "-c", action="store_true", help="Include Claude in review")
+    review_parser.add_argument("--power", "-p", action="store_true", help="Use premium models (higher cost, better results)")
     review_parser.add_argument("--html", action="store_true", help="Generate HTML report")
     review_parser.add_argument("--output", "-o", help="Output path for HTML report")
 
@@ -828,9 +1176,11 @@ def main():
 
     args = parser.parse_args()
 
-    # Enable gemini if --gemini flag is passed on review command
+    # Enable optional models and power mode if flags are passed on review command
     enable_gemini = getattr(args, 'gemini', False)
-    council = AICouncil(enable_gemini=enable_gemini)
+    enable_claude = getattr(args, 'claude', False)
+    power_mode = getattr(args, 'power', False)
+    council = AICouncil(enable_gemini=enable_gemini, enable_claude=enable_claude, power_mode=power_mode)
 
     if args.command == "status":
         print("\n=== AI Council Status ===")
@@ -840,26 +1190,66 @@ def main():
         print(f"Pending reviews: {len(pending)}")
 
     elif args.command == "review":
-        print(f"\nReviewing: {args.file}")
+        # Get actual model names being used
+        mode = "power" if power_mode else "standard"
+        model_names = MODEL_CONFIGS[mode]
+        active_models = [(k, model_names[k]) for k in council.reviewers.keys()]
+
+        print(f"\n{'='*60}")
+        print(f"  AI Council Review: {Path(args.file).name}")
+        print(f"  Mode: {'POWER' if power_mode else 'Standard'}")
+        print(f"{'='*60}")
+        print(f"  Models:")
+        for key, model_id in active_models:
+            print(f"    - {key.upper():8s} -> {model_id}")
+        print(f"{'='*60}\n")
+
         result = asyncio.run(council.review_file(args.file, force=args.force))
+
         if result.get("cached"):
-            print("[*] Using cached review")
+            print("\n[*] Using cached review (use --force to re-review)")
 
         reviews_data = {}
+        usage_by_model = {}
         if "reviews" in result:
+            # Print detailed results
+            print(f"\n{'='*60}")
+            print("  Detailed Results")
+            print(f"{'='*60}")
+
             for model, review in result["reviews"].items():
                 reviews_data[model] = review
-                print(f"\n[{model.upper()}]")
                 if "error" in review:
-                    print(f"  Error: {review['error']}")
+                    print(f"\n  [{model.upper()}] ERROR: {review['error'][:80]}")
                 else:
-                    print(f"  Score: {review.get('quality_score', '?')}/10")
-                    print(f"  Issues: {len(review.get('issues', []))}")
+                    issues = review.get("issues", [])
+                    score = review.get('quality_score', '?')
+                    print(f"\n  [{model.upper()}] Score: {score}/10 | Issues: {len(issues)}")
+
+                    # Show top issues by severity
+                    severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+                    sorted_issues = sorted(issues, key=lambda x: severity_order.get(x.get("severity", "INFO"), 5))
+                    for issue in sorted_issues[:3]:  # Show top 3
+                        sev = issue.get("severity", "?")
+                        line = issue.get("line", "?")
+                        desc = issue.get("description", "")[:60]
+                        print(f"    [{sev}] Line {line}: {desc}...")
+
+                    if len(issues) > 3:
+                        print(f"    ... and {len(issues) - 3} more issues")
+
+                    # Collect token usage
+                    if "_usage" in review:
+                        usage_by_model[model] = review["_usage"]
+
+            # Print token usage summary
+            if usage_by_model:
+                print(format_usage_summary(usage_by_model, power_mode))
 
         # Generate HTML report if --html flag is passed
         if getattr(args, 'html', False) and reviews_data:
             output_path = getattr(args, 'output', None)
-            report_path = generate_html_report(args.file, reviews_data, output_path)
+            report_path = generate_html_report(args.file, reviews_data, output_path, power_mode)
             print(f"\n[+] HTML report generated: {report_path}")
 
     elif args.command == "show":
