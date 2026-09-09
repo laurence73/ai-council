@@ -191,7 +191,7 @@ class GPTReviewer:
 
 
 class GrokReviewer:
-    """xAI Grok reviewer"""
+    """xAI Grok reviewer - uses grok-build (code-optimized model)"""
 
     def __init__(self, api_key: str):
         if not HAS_HTTPX:
@@ -209,15 +209,18 @@ class GrokReviewer:
                         "Content-Type": "application/json"
                     },
                     json={
-                        "model": "grok-beta",
+                        "model": "grok-build-0.1",  # Code-optimized Grok model
                         "messages": [
                             {"role": "system", "content": REVIEW_SYSTEM_PROMPT},
                             {"role": "user", "content": f"File: {file_path}\n\n```\n{code}\n```"}
                         ]
                     },
-                    timeout=60.0
+                    timeout=90.0
                 )
                 data = response.json()
+                # Handle API errors
+                if "error" in data:
+                    return {"error": data.get("error", "Unknown API error"), "issues": [], "quality_score": 0}
                 content = data["choices"][0]["message"]["content"]
                 # Try to extract JSON from response
                 if "```json" in content:
