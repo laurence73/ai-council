@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Council Review - ai_council.py</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🤖</text></svg>">
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+        :root {
+            --indigo-500: #6366f1; --indigo-400: #818cf8; --purple-500: #a855f7;
+            --cyan-500: #06b6d4; --cyan-400: #22d3ee; --zinc-900: #18181b;
+            --zinc-800: #27272a; --zinc-700: #3f3f46; --zinc-600: #52525b;
+            --zinc-500: #71717a; --zinc-400: #a1a1aa; --emerald-500: #10b981;
+            --emerald-400: #34d399; --rose-500: #f43f5e; --amber-500: #f59e0b;
+            --bg-dark: #09090b; --text-primary: #fafafa; --text-secondary: #a1a1aa;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Inter', -apple-system, sans-serif;
+            background: var(--bg-dark); color: var(--text-primary);
+            line-height: 1.7; font-size: 16px; padding: 2rem;
+        }
+        .container { max-width: 900px; margin: 0 auto; }
+        .header {
+            background: linear-gradient(135deg, var(--zinc-900), var(--zinc-800));
+            border: 1px solid var(--zinc-700); border-radius: 16px;
+            padding: 2rem; margin-bottom: 2rem; position: relative; overflow: hidden;
+        }
+        .header::before {
+            content: ''; position: absolute; top: 0; left: 0; right: 0; height: 4px;
+            background: linear-gradient(90deg, var(--indigo-500), var(--purple-500), var(--cyan-500));
+        }
+        .header h1 {
+            font-size: 1.75rem; font-weight: 700; margin-bottom: 0.5rem;
+            background: linear-gradient(135deg, var(--indigo-400), var(--cyan-400));
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+        }
+        .header .meta { color: var(--zinc-400); font-size: 0.875rem; }
+        .score-grid {
+            display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem; margin-bottom: 2rem;
+        }
+        .score-card {
+            background: var(--zinc-800); border: 1px solid var(--zinc-700);
+            border-radius: 12px; padding: 1.5rem; text-align: center;
+        }
+        .score-card.gpt { border-top: 4px solid #10a37f; }
+        .score-card.grok { border-top: 4px solid #1da1f2; }
+        .score-card.gemini { border-top: 4px solid #8e44ad; }
+        .score-card.consensus { border-top: 4px solid var(--indigo-500); }
+        .score-card h3 { font-size: 0.875rem; color: var(--zinc-400); margin-bottom: 0.5rem; }
+        .score-card .score { font-size: 2.5rem; font-weight: 700; }
+        .score-card .score.good { color: var(--emerald-400); }
+        .score-card .score.medium { color: var(--amber-500); }
+        .score-card .score.bad { color: var(--rose-500); }
+        .section {
+            background: var(--zinc-800); border: 1px solid var(--zinc-700);
+            border-radius: 12px; padding: 1.5rem; margin-bottom: 1.5rem;
+        }
+        .section h2 {
+            font-size: 1.1rem; font-weight: 600; margin-bottom: 1rem;
+            padding-bottom: 0.5rem; border-bottom: 1px solid var(--zinc-700);
+            display: flex; align-items: center; gap: 0.5rem;
+        }
+        .issue {
+            background: var(--zinc-900); border-radius: 8px; padding: 1rem;
+            margin-bottom: 0.75rem; border-left: 4px solid var(--zinc-600);
+        }
+        .issue.critical { border-left-color: #dc2626; }
+        .issue.high { border-left-color: #ea580c; }
+        .issue.medium { border-left-color: var(--amber-500); }
+        .issue.low { border-left-color: var(--cyan-500); }
+        .issue.info { border-left-color: var(--zinc-500); }
+        .issue-header { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.5rem; }
+        .badge {
+            display: inline-block; padding: 0.2em 0.6em; font-size: 0.7rem;
+            font-weight: 600; border-radius: 4px; text-transform: uppercase;
+        }
+        .badge.critical { background: #dc2626; color: white; }
+        .badge.high { background: #ea580c; color: white; }
+        .badge.medium { background: var(--amber-500); color: black; }
+        .badge.low { background: var(--cyan-500); color: white; }
+        .badge.info { background: var(--zinc-600); color: var(--text-secondary); }
+        .issue-line { font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; color: var(--zinc-400); }
+        .issue-desc { color: var(--text-secondary); font-size: 0.9rem; }
+        .issue-rec { color: var(--emerald-400); font-size: 0.85rem; margin-top: 0.5rem; font-style: italic; }
+        .model-tag {
+            font-size: 0.65rem; padding: 0.15em 0.4em; border-radius: 3px;
+            background: var(--zinc-700); color: var(--zinc-400);
+        }
+        .summary { color: var(--text-secondary); font-size: 0.9rem; margin-bottom: 1rem; }
+        .footer { text-align: center; margin-top: 2rem; color: var(--zinc-500); font-size: 0.8rem; }
+        code { font-family: 'JetBrains Mono', monospace; background: var(--zinc-900); padding: 0.1em 0.3em; border-radius: 3px; font-size: 0.85em; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🤖 AI Council Review</h1>
+            <div class="meta">
+                <strong>ai_council.py</strong> &bull; 2026-09-09 12:10:29
+            </div>
+        </div>
+
+        <div class="score-grid">
+
+            <div class="score-card gpt">
+                <h3>GPT-4</h3>
+                <div class="score bad">4/10</div>
+                <div style="color: var(--zinc-400); font-size: 0.8rem;">6 issues</div>
+            </div>
+
+            <div class="score-card grok">
+                <h3>GROK</h3>
+                <div class="score bad">ERR/10</div>
+                <div style="color: var(--zinc-400); font-size: 0.8rem;">0 issues</div>
+            </div>
+
+            <div class="score-card consensus">
+                <h3>CONSENSUS</h3>
+                <div class="score bad">4.0/10</div>
+                <div style="color: var(--zinc-400); font-size: 0.8rem;">0 agreed issues</div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>🧠 GPT-4 Review</h2>
+            <div class="summary">The code has several high and medium severity issues related to security and performance, particularly concerning SQL injection and database connection management. There are also concerns about error handling and the security of environment variables.</div>
+
+            <div class="issue high">
+                <div class="issue-header">
+                    <span class="badge high">HIGH</span>
+                    <span class="issue-line">Line 77</span>
+                </div>
+                <div class="issue-desc">Potential SQL injection vulnerability in database operations.</div>
+                <div class='issue-rec'>💡 Use parameterized queries or prepared statements to prevent SQL injection.</div>
+            </div>
+
+            <div class="issue medium">
+                <div class="issue-header">
+                    <span class="badge medium">MEDIUM</span>
+                    <span class="issue-line">Line 77</span>
+                </div>
+                <div class="issue-desc">Database connection is opened but not explicitly closed in each method.</div>
+                <div class='issue-rec'>💡 Use context managers to ensure that database connections are properly closed after operations.</div>
+            </div>
+
+            <div class="issue high">
+                <div class="issue-header">
+                    <span class="badge high">HIGH</span>
+                    <span class="issue-line">Line None</span>
+                </div>
+                <div class="issue-desc">Sensitive information such as API keys might be exposed if environment variables are not properly secured.</div>
+                <div class='issue-rec'>💡 Ensure environment variables are secured and not accessible by unauthorized users.</div>
+            </div>
+
+            <div class="issue medium">
+                <div class="issue-header">
+                    <span class="badge medium">MEDIUM</span>
+                    <span class="issue-line">Line None</span>
+                </div>
+                <div class="issue-desc">The application does not handle exceptions for missing required packages gracefully.</div>
+                <div class='issue-rec'>💡 Implement graceful error handling and user-friendly messages when required packages are missing.</div>
+            </div>
+
+            <div class="issue low">
+                <div class="issue-header">
+                    <span class="badge low">LOW</span>
+                    <span class="issue-line">Line None</span>
+                </div>
+                <div class="issue-desc">The code lacks comprehensive documentation and comments for complex functions and logic.</div>
+                <div class='issue-rec'>💡 Add detailed comments and documentation to improve code maintainability and understandability.</div>
+            </div>
+
+            <div class="issue medium">
+                <div class="issue-header">
+                    <span class="badge medium">MEDIUM</span>
+                    <span class="issue-line">Line None</span>
+                </div>
+                <div class="issue-desc">The application may suffer from performance issues due to synchronous database operations within an asynchronous framework.</div>
+                <div class='issue-rec'>💡 Consider using asynchronous database libraries to improve performance in an asyncio environment.</div>
+            </div>
+        </div>
+
+        <div class="footer">
+            Generated by AI Council &bull; Multi-Model Code Review System<br>
+            <a href="https://github.com/laurence73/ai-council" style="color: var(--indigo-400);">github.com/laurence73/ai-council</a>
+        </div>
+    </div>
+</body>
+</html>

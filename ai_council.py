@@ -207,13 +207,71 @@ class GPTReviewer:
 class GrokReviewer:
     """xAI Grok reviewer - uses grok-build (code-optimized model)"""
 
+    # Max characters per chunk (Grok works better with smaller contexts)
+    MAX_CHUNK_SIZE = 15000
+
     def __init__(self, api_key: str):
         if not HAS_HTTPX:
             raise ImportError("httpx package not installed. Run: pip install httpx")
         self.api_key = api_key
         self.base_url = "https://api.x.ai/v1"
 
+    def _chunk_code(self, code: str) -> list:
+        """Split large files into reviewable chunks by function/class boundaries"""
+        if len(code) <= self.MAX_CHUNK_SIZE:
+            return [code]
+
+        chunks = []
+        lines = code.split('\n')
+        current_chunk = []
+        current_size = 0
+
+        for line in lines:
+            line_size = len(line) + 1
+            # Start new chunk at class/function boundaries when near limit
+            is_boundary = line.strip().startswith(('class ', 'def ', 'async def '))
+            if current_size + line_size > self.MAX_CHUNK_SIZE and is_boundary and current_chunk:
+                chunks.append('\n'.join(current_chunk))
+                current_chunk = [line]
+                current_size = line_size
+            else:
+                current_chunk.append(line)
+                current_size += line_size
+
+        if current_chunk:
+            chunks.append('\n'.join(current_chunk))
+
+        return chunks
+
     async def review(self, code: str, file_path: str) -> dict:
+        chunks = self._chunk_code(code)
+
+        if len(chunks) == 1:
+            return await self._review_chunk(chunks[0], file_path, None)
+
+        # Review multiple chunks and merge results
+        all_issues = []
+        summaries = []
+        scores = []
+
+        for i, chunk in enumerate(chunks):
+            result = await self._review_chunk(chunk, file_path, i + 1)
+            if "error" not in result:
+                all_issues.extend(result.get("issues", []))
+                summaries.append(result.get("summary", ""))
+                scores.append(result.get("quality_score", 5))
+
+        if not scores:
+            return {"error": "All chunks failed to review", "issues": [], "quality_score": 0}
+
+        return {
+            "issues": all_issues,
+            "summary": f"Reviewed in {len(chunks)} chunks. " + " ".join(summaries[:2]),
+            "quality_score": sum(scores) // len(scores)
+        }
+
+    async def _review_chunk(self, code: str, file_path: str, chunk_num: Optional[int]) -> dict:
+        chunk_info = f" (chunk {chunk_num})" if chunk_num else ""
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.post(
@@ -223,25 +281,48 @@ class GrokReviewer:
                         "Content-Type": "application/json"
                     },
                     json={
-                        "model": "grok-build-0.1",  # Code-optimized Grok model
+                        "model": "grok-build-0.1",
                         "messages": [
-                            {"role": "system", "content": REVIEW_SYSTEM_PROMPT},
-                            {"role": "user", "content": f"File: {file_path}\n\n```\n{code}\n```"}
+                            {"role": "system", "content": REVIEW_SYSTEM_PROMPT + "\n\nIMPORTANT: You MUST respond with ONLY valid JSON, no markdown, no explanation."},
+                            {"role": "user", "content": f"File: {file_path}{chunk_info}\n\n```\n{code}\n```"}
                         ]
                     },
-                    timeout=90.0
+                    timeout=120.0
                 )
                 data = response.json()
+
                 # Handle API errors
                 if "error" in data:
-                    return {"error": data.get("error", "Unknown API error"), "issues": [], "quality_score": 0}
+                    return {"error": str(data.get("error", "Unknown API error")), "issues": [], "quality_score": 0}
+
                 content = data["choices"][0]["message"]["content"]
-                # Try to extract JSON from response
+
+                # Try to extract JSON from response (Grok sometimes wraps in markdown)
                 if "```json" in content:
                     content = content.split("```json")[1].split("```")[0]
                 elif "```" in content:
-                    content = content.split("```")[1].split("```")[0]
+                    parts = content.split("```")
+                    for part in parts:
+                        part = part.strip()
+                        if part.startswith("{"):
+                            content = part
+                            break
+
+                # Clean up content
+                content = content.strip()
+                if not content.startswith("{"):
+                    # Try to find JSON object in response
+                    start = content.find("{")
+                    end = content.rfind("}") + 1
+                    if start != -1 and end > start:
+                        content = content[start:end]
+                    else:
+                        return {"error": f"No JSON found in response: {content[:200]}...", "issues": [], "quality_score": 0}
+
                 return json.loads(content)
+
+        except json.JSONDecodeError as e:
+            return {"error": f"JSON parse error: {e}. Response started with: {content[:100] if 'content' in dir() else 'N/A'}...", "issues": [], "quality_score": 0}
         except Exception as e:
             return {"error": str(e), "issues": [], "quality_score": 0}
 
