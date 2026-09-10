@@ -1,0 +1,173 @@
+{
+  "name": "ai-council",
+  "displayName": "AI Council - Multi-Model Code Review",
+  "description": "Get parallel code reviews from GPT-4, Grok, Claude, and Gemini - find bugs that single-model reviews miss.",
+  "version": "0.1.0",
+  "publisher": "laurence73",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Linters",
+    "Other"
+  ],
+  "keywords": [
+    "code review",
+    "ai",
+    "gpt-4",
+    "claude",
+    "grok",
+    "gemini",
+    "multi-model",
+    "security"
+  ],
+  "activationEvents": [
+    "onView:ai-council.sidebar"
+  ],
+  "main": "./out/extension.js",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/laurence73/ai-council"
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "ai-council.reviewFile",
+        "title": "AI Council: Review Current File",
+        "icon": "$(eye)"
+      },
+      {
+        "command": "ai-council.reviewFilePower",
+        "title": "AI Council: Review Current File (Power Mode)",
+        "icon": "$(zap)"
+      },
+      {
+        "command": "ai-council.showLastReview",
+        "title": "AI Council: Show Last Review"
+      },
+      {
+        "command": "ai-council.clearCache",
+        "title": "AI Council: Clear Review Cache"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "ai-council.reviewFile",
+          "group": "navigation",
+          "when": "editorLangId =~ /csharp|javascript|typescript|python|java|go|rust|cpp|c/"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "ai-council.reviewFile",
+          "group": "ai-council@1",
+          "when": "editorTextFocus"
+        },
+        {
+          "command": "ai-council.reviewFilePower",
+          "group": "ai-council@2",
+          "when": "editorTextFocus"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "ai-council.reviewFile",
+          "group": "ai-council@1",
+          "when": "resourceExtname =~ /\\.(cs|js|ts|py|java|go|rs|cpp|c|jsx|tsx)$/"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "AI Council",
+      "properties": {
+        "ai-council.pythonPath": {
+          "type": "string",
+          "default": "python",
+          "description": "Path to Python executable"
+        },
+        "ai-council.scriptPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to ai_council.py script. Leave empty to use bundled script."
+        },
+        "ai-council.apiKeys.openai": {
+          "type": "string",
+          "default": "",
+          "description": "OpenAI API Key (for GPT-4). Get yours at: https://platform.openai.com/api-keys"
+        },
+        "ai-council.apiKeys.anthropic": {
+          "type": "string",
+          "default": "",
+          "description": "Anthropic API Key (for Claude). Get yours at: https://console.anthropic.com/"
+        },
+        "ai-council.apiKeys.xai": {
+          "type": "string",
+          "default": "",
+          "description": "xAI API Key (for Grok). Get yours at: https://console.x.ai/"
+        },
+        "ai-council.apiKeys.google": {
+          "type": "string",
+          "default": "",
+          "description": "Google API Key (for Gemini - FREE!). Get yours at: https://aistudio.google.com/app/apikey"
+        },
+        "ai-council.apiKeys.groq": {
+          "type": "string",
+          "default": "",
+          "description": "Groq API Key (for Llama - FREE!). Get yours at: https://console.groq.com/"
+        },
+        "ai-council.autoReviewOnSave": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically queue files for review on save"
+        },
+        "ai-council.showInlineHints": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show inline hints for issues at specific line numbers"
+        },
+        "ai-council.defaultMode": {
+          "type": "string",
+          "enum": ["standard", "power"],
+          "default": "standard",
+          "description": "Default review mode"
+        }
+      }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "ai-council",
+          "title": "AI Council",
+          "icon": "media/ai-council-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "ai-council": [
+        {
+          "type": "webview",
+          "id": "ai-council.sidebar",
+          "name": "AI Council"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile",
+    "lint": "eslint src --ext ts",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@types/vscode": "^1.85.0",
+    "@typescript-eslint/eslint-plugin": "^6.13.0",
+    "@typescript-eslint/parser": "^6.13.0",
+    "eslint": "^8.54.0",
+    "typescript": "^5.3.0",
+    "@vscode/vsce": "^2.22.0"
+  }
+}

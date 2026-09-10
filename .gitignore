@@ -29,3 +29,23 @@ Thumbs.db
 # Environment (contains API keys!)
 .env
 .env.local
+
+# Node.js / VS Code Extension
+node_modules/
+vscode-extension/node_modules/
+vscode-extension/out/
+*.vsix
+
+# Build artifacts
+dist/
+build/
+
+# Reports and AI Council data (generated, don't commit)
+reports/
+.ai-council/
+
+# Assets repo (separate git repo)
+assets-repo/
+
+# Misc
+logo-base64.txt

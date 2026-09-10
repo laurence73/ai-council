@@ -10,11 +10,43 @@
 </p>
 
 <p align="center">
+  <a href="#vs-code-extension">VS Code Extension</a> -
   <a href="#quick-start">Quick Start</a> -
-  <a href="#features">Features</a> -
-  <a href="#power-mode">Power Mode</a> -
-  <a href="#claude-code-integration">Claude Code Integration</a>
+  <a href="#free-models">Free Models</a> -
+  <a href="#power-mode">Power Mode</a>
 </p>
+
+---
+
+## VS Code Extension
+
+**Install the AI Council extension for VS Code!**
+
+### Features
+
+- Side panel with model toggles
+- One-click code review
+- Free vs Paid model grouping
+- API key settings in VS Code
+- Real-time progress tracking
+- HTML report generation
+
+### Installation
+
+1. Download `ai-council-0.1.0.vsix` from [Releases](https://github.com/laurence73/ai-council/releases)
+2. In VS Code: `Ctrl+Shift+P` -> "Extensions: Install from VSIX..."
+3. Select the downloaded file
+4. Configure API keys in Settings (`Ctrl+,` -> search "AI Council")
+
+### Screenshot
+
+The extension adds an AI Council icon to the Activity Bar with:
+
+- **Free Models**: Gemini, Groq/Llama, Ollama (local)
+- **Paid Models**: GPT-4, Claude, Grok, + more coming soon
+- **Options**: Power Mode, HTML Report toggle
+- **Actions**: Review Current File, Power Review
+- **Tools**: Check Status, Clear Cache, Settings
 
 ---
 
@@ -35,24 +67,48 @@ Instead of relying on a single AI for code review, AI Council runs your code thr
 
 ---
 
+## Free Models
+
+Several models have **free tiers** - perfect for getting started!
+
+| Provider | Model | Free Tier | Get API Key |
+|----------|-------|-----------|-------------|
+| **Google Gemini** | gemini-2.0-flash | 1M tokens/day | [aistudio.google.com](https://aistudio.google.com/app/apikey) |
+| **Groq** | Llama 3.1 70B | 14,400 req/day | [console.groq.com](https://console.groq.com/) |
+| **Ollama** | Any local model | Unlimited (local) | [ollama.ai](https://ollama.ai/) |
+
+### Using Free Models Only
+
+```bash
+# Use only Gemini (free)
+python ai_council.py review myfile.cs --gemini --no-gpt --no-claude --no-grok
+```
+
+---
+
 ## Quick Start
 
 ### 1. Install Dependencies
 
 ```bash
-pip install openai httpx anthropic
+pip install openai httpx anthropic google-generativeai
 ```
 
 ### 2. Set API Keys
 
-Create a `.env` file in the AI Council directory:
+**Option A: Environment Variables**
 
 ```env
 OPENAI_API_KEY=sk-...
 XAI_API_KEY=xai-...
 ANTHROPIC_API_KEY=sk-ant-...
-GOOGLE_API_KEY=...          # Optional, for Gemini
+GOOGLE_API_KEY=...          # FREE - Gemini
+GROQ_API_KEY=...            # FREE - Llama via Groq
 ```
+
+**Option B: VS Code Settings** (if using extension)
+
+`Ctrl+,` -> Search "AI Council" -> Enter keys in settings fields
 
 ### 3. Review Your First File
 
@@ -142,17 +198,7 @@ python ai_council.py review myfile.cs --power
 |------|--------|---------------------|
 | Standard | 3 models | ~$0.07 |
 | Power | 3 models | ~$0.30-0.50 |
-
-Power mode shows a warning before running:
-
-```
-[!] POWER MODE ENABLED - Using premium models (higher cost)
-    Estimated cost: ~$0.30-0.50 per review
-
-[+] GPT-4 reviewer enabled (gpt-6-astra)
-[+] Grok reviewer enabled (grok-3)
-[+] Claude reviewer enabled (claude-fable-5-1)
-```
+| **Free only** | Gemini | **$0.00** |
 
 ---
 
@@ -176,30 +222,11 @@ python ai_council.py review <file> --power
 # Generate HTML report
 python ai_council.py review <file> --html
 
-# Combine flags
-python ai_council.py review <file> --power --html --force
+# Disable specific models
+python ai_council.py review <file> --no-gpt --no-claude
 
-# Custom output path for HTML
-python ai_council.py review <file> --html --output "C:/reports/my-review.html"
-```
-
-### Other Commands
-
-```bash
-# Show cached reviews for a file
-python ai_council.py show <file>
-
-# Check system status
-python ai_council.py status
-
-# Queue file for background review
-python ai_council.py queue <file> --priority high
-
-# Process queued reviews
-python ai_council.py process
-
-# Watch directory for changes
-python ai_council.py watch --path "C:\your\project"
+# Free models only
+python ai_council.py review <file> --gemini --no-gpt --no-claude --no-grok
 ```
 
 ### Flags Reference
@@ -208,6 +235,9 @@ python ai_council.py watch --path "C:\your\project"
 |------|-------|-------------|
 | `--force` | `-f` | Bypass cache, force fresh review |
 | `--gemini` | `-g` | Include Gemini in review |
+| `--no-gpt` | | Disable GPT-4 reviewer |
+| `--no-claude` | | Disable Claude reviewer |
+| `--no-grok` | | Disable Grok reviewer |
 | `--power` | `-p` | Use premium models (higher cost) |
 | `--html` | | Generate HTML report |
 | `--output` | `-o` | Custom output path for HTML |
@@ -217,26 +247,52 @@ python ai_council.py watch --path "C:\your\project"
 
 ---
 
-## Auto-Create GitHub Issues
+## API Keys
 
-Automatically create GitHub issues for problems found during code review:
+### Paid Models
 
-```bash
-# Create issues in current repo (consensus findings only)
-python ai_council.py review myfile.cs --issues
+| Provider | Get Key | Env Variable |
+|----------|---------|--------------|
+| OpenAI | [platform.openai.com](https://platform.openai.com/api-keys) | `OPENAI_API_KEY` |
+| xAI (Grok) | [console.x.ai](https://console.x.ai/) | `XAI_API_KEY` |
+| Anthropic | [console.anthropic.com](https://console.anthropic.com/) | `ANTHROPIC_API_KEY` |
 
-# Create issues in a specific repo
-python ai_council.py review myfile.cs --issues --repo owner/repo
+### Free Models
 
-# Create issues for ALL findings (not just consensus)
-python ai_council.py review myfile.cs --issues-all
-```
+| Provider | Get Key | Env Variable |
+|----------|---------|--------------|
+| Google Gemini | [aistudio.google.com](https://aistudio.google.com/app/apikey) | `GOOGLE_API_KEY` |
+| Groq (Llama) | [console.groq.com](https://console.groq.com/) | `GROQ_API_KEY` |
+| Ollama | No key needed (local) | N/A |
 
-Issues are created with:
-- Severity-based labels (critical, high, medium, low)
-- File path and line number
-- Full description and recommendation
-- List of models that found the issue
+---
+
+## Roadmap
+
+### Completed
+
+- [x] VS Code Extension - Basic (#22)
+- [x] VS Code Extension - Side Panel UI (#24)
+- [x] API Key Settings in VS Code
+- [x] Free vs Paid Model Grouping
+
+### Coming Soon - New Models
+
+| Issue | Model | Type | Status |
+|-------|-------|------|--------|
+| [#30](https://github.com/laurence73/ai-council/issues/30) | Mistral Codestral | Paid | Planned |
+| [#31](https://github.com/laurence73/ai-council/issues/31) | DeepSeek Coder | Paid | Planned |
+| [#32](https://github.com/laurence73/ai-council/issues/32) | Qwen 2.5 Coder | Paid | Planned |
+| [#33](https://github.com/laurence73/ai-council/issues/33) | Llama 3.1 (Groq) | **FREE** | Planned |
+| [#34](https://github.com/laurence73/ai-council/issues/34) | Cohere Command R+ | Paid | Planned |
+| [#35](https://github.com/laurence73/ai-council/issues/35) | Ollama (Local) | **FREE** | Planned |
+
+### Future
+
+- [ ] VS Code Extension - Diagnostics Integration (#23)
+- [ ] VS Code Extension - Native TypeScript (#25)
+- [ ] VS Code Extension - Language Server Protocol (#26)
+- [ ] Visual Studio Extension (#27)
 
 ---
 
@@ -271,79 +327,6 @@ Then use in Claude Code:
 /ai-council src/MyService.cs --power --html
 ```
 
-### Auto-Queue on Edit (Hooks)
-
-Add to `~/.claude/settings.json`:
-
-```json
-{
-  "hooks": {
-    "PostToolUse": [
-      {
-        "matcher": "^(Edit|Write)$",
-        "command": "python \"C:/AI COUNCIL/queue_review.py\" \"$TOOL_INPUT_file_path\""
-      }
-    ]
-  }
-}
-```
-
-Now every file Claude edits automatically gets queued for multi-model review!
-
----
-
-## Model Pricing
-
-### Standard Models (Default)
-
-| Provider | Model | Input (per 1M) | Output (per 1M) |
-|----------|-------|----------------|-----------------|
-| OpenAI | gpt-4-turbo | $10.00 | $30.00 |
-| xAI | grok-3-mini | $5.00 | $15.00 |
-| Anthropic | claude-sonnet-4-5 | $3.00 | $15.00 |
-| Google | gemini-2.0-flash | $0.075 | $0.30 |
-
-### Power Models (`--power`)
-
-| Provider | Model | Input (per 1M) | Output (per 1M) |
-|----------|-------|----------------|-----------------|
-| OpenAI | gpt-6-astra | $5.00 | $20.00 |
-| xAI | grok-3 | $3.00 | $15.00 |
-| Anthropic | claude-fable-5-1 | $10.00 | $50.00 |
-| Google | gemini-2.5-pro | $1.25 | $10.00 |
-
----
-
-## API Keys
-
-| Provider | Get Key | Env Variable |
-|----------|---------|--------------|
-| OpenAI | [platform.openai.com](https://platform.openai.com/api-keys) | `OPENAI_API_KEY` |
-| xAI (Grok) | [console.x.ai](https://console.x.ai/) | `XAI_API_KEY` |
-| Anthropic | [console.anthropic.com](https://console.anthropic.com/) | `ANTHROPIC_API_KEY` |
-| Google | [makersuite.google.com](https://makersuite.google.com/app/apikey) | `GOOGLE_API_KEY` |
-
----
-
-## Monthly Cost Estimates
-
-### Per Review (typical 500-line file)
-
-| Mode | Models | Cost |
-|------|--------|------|
-| Standard (3 models) | GPT-4 + Grok + Claude | ~$0.07 |
-| Standard + Gemini | All 4 models | ~$0.08 |
-| Power (3 models) | Astra + Grok-3 + Fable | ~$0.35 |
-| Power + Gemini | All 4 premium | ~$0.45 |
-
-### Monthly Usage
-
-| Reviews/Day | Standard | Power |
-|-------------|----------|-------|
-| 10 | ~$21/month | ~$105/month |
-| 30 | ~$63/month | ~$315/month |
-| 50 | ~$105/month | ~$525/month |
-
 ---
 
 ## Architecture
@@ -374,8 +357,8 @@ Now every file Claude edits automatically gets queued for multi-model review!
     +-----------+-----------+
     v           v           v
 +--------+ +----------+ +--------+
-|Console | |   HTML   | | Claude |
-|Output  | |  Report  | |  Code  |
+|Console | |   HTML   | |VS Code |
+|Output  | |  Report  | |Extension
 +--------+ +----------+ +--------+
 ```
 
@@ -388,20 +371,8 @@ Now every file Claude edits automatically gets queued for multi-model review!
 | `ai_council.py` | Main CLI and orchestrator |
 | `reviews.db` | SQLite cache (auto-created) |
 | `reports/` | Generated HTML reports |
+| `vscode-extension/` | VS Code extension source |
 | `.env` | API keys (gitignored) |
-
----
-
-## Roadmap
-
-See [GitHub Issues](https://github.com/laurence73/ai-council/issues) for planned features:
-
-- [ ] VS Code Extension - Basic (#22)
-- [ ] VS Code Extension - Diagnostics Integration (#23)
-- [ ] VS Code Extension - Side Panel UI (#24)
-- [ ] VS Code Extension - Native TypeScript (#25)
-- [ ] VS Code Extension - Language Server Protocol (#26)
-- [ ] Visual Studio Extension (#27)
 
 ---
 

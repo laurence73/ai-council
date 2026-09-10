@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <!-- Central dark circle -->
+  <circle cx="12" cy="12" r="5.5" fill="#1e293b"/>
+
+  <!-- Terminal prompt ">" as path -->
+  <path d="M9.5 10 L11.5 12 L9.5 14" stroke="#94a3b8" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+
+  <!-- Underscore "_" as path -->
+  <line x1="12.5" y1="14" x2="14.5" y2="14" stroke="#94a3b8" stroke-width="1.5" stroke-linecap="round"/>
+
+  <!-- Green node (top) - Claude -->
+  <circle cx="12" cy="2.5" r="2.5" fill="#22c55e"/>
+
+  <!-- Blue node (bottom left) - GPT -->
+  <circle cx="4" cy="18" r="2.5" fill="#3b82f6"/>
+
+  <!-- Orange node (bottom right) - Grok -->
+  <circle cx="20" cy="18" r="2.5" fill="#f97316"/>
+</svg>

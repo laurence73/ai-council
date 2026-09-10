@@ -80,13 +80,13 @@ MODEL_CONFIGS = {
         "gpt-4": "gpt-4-turbo",
         "grok": "grok-3-mini",
         "claude": "claude-sonnet-4-5",
-        "gemini": "gemini-2.0-flash",
+        "gemini": "gemini-3-flash-preview",
     },
     "power": {
         "gpt-4": "gpt-6-astra",
         "grok": "grok-3",
         "claude": "claude-fable-5-1",
-        "gemini": "gemini-2.5-pro-preview-06-05",
+        "gemini": "gemini-3.1-pro-preview",
     }
 }
 
@@ -605,7 +605,7 @@ class GrokReviewer:
 class GeminiReviewer:
     """Google Gemini reviewer"""
 
-    def __init__(self, api_key: str, model: str = "gemini-2.0-flash"):
+    def __init__(self, api_key: str, model: str = "gemini-3-flash-preview"):
         if not HAS_HTTPX:
             raise ImportError("httpx package not installed. Run: pip install httpx")
         self.api_key = api_key
@@ -719,14 +719,25 @@ class ClaudeReviewer:
 class AICouncil:
     """Main orchestrator for multi-model reviews"""
 
-    def __init__(self, config: dict = None, enable_gemini: bool = False, enable_claude: bool = False, power_mode: bool = False):
-        self.config = config or DEFAULT_CONFIG.copy()
+    def __init__(self, config: dict = None, enable_gemini: bool = False, enable_gpt: bool = True, enable_claude: bool = True, enable_grok: bool = True, power_mode: bool = False, db_path: str = None):
+        import copy
+        self.config = config or copy.deepcopy(DEFAULT_CONFIG)
         self.power_mode = power_mode
+        # Use custom db_path if provided
+        if db_path:
+            self.config["db_path"] = db_path
+            # Ensure directory exists
+            Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         # Override model settings if requested
         if enable_gemini:
             self.config["models"]["gemini"]["enabled"] = True
-        if enable_claude:
-            self.config["models"]["claude"]["enabled"] = True
+        # Allow disabling default models
+        if not enable_gpt:
+            self.config["models"]["gpt-4"]["enabled"] = False
+        if not enable_claude:
+            self.config["models"]["claude"]["enabled"] = False
+        if not enable_grok:
+            self.config["models"]["grok"]["enabled"] = False
         self.db = ReviewDatabase(self.config["db_path"])
         self.reviewers = {}
         self._setup_reviewers()
@@ -795,23 +806,39 @@ class AICouncil:
         content = path.read_text(encoding="utf-8", errors="ignore")
         file_hash = self.get_file_hash(content)
 
-        # Check if already reviewed (unless forced)
+        # Get currently enabled models
+        enabled_models = set(self.reviewers.keys())
+
+        # Check for cached reviews (unless forced)
+        cached_reviews = {}
+        models_to_run = set(enabled_models)
+
         if not force:
             existing = self.db.get_latest_by_hash(file_hash)
             if existing:
-                return {"cached": True, "reviews": existing}
+                # Filter to only include reviews for currently enabled models
+                for item in existing:
+                    model = item["model"]
+                    if model in enabled_models:
+                        cached_reviews[model] = item["review"]
+                        models_to_run.discard(model)
 
-        # Initialize progress tracker
+                # If all enabled models have cached reviews, return them
+                if not models_to_run:
+                    return {"cached": True, "reviews": cached_reviews}
+
+        # Initialize progress tracker for models that need to be run
         tracker = None
-        if show_progress and self.reviewers:
-            tracker = ProgressTracker(list(self.reviewers.keys()))
+        if show_progress and models_to_run:
+            tracker = ProgressTracker(list(models_to_run))
             tracker.start_spinner()
 
-        # Run reviews in parallel
-        results = {}
+        # Run reviews in parallel for models without cache
+        results = dict(cached_reviews)  # Start with cached results
         tasks = []
 
-        for model_name, reviewer in self.reviewers.items():
+        for model_name in models_to_run:
+            reviewer = self.reviewers[model_name]
             tasks.append(self._review_with_model(model_name, reviewer, content, file_path, tracker))
 
         if tasks:
@@ -825,7 +852,8 @@ class AICouncil:
             tracker.stop_spinner()
             tracker.print_summary()
 
-        return {"cached": False, "reviews": results, "_tracker": tracker}
+        has_cached = len(cached_reviews) > 0
+        return {"cached": has_cached and not tasks, "reviews": results, "_tracker": tracker}
 
     async def _review_with_model(self, model_name: str, reviewer, content: str, file_path: str, tracker: ProgressTracker = None):
         if tracker:
@@ -870,6 +898,178 @@ class AICouncil:
             "average_score": sum(scores) / len(scores) if scores else 0,
             "model_count": len(reviews)
         }
+
+    async def synthesize_reviews(self, file_path: str, code_content: str, reviews: dict, preferred_synthesizer: str = None) -> dict:
+        """AI-powered synthesis of all reviews - Council Verdict"""
+        synthesizer = None
+        synthesizer_name = None
+
+        # If a specific synthesizer is requested and available, use it
+        if preferred_synthesizer and preferred_synthesizer in self.reviewers:
+            synthesizer = self.reviewers[preferred_synthesizer]
+            synthesizer_name = preferred_synthesizer
+        else:
+            # Fall back to best available (prefer Claude > GPT-4 > Gemini > Grok)
+            synthesis_order = ['claude', 'gpt-4', 'gemini', 'grok']
+            for model_name in synthesis_order:
+                if model_name in self.reviewers:
+                    synthesizer = self.reviewers[model_name]
+                    synthesizer_name = model_name
+                    break
+
+        if not synthesizer:
+            return {"error": "No AI available for synthesis"}
+
+        # Build the synthesis prompt
+        filename = Path(file_path).name
+
+        # Format individual reviews
+        reviews_text = ""
+        for model, review in reviews.items():
+            if "error" in review:
+                reviews_text += f"\n### {model.upper()} - ERROR\nFailed to review.\n"
+                continue
+
+            score = review.get("quality_score", "?")
+            issues = review.get("issues", [])
+            reviews_text += f"\n### {model.upper()} (Score: {score}/10)\n"
+
+            if issues:
+                for i, issue in enumerate(issues, 1):
+                    sev = issue.get("severity", "?")
+                    line = issue.get("line", "?")
+                    desc = issue.get("description", "")
+                    reviews_text += f"{i}. [{sev}] Line {line}: {desc}\n"
+            else:
+                reviews_text += "No issues found.\n"
+
+        # Truncate code if too long
+        code_preview = code_content[:3000] + "\n...(truncated)" if len(code_content) > 3000 else code_content
+
+        synthesis_prompt = f"""You are the Chief Arbiter of the AI Council, synthesizing code reviews from multiple AI models.
+
+## File Under Review: {filename}
+
+## Code Preview:
+```
+{code_preview}
+```
+
+## Individual Model Reviews:
+{reviews_text}
+
+## Your Synthesis Task:
+Analyze all reviews and provide a unified Council Verdict:
+
+1. **Consensus Issues** - Issues flagged by 2+ models (most important to fix)
+2. **Disputed Findings** - Where models disagree, and your judgment on who's correct
+3. **Priority Ranking** - Top 3 issues to fix first, with reasoning
+4. **Potential False Positives** - Any issues that seem incorrect or overly pedantic
+5. **Council Verdict** - Overall assessment in 2-3 sentences
+
+Respond in JSON format:
+{{
+    "consensus_issues": [
+        {{"description": "...", "severity": "high/medium/low", "models_agreed": ["gpt-4", "claude"], "line": 123}}
+    ],
+    "disputed_findings": [
+        {{"issue": "...", "models_for": ["gpt-4"], "models_against": ["claude"], "verdict": "...", "correct_assessment": "..."}}
+    ],
+    "priority_ranking": [
+        {{"rank": 1, "issue": "...", "reason": "..."}}
+    ],
+    "false_positives": [
+        {{"issue": "...", "flagged_by": "gpt-4", "reason_incorrect": "..."}}
+    ],
+    "council_verdict": "Overall assessment...",
+    "final_score": 8
+}}"""
+
+        print(f"\n[*] Synthesizing reviews with {synthesizer_name.upper()}...")
+
+        try:
+            # Use the same review method but with synthesis prompt
+            response = await synthesizer._call_api(synthesis_prompt)
+
+            # Parse JSON from response
+            import re
+            json_match = re.search(r'\{[\s\S]*\}', response)
+            if json_match:
+                synthesis = json.loads(json_match.group())
+                synthesis["synthesized_by"] = synthesizer_name
+                print(f"[+] Synthesis complete by {synthesizer_name.upper()}")
+                return synthesis
+            else:
+                return {"error": "Failed to parse synthesis response", "raw": response[:500]}
+        except Exception as e:
+            return {"error": f"Synthesis failed: {str(e)}"}
+
+    async def fix_code(self, file_path: str, fixer_name: str, issues: list = None) -> str:
+        """AI-powered code fixing based on review findings"""
+        if fixer_name not in self.reviewers:
+            raise ValueError(f"Fixer '{fixer_name}' not available")
+
+        fixer = self.reviewers[fixer_name]
+        filename = Path(file_path).name
+
+        # Read the original code
+        code_content = Path(file_path).read_text(encoding="utf-8", errors="ignore")
+
+        # Format issues if provided
+        issues_text = ""
+        if issues:
+            for i, issue in enumerate(issues, 1):
+                sev = issue.get("severity", "INFO")
+                line = issue.get("line", "?")
+                desc = issue.get("description", "")
+                rec = issue.get("recommendation", "")
+                issues_text += f"{i}. [{sev}] Line {line}: {desc}"
+                if rec:
+                    issues_text += f" - Recommendation: {rec}"
+                issues_text += "\n"
+        else:
+            issues_text = "Review the code for bugs, security issues, and improvements."
+
+        fix_prompt = f"""You are an expert code fixer. Your task is to fix the issues found in this code.
+
+## File: {filename}
+
+## Issues to Fix:
+{issues_text}
+
+## Original Code:
+```
+{code_content}
+```
+
+## Instructions:
+1. Fix ALL the issues listed above
+2. Maintain the original code style and formatting
+3. Add brief comments only where the fix is non-obvious
+4. Return ONLY the complete fixed code, no explanations
+5. Do not add markdown code fences or language tags
+
+Return the complete fixed file content:"""
+
+        print(f"[*] Fixing code with {fixer_name.upper()}...", file=sys.stderr)
+
+        try:
+            fixed_code = await fixer._call_api(fix_prompt)
+
+            # Clean up the response - remove any markdown code fences
+            fixed_code = fixed_code.strip()
+            if fixed_code.startswith("```"):
+                lines = fixed_code.split("\n")
+                # Remove first line (```language) and last line (```)
+                if lines[-1].strip() == "```":
+                    lines = lines[1:-1]
+                else:
+                    lines = lines[1:]
+                fixed_code = "\n".join(lines)
+
+            return fixed_code
+        except Exception as e:
+            raise Exception(f"Fix failed: {str(e)}")
 
     def queue_file(self, file_path: str, priority: str = "normal"):
         """Add file to review queue"""
@@ -920,7 +1120,7 @@ class AICouncil:
             print()
 
 
-def generate_html_report(file_path: str, reviews: dict, output_path: str = None, power_mode: bool = False) -> str:
+def generate_html_report(file_path: str, reviews: dict, output_path: str = None, power_mode: bool = False, synthesis: dict = None) -> str:
     """Generate a beautiful HTML report for the review results"""
     from datetime import datetime
 
@@ -989,7 +1189,7 @@ def generate_html_report(file_path: str, reviews: dict, output_path: str = None,
         }}
         .header-content {{ display: flex; align-items: center; gap: 1.5rem; }}
         .header-logo {{ flex-shrink: 0; }}
-        .header-logo img {{ width: 100%; height: 100%; object-fit: contain; }}
+        .header-logo img {{ height: 48px; width: auto; border-radius: 8px; }}
         .header-text {{ flex: 1; }}
         .header h1 {{
             font-size: 1.75rem; font-weight: 700; margin-bottom: 0.5rem;
@@ -1082,6 +1282,44 @@ def generate_html_report(file_path: str, reviews: dict, output_path: str = None,
         .usage-total .usage-model {{ color: white; }}
         .usage-total .usage-tokens {{ color: rgba(255,255,255,0.8); }}
         .usage-total .usage-cost {{ color: white; font-size: 1rem; }}
+        .council-verdict {{
+            background: linear-gradient(135deg, rgba(99, 102, 241, 0.15), rgba(168, 85, 247, 0.15));
+            border: 2px solid var(--indigo-500); border-radius: 16px;
+            padding: 2rem; margin-bottom: 2rem; position: relative; overflow: hidden;
+        }}
+        .council-verdict::before {{
+            content: ''; position: absolute; top: 0; left: 0; right: 0; height: 4px;
+            background: linear-gradient(90deg, var(--indigo-500), var(--purple-500), var(--cyan-500));
+        }}
+        .council-verdict h2 {{
+            font-size: 1.5rem; font-weight: 700; margin-bottom: 1.5rem;
+            background: linear-gradient(135deg, var(--indigo-400), var(--purple-500));
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+            display: flex; align-items: center; gap: 0.75rem;
+        }}
+        .verdict-score {{
+            display: flex; align-items: center; justify-content: center; gap: 2rem;
+            background: var(--zinc-900); border-radius: 12px; padding: 1.5rem; margin-bottom: 1.5rem;
+        }}
+        .verdict-score-number {{
+            font-size: 4rem; font-weight: 800;
+            background: linear-gradient(135deg, var(--emerald-400), var(--cyan-400));
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+        }}
+        .verdict-score-label {{ color: var(--zinc-400); font-size: 1rem; font-weight: 500; }}
+        .verdict-summary {{ color: var(--text-secondary); line-height: 1.8; margin-bottom: 1.5rem; font-size: 1rem; }}
+        .verdict-section {{ margin-bottom: 1.5rem; }}
+        .verdict-section h3 {{ font-size: 1rem; font-weight: 600; color: var(--indigo-400); margin-bottom: 0.75rem; display: flex; align-items: center; gap: 0.5rem; }}
+        .verdict-list {{ list-style: none; padding: 0; }}
+        .verdict-list li {{
+            background: var(--zinc-900); border-radius: 8px; padding: 0.75rem 1rem;
+            margin-bottom: 0.5rem; color: var(--text-secondary); font-size: 0.9rem;
+            border-left: 3px solid var(--zinc-600);
+        }}
+        .verdict-list li.priority {{ border-left-color: var(--rose-500); }}
+        .verdict-list li.disputed {{ border-left-color: var(--amber-500); }}
+        .verdict-list li.false-positive {{ border-left-color: var(--emerald-400); }}
+        .synthesizer {{ font-size: 0.8rem; color: var(--zinc-500); text-align: right; margin-top: 1rem; }}
     </style>
 </head>
 <body>
@@ -1187,6 +1425,81 @@ def generate_html_report(file_path: str, reviews: dict, output_path: str = None,
 '''
         html += '        </div>\n'
 
+    # Add Council Verdict section if synthesis is available
+    if synthesis and not synthesis.get("error"):
+        final_score = synthesis.get("final_score", "?")
+        verdict = synthesis.get("council_verdict", "")
+        priority_ranking = synthesis.get("priority_ranking", [])
+        disputed_findings = synthesis.get("disputed_findings", [])
+        false_positives = synthesis.get("false_positives", [])
+        synthesizer = synthesis.get("synthesized_by", "AI")
+
+        html += f'''
+        <div class="council-verdict">
+            <h2>⚖️ Council Verdict</h2>
+            <div class="verdict-score">
+                <div>
+                    <div class="verdict-score-number">{final_score}/10</div>
+                    <div class="verdict-score-label">Final Score</div>
+                </div>
+            </div>
+            <div class="verdict-summary">{verdict}</div>
+'''
+
+        if priority_ranking:
+            html += '''
+            <div class="verdict-section">
+                <h3>🎯 Priority Ranking</h3>
+                <ol class="verdict-list" style="list-style: decimal; padding-left: 1.5rem;">
+'''
+            for item in priority_ranking[:5]:  # Top 5 priorities
+                # Handle both string items and dict items with rank/issue keys
+                if isinstance(item, dict):
+                    issue_text = item.get("issue", str(item))
+                else:
+                    issue_text = str(item)
+                html += f'                    <li class="priority">{issue_text}</li>\n'
+            html += '''                </ol>
+            </div>
+'''
+
+        if disputed_findings:
+            html += '''
+            <div class="verdict-section">
+                <h3>⚠️ Disputed Findings</h3>
+                <ul class="verdict-list">
+'''
+            for item in disputed_findings:
+                if isinstance(item, dict):
+                    item_text = item.get("description", item.get("issue", str(item)))
+                else:
+                    item_text = str(item)
+                html += f'                    <li class="disputed">{item_text}</li>\n'
+            html += '''                </ul>
+            </div>
+'''
+
+        if false_positives:
+            html += '''
+            <div class="verdict-section">
+                <h3>✅ Likely False Positives</h3>
+                <ul class="verdict-list">
+'''
+            for item in false_positives:
+                if isinstance(item, dict):
+                    item_text = item.get("description", item.get("issue", str(item)))
+                else:
+                    item_text = str(item)
+                html += f'                    <li class="false-positive">{item_text}</li>\n'
+            html += '''                </ul>
+            </div>
+'''
+
+        html += f'''
+            <div class="synthesizer">Synthesized by {synthesizer.upper()}</div>
+        </div>
+'''
+
     # Add per-model sections
     for model, review in reviews.items():
         if isinstance(review, dict) and "error" not in review:
@@ -1267,6 +1580,7 @@ class FileWatchHandler(FileSystemEventHandler):
 
 def main():
     parser = argparse.ArgumentParser(description="AI Council - Multi-Model Code Review")
+    parser.add_argument("--db", help="Path to reviews database (default: script directory)")
     subparsers = parser.add_subparsers(dest="command", help="Commands")
 
     # Status command
@@ -1277,13 +1591,23 @@ def main():
     review_parser.add_argument("file", help="File to review")
     review_parser.add_argument("--force", "-f", action="store_true", help="Force re-review")
     review_parser.add_argument("--gemini", "-g", action="store_true", help="Include Gemini in review")
-    review_parser.add_argument("--claude", "-c", action="store_true", help="Include Claude in review")
+    review_parser.add_argument("--no-gpt", action="store_true", help="Disable GPT-4 reviewer")
+    review_parser.add_argument("--no-claude", action="store_true", help="Disable Claude reviewer")
+    review_parser.add_argument("--no-grok", action="store_true", help="Disable Grok reviewer")
     review_parser.add_argument("--power", "-p", action="store_true", help="Use premium models (higher cost, better results)")
     review_parser.add_argument("--html", action="store_true", help="Generate HTML report")
     review_parser.add_argument("--output", "-o", help="Output path for HTML report")
     review_parser.add_argument("--issues", action="store_true", help="Create GitHub issues for consensus findings")
     review_parser.add_argument("--issues-all", action="store_true", help="Create GitHub issues for ALL findings")
     review_parser.add_argument("--repo", help="Target repo for issues (default: current git repo)")
+    review_parser.add_argument("--synthesize", "-s", action="store_true", help="AI-powered synthesis of all reviews (Council Verdict)")
+    review_parser.add_argument("--synthesizer", choices=['claude', 'gpt-4', 'gemini', 'grok'], help="Specific AI to use for synthesis (default: auto)")
+
+    # Fix command
+    fix_parser = subparsers.add_parser("fix", help="Fix code based on review findings")
+    fix_parser.add_argument("file", help="File to fix")
+    fix_parser.add_argument("--fixer", choices=['claude', 'gpt-4', 'gemini', 'grok'], required=True, help="AI to use for fixing")
+    fix_parser.add_argument("--report", help="Path to HTML report with issues")
 
     # Show command
     show_parser = subparsers.add_parser("show", help="Show reviews for a file")
@@ -1305,9 +1629,19 @@ def main():
 
     # Enable optional models and power mode if flags are passed on review command
     enable_gemini = getattr(args, 'gemini', False)
-    enable_claude = getattr(args, 'claude', False)
+    disable_gpt = getattr(args, 'no_gpt', False)
+    disable_claude = getattr(args, 'no_claude', False)
+    disable_grok = getattr(args, 'no_grok', False)
     power_mode = getattr(args, 'power', False)
-    council = AICouncil(enable_gemini=enable_gemini, enable_claude=enable_claude, power_mode=power_mode)
+    db_path = getattr(args, 'db', None)
+    council = AICouncil(
+        enable_gemini=enable_gemini,
+        enable_gpt=not disable_gpt,
+        enable_claude=not disable_claude,
+        enable_grok=not disable_grok,
+        power_mode=power_mode,
+        db_path=db_path
+    )
 
     if args.command == "status":
         print("\n=== AI Council Status ===")
@@ -1344,14 +1678,20 @@ def main():
             print("  Detailed Results")
             print(f"{'='*60}")
 
+            total_models = len(result["reviews"])
+            completed = 0
             for model, review in result["reviews"].items():
+                completed += 1
                 reviews_data[model] = review
                 if "error" in review:
-                    print(f"\n  [{model.upper()}] ERROR: {review['error'][:80]}")
+                    print(f"[!] {model.upper()} ERROR")
+                    print(f"  [{model.upper()}] ERROR: {review['error'][:80]}")
                 else:
                     issues = review.get("issues", [])
                     score = review.get('quality_score', '?')
-                    print(f"\n  [{model.upper()}] Score: {score}/10 | Issues: {len(issues)}")
+                    # Output in format that VS Code extension can parse
+                    print(f"[+] {model.upper()} Score: {score}/10 (0.0s) [{completed}/{total_models}]")
+                    print(f"  [{model.upper()}] Score: {score}/10 | Issues: {len(issues)}")
 
                     # Show top issues by severity
                     severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
@@ -1373,10 +1713,37 @@ def main():
             if usage_by_model:
                 print(format_usage_summary(usage_by_model, power_mode))
 
+        # Run synthesis if --synthesize flag is passed and we have 2+ models
+        synthesis_result = None
+        do_synthesize = getattr(args, 'synthesize', False)
+        if do_synthesize and reviews_data and len(reviews_data) >= 2:
+            # Read file content for synthesis
+            try:
+                code_content = Path(args.file).read_text(encoding="utf-8", errors="ignore")
+                preferred_synth = getattr(args, 'synthesizer', None)
+                synthesis_result = asyncio.run(council.synthesize_reviews(args.file, code_content, reviews_data, preferred_synth))
+
+                if "error" not in synthesis_result:
+                    print(f"\n{'='*60}")
+                    print("  Council Verdict (Synthesized by " + synthesis_result.get("synthesized_by", "AI").upper() + ")")
+                    print(f"{'='*60}")
+                    print(f"\n  Final Score: {synthesis_result.get('final_score', '?')}/10")
+                    print(f"  {synthesis_result.get('council_verdict', 'No verdict available.')}")
+
+                    priority = synthesis_result.get('priority_ranking', [])
+                    if priority:
+                        print(f"\n  Priority Fixes:")
+                        for item in priority[:3]:
+                            print(f"    {item.get('rank', '?')}. {item.get('issue', '')[:50]}...")
+                else:
+                    print(f"\n[!] Synthesis failed: {synthesis_result.get('error', 'Unknown error')}")
+            except Exception as e:
+                print(f"\n[!] Synthesis error: {str(e)}")
+
         # Generate HTML report if --html flag is passed
         if getattr(args, 'html', False) and reviews_data:
             output_path = getattr(args, 'output', None)
-            report_path = generate_html_report(args.file, reviews_data, output_path, power_mode)
+            report_path = generate_html_report(args.file, reviews_data, output_path, power_mode, synthesis_result)
             print(f"\n[+] HTML report generated: {report_path}")
 
         # Create GitHub issues if --issues or --issues-all flag is passed
@@ -1421,6 +1788,42 @@ def main():
                 print("\n[*] No consensus issues found to create GitHub issues for.")
                 if not create_all_issues:
                     print("    Use --issues-all to create issues for all findings.")
+
+    elif args.command == "fix":
+        # Parse issues from HTML report if provided
+        issues = []
+        if args.report:
+            try:
+                from bs4 import BeautifulSoup
+                report_html = Path(args.report).read_text(encoding="utf-8", errors="ignore")
+                soup = BeautifulSoup(report_html, 'html.parser')
+
+                # Extract issues from the report
+                for issue_div in soup.select('.issue'):
+                    severity_badge = issue_div.select_one('.badge')
+                    line_span = issue_div.select_one('.issue-line')
+                    desc_div = issue_div.select_one('.issue-desc')
+                    rec_div = issue_div.select_one('.issue-rec')
+
+                    issue = {
+                        "severity": severity_badge.get_text(strip=True) if severity_badge else "INFO",
+                        "line": line_span.get_text(strip=True).replace("Line ", "") if line_span else "?",
+                        "description": desc_div.get_text(strip=True) if desc_div else "",
+                        "recommendation": rec_div.get_text(strip=True).replace("💡 ", "") if rec_div else ""
+                    }
+                    issues.append(issue)
+            except ImportError:
+                print("[!] beautifulsoup4 not installed, fixing without issue context", file=sys.stderr)
+            except Exception as e:
+                print(f"[!] Could not parse report: {e}", file=sys.stderr)
+
+        try:
+            fixed_code = asyncio.run(council.fix_code(args.file, args.fixer, issues if issues else None))
+            # Output the fixed code to stdout (extension will capture it)
+            print(fixed_code)
+        except Exception as e:
+            print(f"Error: {str(e)}", file=sys.stderr)
+            sys.exit(1)
 
     elif args.command == "show":
         council.show_reviews(args.file)
