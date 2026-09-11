@@ -386,35 +386,44 @@ python ai_council.py fix <file> --fixer gpt-4
 
 ## Claude Code Integration
 
-### Custom Slash Command
+Use the `/ai-council` skill in Claude Code for multi-model reviews with a **FREE Claude review**.
 
-Create `~/.claude/commands/ai-council.md`:
+### How It Works
 
-```markdown
-# AI Council Review
+When you run `/ai-council` from Claude Code:
 
-Run multi-model code review using GPT-4, Grok, Claude, and more.
+1. **GPT-4, Grok, Gemini, Ollama** - Use API keys (via Python script)
+2. **Claude** - Reviewed directly by Claude Code using your subscription (**FREE**)
 
-**Arguments:** `<file_path> [flags]`
+This saves ~$0.03 per review since Claude uses your existing subscription instead of API calls.
 
-**Flags:**
-- `--force` or `-f` - Force re-review
-- `--gemini` or `-g` - Include Gemini
-- `--ollama` - Include Ollama
-- `--power` or `-p` - Use premium models
-- `--html` - Generate HTML report
+### Installation
 
-## Instructions
+Copy `commands/ai-council.md` from this repo to `~/.claude/commands/`:
 
-Run: python "C:/AI COUNCIL/ai_council.py" review "<FILE>" <FLAGS>
+```bash
+cp commands/ai-council.md ~/.claude/commands/
 ```
 
-Then use in Claude Code:
+Or create the file manually - see `commands/ai-council.md` for the full skill.
+
+### Usage
 
 ```
-/ai-council src/MyService.cs --html
-/ai-council src/MyService.cs --power --html --synthesize
+/ai-council src/MyService.cs
+/ai-council src/MyService.cs --html --gemini --ollama
+/ai-council src/MyService.cs --power
 ```
+
+### Cost Comparison
+
+| Model | Via Skill | Via Extension |
+|-------|-----------|---------------|
+| Claude | **FREE** (subscription) | ~$0.03 (API) |
+| GPT-4 | ~$0.03 | ~$0.03 |
+| Grok | ~$0.02 | ~$0.02 |
+| Gemini | FREE | FREE |
+| Ollama | FREE | FREE |
 
 ---
 
