@@ -8,6 +8,7 @@ interface ReviewOptions {
     enableClaude: boolean;
     enableGrok: boolean;
     enableGemini: boolean;
+    enableOllama: boolean;
     powerMode: boolean;
     synthesizer: string;
 }
@@ -16,9 +17,26 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
     public static readonly viewType = 'ai-council.sidebar';
     private _view?: vscode.WebviewView;
     private _extensionUri: vscode.Uri;
+    private _context: vscode.ExtensionContext;
 
-    constructor(extensionUri: vscode.Uri) {
+    constructor(extensionUri: vscode.Uri, context: vscode.ExtensionContext) {
         this._extensionUri = extensionUri;
+        this._context = context;
+    }
+
+    private _saveToggleStates(toggles: Record<string, boolean>) {
+        this._context.globalState.update('ai-council.toggleStates', toggles);
+    }
+
+    private _getToggleStates(): Record<string, boolean> {
+        return this._context.globalState.get('ai-council.toggleStates', {
+            enableGpt: true,
+            enableClaude: true,
+            enableGrok: true,
+            enableGemini: false,
+            enableOllama: false,
+            powerMode: false
+        });
     }
 
     private _getScriptPath(): string {
@@ -74,6 +92,7 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                         enableClaude: message.enableClaude,
                         enableGrok: message.enableGrok,
                         enableGemini: message.enableGemini,
+                        enableOllama: message.enableOllama,
                         powerMode: message.powerMode,
                         synthesizer: message.synthesizer || 'auto'
                     });
@@ -85,7 +104,7 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                     await this._clearCache();
                     break;
                 case 'showStatus':
-                    await this._showStatus();
+                    await this._showStatus(message.toggles);
                     break;
                 case 'openSettings':
                     vscode.commands.executeCommand('workbench.action.openSettings', 'ai-council');
@@ -94,6 +113,13 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                     // Webview is ready to receive messages
                     this._sendApiKeyStatus();
                     this._sendCacheSize();
+                    // Send saved toggle states
+                    const savedToggles = this._getToggleStates();
+                    this._view?.webview.postMessage({ type: 'restoreToggles', toggles: savedToggles });
+                    break;
+                case 'saveToggles':
+                    // Save toggle states when user changes them
+                    this._saveToggleStates(message.toggles);
                     break;
                 case 'reviewCommit':
                     await this._reviewCommit({
@@ -101,6 +127,7 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                         enableClaude: message.enableClaude,
                         enableGrok: message.enableGrok,
                         enableGemini: message.enableGemini,
+                        enableOllama: message.enableOllama,
                         powerMode: message.powerMode,
                         synthesizer: message.synthesizer || 'auto'
                     });
@@ -305,6 +332,8 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             XAI_API_KEY: config.get<string>('apiKeys.xai') || '',
             GOOGLE_API_KEY: config.get<string>('apiKeys.google') || '',
             GROQ_API_KEY: config.get<string>('apiKeys.groq') || '',
+            OLLAMA_API_KEY: config.get<string>('apiKeys.ollama') || '',
+            OLLAMA_URL: config.get<string>('ollamaUrl') || 'https://wowcentral.worldofworkflows.com',
         };
 
         // Build list of enabled models
@@ -313,6 +342,7 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         if (options.enableClaude) { enabledModelsList.push('claude'); }
         if (options.enableGrok) { enabledModelsList.push('grok'); }
         if (options.enableGemini) { enabledModelsList.push('gemini'); }
+        if (options.enableOllama) { enabledModelsList.push('ollama'); }
 
         // Send start message to webview
         if (this._view) {
@@ -323,14 +353,28 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             });
         }
 
-        this.updateStatus(`Reviewing with ${enabledModelsList.length} model${enabledModelsList.length > 1 ? 's' : ''}...`, true);
-
         // Use workspace .ai-council folder for database
         const aiCouncilDir = path.join(workspaceRoot, '.ai-council');
         const dbPath = path.join(aiCouncilDir, 'reviews.db');
 
-        // Build command args - always generate HTML to project root
-        const args = [`"${scriptPath}"`, '--db', `"${dbPath}"`, 'review', `"${filePath}"`, '--html', '--output', `"${reportPath}"`, '--synthesize'];
+        // Build command args - global flags BEFORE subcommand
+        const args = [`"${scriptPath}"`, '--db', `"${dbPath}"`];
+
+        // Add ollama global flags BEFORE the subcommand
+        if (options.enableOllama) {
+            args.push('--ollama');
+            const ollamaUrl = config.get<string>('ollamaUrl');
+            if (ollamaUrl) {
+                args.push('--ollama-url', `"${ollamaUrl}"`);
+            }
+            const ollamaModel = config.get<string>('ollamaModel');
+            if (ollamaModel) {
+                args.push('--ollama-model', ollamaModel);
+            }
+        }
+
+        // Add subcommand and its arguments
+        args.push('review', `"${filePath}"`, '--html', '--output', `"${reportPath}"`, '--synthesize');
         if (options.synthesizer && options.synthesizer !== 'auto') {
             args.push('--synthesizer', options.synthesizer);
         }
@@ -437,6 +481,39 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         reviewProcess.on('close', (code) => {
             this._isReviewing = false;
             this._currentProcess = null;
+
+            // Parse full stdout for any missed results (especially cached reviews)
+            const allScoreMatches = stdout.matchAll(/\[\+\]\s+(\w+[-\d]*)\s+Score:\s*(\d+)\/10/gi);
+            for (const match of allScoreMatches) {
+                const modelName = match[1].toLowerCase();
+                let modelKey = modelName;
+                if (modelName.includes('gpt')) { modelKey = 'gpt-4'; }
+                else if (modelName.includes('claude')) { modelKey = 'claude'; }
+                else if (modelName.includes('grok')) { modelKey = 'grok'; }
+                else if (modelName.includes('gemini')) { modelKey = 'gemini'; }
+
+                const score = parseInt(match[2]);
+                if (!modelResults[modelKey] || modelResults[modelKey].error) {
+                    modelResults[modelKey] = { score, issues: 0 };
+                }
+            }
+
+            // Parse issues counts
+            const allIssuesMatches = stdout.matchAll(/\[(\w+[-\d]*)\]\s+Score:\s*\d+\/10\s*\|\s*Issues:\s*(\d+)/gi);
+            for (const match of allIssuesMatches) {
+                const modelName = match[1].toLowerCase();
+                let modelKey = modelName;
+                if (modelName.includes('gpt')) { modelKey = 'gpt-4'; }
+                else if (modelName.includes('claude')) { modelKey = 'claude'; }
+                else if (modelName.includes('grok')) { modelKey = 'grok'; }
+                else if (modelName.includes('gemini')) { modelKey = 'gemini'; }
+
+                const issues = parseInt(match[2]);
+                if (modelResults[modelKey]) {
+                    modelResults[modelKey].issues = issues;
+                }
+            }
+
             console.log('AI Council: Process closed with code', code, 'results:', JSON.stringify(modelResults));
 
             if (code === 0) {
@@ -698,7 +775,7 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         }
     }
 
-    private async _showStatus() {
+    private async _showStatus(toggles?: { gpt: boolean; claude: boolean; grok: boolean; gemini: boolean; ollama: boolean }) {
         const config = vscode.workspace.getConfiguration('ai-council');
         const pythonPath = config.get<string>('pythonPath') || 'python';
         const scriptPath = this._getScriptPath();
@@ -711,6 +788,8 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             XAI_API_KEY: config.get<string>('apiKeys.xai') || '',
             GOOGLE_API_KEY: config.get<string>('apiKeys.google') || '',
             GROQ_API_KEY: config.get<string>('apiKeys.groq') || '',
+            OLLAMA_API_KEY: config.get<string>('apiKeys.ollama') || '',
+            OLLAMA_URL: config.get<string>('ollamaUrl') || '',
         };
 
         // Send loading state
@@ -722,13 +801,44 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         console.log('AI Council: Starting org info fetch...');
         const orgInfoPromise = this._fetchAllOrgInfo(apiKeys);
 
-        const args = dbPath
-            ? [`"${scriptPath}"`, '--db', `"${dbPath}"`, 'status']
-            : [`"${scriptPath}"`, 'status'];
+        // Build args - global flags must come BEFORE the subcommand
+        const ollamaUrl = config.get<string>('ollamaUrl');
+        const ollamaModel = config.get<string>('ollamaModel');
+        let args = [`"${scriptPath}"`];
+
+        // Add db path if available
+        if (dbPath) {
+            args.push('--db', `"${dbPath}"`);
+        }
+
+        // Add ollama flags BEFORE the subcommand (ollama is global)
+        if (ollamaUrl && apiKeys.OLLAMA_API_KEY) {
+            args.push('--ollama');
+            args.push('--ollama-url', `"${ollamaUrl}"`);
+            if (ollamaModel) {
+                args.push('--ollama-model', ollamaModel);
+            }
+        }
+
+        // Add subcommand LAST
+        args.push('status');
+
+        console.log('AI Council: Status command args:', args);
+
+        // Build selected reviewers list from toggles (for display, not for Python)
+        const selectedReviewers: string[] = [];
+        if (toggles?.gpt && apiKeys.OPENAI_API_KEY) selectedReviewers.push('gpt-4');
+        if (toggles?.claude && apiKeys.ANTHROPIC_API_KEY) selectedReviewers.push('claude');
+        if (toggles?.grok && apiKeys.XAI_API_KEY) selectedReviewers.push('grok');
+        if (toggles?.gemini && apiKeys.GOOGLE_API_KEY) selectedReviewers.push('gemini');
+        if (toggles?.ollama && ollamaUrl && apiKeys.OLLAMA_API_KEY) {
+            selectedReviewers.push(`ollama (${ollamaModel || 'default'})`);
+        }
 
         // Wrap process in a promise
         const statusPromise = new Promise<Record<string, string>>((resolve) => {
             const cmd = `${pythonPath} ${args.join(' ')}`;
+            console.log('AI Council: Running status command:', cmd);
             const statusProcess = spawn(cmd, [], {
                 shell: true,
                 env: { ...process.env, ...apiKeys }
@@ -739,7 +849,17 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                 output += data.toString();
             });
 
-            statusProcess.on('close', () => {
+            let stderr = '';
+            statusProcess.stderr?.on('data', (data) => {
+                stderr += data.toString();
+            });
+
+            statusProcess.on('close', (code) => {
+                console.log('AI Council: Status command exit code:', code);
+                console.log('AI Council: Status stdout:', output);
+                if (stderr) {
+                    console.log('AI Council: Status stderr:', stderr);
+                }
                 const lines = output.trim().split('\n').filter(l => l.trim());
                 const status: Record<string, string> = {
                     database: '',
@@ -762,6 +882,9 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
 
         // Wait for both to complete
         const [status, orgInfo] = await Promise.all([statusPromise, orgInfoPromise]);
+
+        // Override reviewers with our computed list from toggles
+        status.reviewers = selectedReviewers.length > 0 ? selectedReviewers.join(', ') : 'None selected';
 
         console.log('AI Council: Got status and orgInfo:', JSON.stringify(orgInfo));
 
@@ -900,6 +1023,10 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             const settingsKey = config.get<string>(`apiKeys.${key}`) || '';
             keyStatus[key] = Boolean(settingsKey.trim());
         }
+
+        // Special handling for Ollama - check URL configuration (API key is optional)
+        const ollamaUrl = config.get<string>('ollamaUrl') || '';
+        keyStatus['ollama'] = Boolean(ollamaUrl.trim());
 
         // Fetch org info for OpenAI if key exists
         const openaiKey = config.get<string>('apiKeys.openai') || '';
@@ -1198,6 +1325,11 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             border-color: #4285f4;
         }
 
+        .toggle-switch.ollama input:checked + .toggle-slider {
+            background: linear-gradient(135deg, #ff6b35 0%, #e55a2b 100%);
+            border-color: #ff6b35;
+        }
+
         .toggle-switch.mistral input:checked + .toggle-slider {
             background: linear-gradient(135deg, #ff7000 0%, #e66300 100%);
             border-color: #ff7000;
@@ -1270,11 +1402,6 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         .badge-free {
             background: #22c55e;
             color: white;
-        }
-
-        .toggle-switch.ollama input:checked + .toggle-slider {
-            background: linear-gradient(135deg, #ffffff 0%, #e5e5e5 100%);
-            border-color: #cccccc;
         }
 
         .status-bar {
@@ -1361,24 +1488,26 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             justify-content: space-between;
             font-size: 11px;
             padding: 3px 0;
+            gap: 8px;
         }
 
         .status-label {
             color: var(--vscode-descriptionForeground);
+            flex-shrink: 0;
         }
 
         .status-value {
             color: var(--vscode-foreground);
             font-family: 'JetBrains Mono', monospace;
-            max-width: 150px;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            white-space: nowrap;
+            text-align: right;
+            word-break: break-word;
+            flex: 1;
+            min-width: 0;
         }
 
         /* Review Progress Panel */
         .review-panel {
-            margin-top: 12px;
+            margin-top: 4px;
             background: linear-gradient(180deg, rgba(20, 184, 166, 0.05) 0%, rgba(15, 118, 110, 0.1) 100%);
             border: 1px solid rgba(20, 184, 166, 0.3);
             border-radius: 10px;
@@ -1496,6 +1625,7 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         .model-icon.claude { background: linear-gradient(135deg, #d4a574, #c4956a); }
         .model-icon.grok { background: linear-gradient(135deg, #1d9bf0, #1a8cd8); }
         .model-icon.gemini { background: linear-gradient(135deg, #8b5cf6, #7c3aed); }
+        .model-icon.ollama { background: linear-gradient(135deg, #ff6b35, #e55a2b); }
 
         .model-info {
             display: flex;
@@ -1771,6 +1901,7 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
 
         .tools-section {
             padding: 8px 0 !important;
+            margin-bottom: 4px !important;
         }
 
         .tools-row {
@@ -1932,10 +2063,10 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                         <span class="toggle-slider"></span>
                     </label>
                 </div>
-                <div class="toggle-item" style="opacity: 0.5;">
-                    <span class="toggle-label">Ollama <span class="model-badge badge-free">Local</span> <span class="model-badge badge-coming">Soon</span></span>
+                <div class="toggle-item" id="toggle-enableOllama">
+                    <span class="toggle-label"><span class="model-name-text" data-standard="Ollama" data-power="Ollama Pro">Ollama</span> <span class="model-badge badge-free">Self-hosted</span><span class="key-status" id="key-ollama" title="Ollama Server Status"></span></span>
                     <label class="toggle-switch ollama">
-                        <input type="checkbox" id="enableOllama" disabled>
+                        <input type="checkbox" id="enableOllama">
                         <span class="toggle-slider"></span>
                     </label>
                 </div>
@@ -2127,8 +2258,22 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             'enableGpt': { name: 'GPT-4', key: 'openai', url: 'https://platform.openai.com/api-keys' },
             'enableClaude': { name: 'Claude', key: 'anthropic', url: 'https://console.anthropic.com/' },
             'enableGrok': { name: 'Grok', key: 'xai', url: 'https://console.x.ai/' },
-            'enableGemini': { name: 'Gemini', key: 'google', url: 'https://aistudio.google.com/app/apikey', free: true }
+            'enableGemini': { name: 'Gemini', key: 'google', url: 'https://aistudio.google.com/app/apikey', free: true },
+            'enableOllama': { name: 'Ollama', key: 'ollama', url: '', free: true }
         };
+
+        // Save toggle states to persist across sessions
+        function saveToggleStates() {
+            const toggles = {
+                enableGpt: document.getElementById('enableGpt')?.checked || false,
+                enableClaude: document.getElementById('enableClaude')?.checked || false,
+                enableGrok: document.getElementById('enableGrok')?.checked || false,
+                enableGemini: document.getElementById('enableGemini')?.checked || false,
+                enableOllama: document.getElementById('enableOllama')?.checked || false,
+                powerMode: document.getElementById('powerMode')?.checked || false
+            };
+            vscode.postMessage({ command: 'saveToggles', toggles: toggles });
+        }
 
         // Initialize immediately since script is at bottom of body (DOM is ready)
         (function init() {
@@ -2144,6 +2289,7 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                                 ...modelApiKeys[id]
                             });
                         }
+                        saveToggleStates();
                     });
                 }
             });
@@ -2153,6 +2299,7 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             if (powerModeToggle) {
                 powerModeToggle.addEventListener('change', function() {
                     updateModelNames(this.checked);
+                    saveToggleStates();
                 });
             }
 
@@ -2166,6 +2313,7 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                 enableClaude: document.getElementById('enableClaude').checked,
                 enableGrok: document.getElementById('enableGrok').checked,
                 enableGemini: document.getElementById('enableGemini').checked,
+                enableOllama: document.getElementById('enableOllama').checked,
                 powerMode: document.getElementById('powerMode').checked,
                 synthesizer: document.getElementById('synthesizerSelect').value
             };
@@ -2187,13 +2335,13 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             if (config.enableClaude) enabledModels.push('Claude');
             if (config.enableGrok) enabledModels.push('Grok');
             if (config.enableGemini) enabledModels.push('Gemini');
+            if (config.enableOllama) enabledModels.push('Ollama');
 
             if (enabledModels.length === 0) {
                 updateStatus('Enable at least one model!', false);
                 return;
             }
 
-            updateStatus('Reviewing with ' + enabledModels.join(', ') + '...', true);
             vscode.postMessage({
                 command: 'review',
                 ...config
@@ -2213,10 +2361,21 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         }
 
         function showStatus() {
-            // Show panel and request status
+            // Show panel and request status with current toggle states
             document.getElementById('statusPanel').style.display = 'block';
             document.getElementById('statusPanelContent').innerHTML = '<div style="text-align:center;color:var(--vscode-descriptionForeground);font-style:italic;">Loading...</div>';
-            vscode.postMessage({ command: 'showStatus' });
+            const toggles = {
+                gpt: document.getElementById('enableGpt')?.checked || false,
+                claude: document.getElementById('enableClaude')?.checked || false,
+                grok: document.getElementById('enableGrok')?.checked || false,
+                gemini: document.getElementById('enableGemini')?.checked || false,
+                ollama: document.getElementById('enableOllama')?.checked || false
+            };
+            console.log('AI Council Webview: showStatus toggles =', toggles);
+            vscode.postMessage({
+                command: 'showStatus',
+                toggles: toggles
+            });
         }
 
         function closeStatusPanel() {
@@ -2277,7 +2436,7 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
 
             // Reset
             document.getElementById('reviewPanelIcon').innerHTML = '&#128269;';
-            document.getElementById('reviewPanelTitle').textContent = 'Reviewing...';
+            document.getElementById('reviewPanelTitle').textContent = 'Reviewing with ' + models.length + ' model' + (models.length > 1 ? 's' : '') + '...';
             document.getElementById('reviewFileName').textContent = fileName;
             summary.style.display = 'none';
             if (cancelBtn) cancelBtn.style.display = 'flex';
@@ -2288,7 +2447,8 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                 'gpt-4': { name: 'GPT-4', icon: 'G', class: 'gpt' },
                 'claude': { name: 'Claude', icon: 'C', class: 'claude' },
                 'grok': { name: 'Grok', icon: 'X', class: 'grok' },
-                'gemini': { name: 'Gemini', icon: 'G', class: 'gemini' }
+                'gemini': { name: 'Gemini', icon: 'G', class: 'gemini' },
+                'ollama': { name: 'Ollama', icon: 'O', class: 'ollama' }
             };
 
             container.innerHTML = models.map(m => {
@@ -2424,10 +2584,25 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             summary.style.display = 'block';
         }
 
+        let statusTimeout = null;
         function updateStatus(text, isLoading) {
             const statusBar = document.getElementById('statusBar');
             statusBar.textContent = text;
             statusBar.classList.toggle('loading', isLoading);
+
+            // Clear any existing timeout
+            if (statusTimeout) {
+                clearTimeout(statusTimeout);
+                statusTimeout = null;
+            }
+
+            // Auto-clear non-loading status messages after 3 seconds
+            if (text && !isLoading) {
+                statusTimeout = setTimeout(() => {
+                    statusBar.textContent = '';
+                    statusTimeout = null;
+                }, 3000);
+            }
         }
 
         function updateResults(results) {
@@ -2456,7 +2631,8 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             'enableGpt': 'openai',
             'enableClaude': 'anthropic',
             'enableGrok': 'xai',
-            'enableGemini': 'google'
+            'enableGemini': 'google',
+            'enableOllama': 'ollama'
         };
 
         function updateKeyStatus(status, orgInfo) {
@@ -2553,6 +2729,31 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                     const label = document.getElementById('cacheSizeLabel');
                     if (label) {
                         label.textContent = message.size ? ' (' + message.size + ')' : '';
+                    }
+                    break;
+                case 'restoreToggles':
+                    // Restore saved toggle states
+                    if (message.toggles) {
+                        const toggleMap = {
+                            'enableGpt': 'enableGpt',
+                            'enableClaude': 'enableClaude',
+                            'enableGrok': 'enableGrok',
+                            'enableGemini': 'enableGemini',
+                            'enableOllama': 'enableOllama',
+                            'powerMode': 'powerMode'
+                        };
+                        for (const [key, id] of Object.entries(toggleMap)) {
+                            const el = document.getElementById(id);
+                            if (el && message.toggles[key] !== undefined) {
+                                el.checked = message.toggles[key];
+                            }
+                        }
+                        // Update power mode display
+                        if (message.toggles.powerMode) {
+                            document.querySelectorAll('.model-name-text').forEach(el => {
+                                el.textContent = el.getAttribute('data-power') || el.textContent;
+                            });
+                        }
                     }
                     break;
                 case 'statusPanel':

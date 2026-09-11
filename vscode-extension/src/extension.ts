@@ -52,7 +52,7 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(statusBarItem);
 
     // Register sidebar provider
-    sidebarProvider = new AiCouncilSidebarProvider(context.extensionUri);
+    sidebarProvider = new AiCouncilSidebarProvider(context.extensionUri, context);
     context.subscriptions.push(
         vscode.window.registerWebviewViewProvider('ai-council.sidebar', sidebarProvider)
     );

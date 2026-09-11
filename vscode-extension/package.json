@@ -116,6 +116,29 @@
           "default": "",
           "description": "Groq API Key (for Llama - FREE!). Get yours at: https://console.groq.com/"
         },
+        "ai-council.apiKeys.ollama": {
+          "type": "string",
+          "default": "wowgateway:biS4pjsPMd1XOn5L7llC4",
+          "description": "WoW AI auth (user:pass for Basic auth, or Bearer token)"
+        },
+        "ai-council.ollamaUrl": {
+          "type": "string",
+          "default": "https://wowai-api.worldofworkflows.com:9443",
+          "description": "WoW AI / Ollama server URL"
+        },
+        "ai-council.ollamaModel": {
+          "type": "string",
+          "default": "qwen3.6:35b-mlx",
+          "description": "Ollama model to use for code review",
+          "enum": [
+            "qwen3.6:35b-mlx",
+            "qwen3-coder-next:latest",
+            "qwen3-coder-next:q4_K_M",
+            "qwen2.5-coder:14b",
+            "gemma4:12b-mlx",
+            "llama3.2:latest"
+          ]
+        },
         "ai-council.autoReviewOnSave": {
           "type": "boolean",
           "default": false,

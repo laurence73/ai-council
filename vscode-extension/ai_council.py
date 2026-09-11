@@ -70,7 +70,8 @@ DEFAULT_CONFIG = {
         "gpt-4": {"enabled": True, "api_key_env": "OPENAI_API_KEY"},
         "grok": {"enabled": True, "api_key_env": "XAI_API_KEY"},
         "claude": {"enabled": True, "api_key_env": "ANTHROPIC_API_KEY"},
-        "gemini": {"enabled": False, "api_key_env": "GOOGLE_API_KEY"}
+        "gemini": {"enabled": False, "api_key_env": "GOOGLE_API_KEY"},
+        "ollama": {"enabled": False, "api_key_env": "OLLAMA_API_KEY", "url_env": "OLLAMA_URL"}
     }
 }
 
@@ -80,13 +81,15 @@ MODEL_CONFIGS = {
         "gpt-4": "gpt-4-turbo",
         "grok": "grok-3-mini",
         "claude": "claude-sonnet-4-5",
-        "gemini": "gemini-2.0-flash",
+        "gemini": "gemini-3-flash-preview",
+        "ollama": "qwen3.6:35b-mlx",
     },
     "power": {
         "gpt-4": "gpt-6-astra",
         "grok": "grok-3",
         "claude": "claude-fable-5-1",
-        "gemini": "gemini-2.5-pro-preview-06-05",
+        "gemini": "gemini-3.1-pro-preview",
+        "ollama": "qwen3.6:35b-mlx",
     }
 }
 
@@ -97,6 +100,7 @@ API_PRICING = {
     "grok": {"input": 5.00, "output": 15.00},        # Grok (estimated)
     "claude": {"input": 3.00, "output": 15.00},      # Claude Sonnet
     "gemini": {"input": 0.075, "output": 0.30},      # Gemini 1.5 Flash
+    "ollama": {"input": 0.00, "output": 0.00},       # Self-hosted (free)
 }
 
 # Power model pricing (higher costs) - Sep 2026 prices
@@ -105,6 +109,7 @@ API_PRICING_POWER = {
     "grok": {"input": 3.00, "output": 15.00},        # Grok-3
     "claude": {"input": 10.00, "output": 50.00},     # Claude Fable 5.1
     "gemini": {"input": 1.25, "output": 10.00},      # Gemini 2.5 Pro
+    "ollama": {"input": 0.00, "output": 0.00},       # Self-hosted (free)
 }
 
 
@@ -439,6 +444,25 @@ class GPTReviewer:
         self.client = openai.OpenAI(api_key=api_key)
         self.model = model
 
+    async def _call_api(self, prompt: str) -> str:
+        """Make a direct API call and return raw text response"""
+        try:
+            loop = asyncio.get_event_loop()
+            model = self.model
+            response = await loop.run_in_executor(
+                None,
+                lambda: self.client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.3
+                )
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            raise Exception(f"GPT API call failed: {str(e)}")
+
     async def review(self, code: str, file_path: str) -> dict:
         try:
             # Run synchronous API call in thread pool to avoid blocking event loop
@@ -480,6 +504,31 @@ class GrokReviewer:
         self.api_key = api_key
         self.base_url = "https://api.x.ai/v1"
         self.model = model
+
+    async def _call_api(self, prompt: str) -> str:
+        """Make a direct API call and return raw text response"""
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{self.base_url}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "model": self.model,
+                        "messages": [
+                            {"role": "user", "content": prompt}
+                        ]
+                    },
+                    timeout=120.0
+                )
+                data = response.json()
+                if "error" in data:
+                    raise Exception(str(data.get("error", "Unknown API error")))
+                return data["choices"][0]["message"]["content"]
+        except Exception as e:
+            raise Exception(f"Grok API call failed: {str(e)}")
 
     def _chunk_code(self, code: str) -> list:
         """Split large files into reviewable chunks by function/class boundaries"""
@@ -605,12 +654,38 @@ class GrokReviewer:
 class GeminiReviewer:
     """Google Gemini reviewer"""
 
-    def __init__(self, api_key: str, model: str = "gemini-2.0-flash"):
+    def __init__(self, api_key: str, model: str = "gemini-3-flash-preview"):
         if not HAS_HTTPX:
             raise ImportError("httpx package not installed. Run: pip install httpx")
         self.api_key = api_key
         self.base_url = "https://generativelanguage.googleapis.com/v1beta"
         self.model = model
+
+    async def _call_api(self, prompt: str) -> str:
+        """Make a direct API call and return raw text response"""
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{self.base_url}/models/{self.model}:generateContent?key={self.api_key}",
+                    headers={"Content-Type": "application/json"},
+                    json={
+                        "contents": [{
+                            "parts": [{
+                                "text": prompt
+                            }]
+                        }],
+                        "generationConfig": {
+                            "temperature": 0.3
+                        }
+                    },
+                    timeout=90.0
+                )
+                data = response.json()
+                if "error" in data:
+                    raise Exception(data["error"].get("message", "Unknown API error"))
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+        except Exception as e:
+            raise Exception(f"Gemini API call failed: {str(e)}")
 
     async def review(self, code: str, file_path: str) -> dict:
         try:
@@ -656,6 +731,157 @@ class GeminiReviewer:
             return {"error": str(e), "issues": [], "quality_score": 0}
 
 
+class OllamaReviewer:
+    """Self-hosted Ollama reviewer (OpenAI-compatible API)"""
+
+    def __init__(self, base_url: str, model: str = "qwen3.6:35b-mlx", api_key: str = None):
+        if not HAS_HTTPX:
+            raise ImportError("httpx package not installed. Run: pip install httpx")
+        # Normalize URL - remove trailing slash
+        self.base_url = base_url.rstrip('/')
+        self.model = model
+        self.api_key = api_key  # Optional Bearer token
+
+    def _get_headers(self) -> dict:
+        """Build request headers with appropriate auth"""
+        import base64
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            # Check if it's Basic auth format (user:pass) or just a token
+            if ':' in self.api_key:
+                # Basic auth - encode credentials
+                credentials = base64.b64encode(self.api_key.encode()).decode()
+                headers["Authorization"] = f"Basic {credentials}"
+            else:
+                # Bearer token or custom header
+                headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
+
+    async def _call_api(self, prompt: str) -> str:
+        """Make a direct API call and return raw text response"""
+        try:
+            headers = self._get_headers()
+            endpoint = f"{self.base_url}/v1/chat/completions"
+            request_body = {
+                "model": self.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False
+            }
+
+            async with httpx.AsyncClient(verify=False) as client:
+                response = await client.post(
+                    endpoint,
+                    headers=headers,
+                    json=request_body,
+                    timeout=180.0
+                )
+                if response.status_code != 200:
+                    raise Exception(f"HTTP {response.status_code}: {response.text[:200]}")
+                data = response.json()
+                if "error" in data:
+                    raise Exception(str(data.get("error", "Unknown API error")))
+                if "choices" in data:
+                    return data["choices"][0]["message"]["content"]
+                else:
+                    raise Exception(f"Unexpected response: {str(data)[:200]}")
+        except Exception as e:
+            raise Exception(f"Ollama API call failed: {str(e)}")
+
+    async def review(self, code: str, file_path: str) -> dict:
+        try:
+            headers = self._get_headers()
+
+            # Use standard OpenAI-compatible format for all endpoints
+            endpoint = f"{self.base_url}/v1/chat/completions"
+            request_body = {
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": REVIEW_SYSTEM_PROMPT + "\n\nIMPORTANT: Respond with ONLY valid JSON, no markdown."},
+                    {"role": "user", "content": f"File: {file_path}\n\n```\n{code}\n```"}
+                ],
+                "stream": False
+            }
+
+            print(f"  [DEBUG] Ollama endpoint: {endpoint}")
+            print(f"  [DEBUG] Ollama model: {self.model}")
+            print(f"  [DEBUG] Ollama headers: {list(headers.keys())}")
+
+            async with httpx.AsyncClient(verify=False) as client:  # verify=False for self-signed certs
+                response = await client.post(
+                    endpoint,
+                    headers=headers,
+                    json=request_body,
+                    timeout=180.0
+                )
+
+                print(f"  [DEBUG] Ollama response status: {response.status_code}")
+
+                # Check HTTP status first
+                if response.status_code != 200:
+                    error_text = response.text[:500] if response.text else "No response body"
+                    print(f"  [!] Ollama HTTP {response.status_code}: {error_text}")
+                    return {"error": f"HTTP {response.status_code}: {error_text[:200]}", "issues": [], "quality_score": 0}
+
+                data = response.json()
+                print(f"  [DEBUG] Ollama response keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
+
+                # Handle API errors
+                if "error" in data:
+                    error_msg = str(data.get("error", "Unknown API error"))
+                    print(f"  [!] Ollama API error: {error_msg[:200]}")
+                    return {"error": error_msg, "issues": [], "quality_score": 0}
+
+                # Extract content - standard OpenAI format
+                content = None
+                if "choices" in data and len(data["choices"]) > 0:
+                    content = data["choices"][0]["message"]["content"]
+                    print(f"  [DEBUG] Ollama content extracted, length: {len(content)}")
+                else:
+                    print(f"  [DEBUG] Ollama unexpected response: {str(data)[:300]}")
+                    return {"error": f"Unexpected response format: {str(data)[:200]}", "issues": [], "quality_score": 0}
+
+                if content is None:
+                    return {"error": f"Could not parse response: {str(data)[:200]}", "issues": [], "quality_score": 0}
+
+                # Capture token usage from response if available
+                usage_data = data.get("usage", {})
+
+                # Try to extract JSON from response
+                if "```json" in content:
+                    content = content.split("```json")[1].split("```")[0]
+                elif "```" in content:
+                    parts = content.split("```")
+                    for part in parts:
+                        part = part.strip()
+                        if part.startswith("{"):
+                            content = part
+                            break
+
+                # Clean up content
+                content = content.strip()
+                if not content.startswith("{"):
+                    start = content.find("{")
+                    end = content.rfind("}") + 1
+                    if start != -1 and end > start:
+                        content = content[start:end]
+                    else:
+                        return {"error": f"No JSON found in response: {content[:200]}...", "issues": [], "quality_score": 0}
+
+                result = json.loads(content)
+                # Add token usage
+                if usage_data:
+                    result["_usage"] = {
+                        "input_tokens": usage_data.get("prompt_tokens", 0),
+                        "output_tokens": usage_data.get("completion_tokens", 0)
+                    }
+                return result
+
+        except json.JSONDecodeError as e:
+            return {"error": f"JSON parse error: {e}", "issues": [], "quality_score": 0}
+        except Exception as e:
+            return {"error": str(e), "issues": [], "quality_score": 0}
+
+
 class ClaudeReviewer:
     """Anthropic Claude reviewer"""
 
@@ -664,6 +890,26 @@ class ClaudeReviewer:
             raise ImportError("anthropic package not installed. Run: pip install anthropic")
         self.client = anthropic.Anthropic(api_key=api_key)
         self.model = model
+
+    async def _call_api(self, prompt: str) -> str:
+        """Make a direct API call and return raw text response"""
+        try:
+            import asyncio
+            loop = asyncio.get_event_loop()
+            model = self.model
+            response = await loop.run_in_executor(
+                None,
+                lambda: self.client.messages.create(
+                    model=model,
+                    max_tokens=8192,
+                    messages=[
+                        {"role": "user", "content": prompt}
+                    ]
+                )
+            )
+            return response.content[0].text
+        except Exception as e:
+            raise Exception(f"Claude API call failed: {str(e)}")
 
     async def review(self, code: str, file_path: str) -> dict:
         try:
@@ -719,10 +965,12 @@ class ClaudeReviewer:
 class AICouncil:
     """Main orchestrator for multi-model reviews"""
 
-    def __init__(self, config: dict = None, enable_gemini: bool = False, enable_gpt: bool = True, enable_claude: bool = True, enable_grok: bool = True, power_mode: bool = False, db_path: str = None):
+    def __init__(self, config: dict = None, enable_gemini: bool = False, enable_gpt: bool = True, enable_claude: bool = True, enable_grok: bool = True, enable_ollama: bool = False, ollama_url: str = None, ollama_model: str = None, power_mode: bool = False, db_path: str = None):
         import copy
         self.config = config or copy.deepcopy(DEFAULT_CONFIG)
         self.power_mode = power_mode
+        self.ollama_url = ollama_url
+        self.ollama_model = ollama_model
         # Use custom db_path if provided
         if db_path:
             self.config["db_path"] = db_path
@@ -731,6 +979,8 @@ class AICouncil:
         # Override model settings if requested
         if enable_gemini:
             self.config["models"]["gemini"]["enabled"] = True
+        if enable_ollama:
+            self.config["models"]["ollama"]["enabled"] = True
         # Allow disabling default models
         if not enable_gpt:
             self.config["models"]["gpt-4"]["enabled"] = False
@@ -791,6 +1041,17 @@ class AICouncil:
                 except ImportError as e:
                     print(f"[-] Claude disabled: {e}")
 
+        if models.get("ollama", {}).get("enabled"):
+            # Get URL from instance variable, env var, or default
+            ollama_url = self.ollama_url or os.environ.get(models["ollama"].get("url_env", "OLLAMA_URL")) or "https://wowcentral.worldofworkflows.com"
+            api_key = os.environ.get(models["ollama"]["api_key_env"])  # Optional
+            try:
+                model_name = self.ollama_model or model_names["ollama"]
+                self.reviewers["ollama"] = OllamaReviewer(ollama_url, model=model_name, api_key=api_key)
+                print(f"[+] Ollama reviewer enabled ({model_name} @ {ollama_url})")
+            except ImportError as e:
+                print(f"[-] Ollama disabled: {e}")
+
         if not self.reviewers:
             print("[!] No reviewers configured. Set API keys in environment.")
 
@@ -806,25 +1067,41 @@ class AICouncil:
         content = path.read_text(encoding="utf-8", errors="ignore")
         file_hash = self.get_file_hash(content)
 
-        # Check if already reviewed (unless forced)
+        # Get currently enabled models
+        enabled_models = set(self.reviewers.keys())
+
+        # Check for cached reviews (unless forced)
+        cached_reviews = {}
+        models_to_run = set(enabled_models)
+
         if not force:
             existing = self.db.get_latest_by_hash(file_hash)
             if existing:
-                # Convert list format to dict format for consistency
-                reviews_dict = {item["model"]: item["review"] for item in existing}
-                return {"cached": True, "reviews": reviews_dict}
+                # Filter to only include successful reviews for currently enabled models
+                for item in existing:
+                    model = item["model"]
+                    review = item["review"]
+                    # Skip cached errors - re-run those models
+                    if model in enabled_models and "error" not in review:
+                        cached_reviews[model] = review
+                        models_to_run.discard(model)
 
-        # Initialize progress tracker
+                # If all enabled models have cached reviews, return them
+                if not models_to_run:
+                    return {"cached": True, "reviews": cached_reviews}
+
+        # Initialize progress tracker for models that need to be run
         tracker = None
-        if show_progress and self.reviewers:
-            tracker = ProgressTracker(list(self.reviewers.keys()))
+        if show_progress and models_to_run:
+            tracker = ProgressTracker(list(models_to_run))
             tracker.start_spinner()
 
-        # Run reviews in parallel
-        results = {}
+        # Run reviews in parallel for models without cache
+        results = dict(cached_reviews)  # Start with cached results
         tasks = []
 
-        for model_name, reviewer in self.reviewers.items():
+        for model_name in models_to_run:
+            reviewer = self.reviewers[model_name]
             tasks.append(self._review_with_model(model_name, reviewer, content, file_path, tracker))
 
         if tasks:
@@ -838,7 +1115,8 @@ class AICouncil:
             tracker.stop_spinner()
             tracker.print_summary()
 
-        return {"cached": False, "reviews": results, "_tracker": tracker}
+        has_cached = len(cached_reviews) > 0
+        return {"cached": has_cached and not tasks, "reviews": results, "_tracker": tracker}
 
     async def _review_with_model(self, model_name: str, reviewer, content: str, file_path: str, tracker: ProgressTracker = None):
         if tracker:
@@ -1174,7 +1452,7 @@ def generate_html_report(file_path: str, reviews: dict, output_path: str = None,
         }}
         .header-content {{ display: flex; align-items: center; gap: 1.5rem; }}
         .header-logo {{ flex-shrink: 0; }}
-        .header-logo img {{ height: 48px; width: auto; border-radius: 8px; }}
+        .header-logo img {{ height: 86px; width: auto; border-radius: 8px; }}
         .header-text {{ flex: 1; }}
         .header h1 {{
             font-size: 1.75rem; font-weight: 700; margin-bottom: 0.5rem;
@@ -1194,6 +1472,7 @@ def generate_html_report(file_path: str, reviews: dict, output_path: str = None,
         .score-card.grok {{ border-top: 4px solid #1da1f2; }}
         .score-card.gemini {{ border-top: 4px solid #8e44ad; }}
         .score-card.claude {{ border-top: 4px solid #d97706; }}
+        .score-card.ollama {{ border-top: 4px solid #ff6b35; }}
         .score-card.consensus {{ border-top: 4px solid var(--indigo-500); }}
         .score-card h3 {{ font-size: 0.875rem; color: var(--zinc-400); margin-bottom: 0.5rem; }}
         .score-card .score {{ font-size: 2.5rem; font-weight: 700; }}
@@ -1261,6 +1540,7 @@ def generate_html_report(file_path: str, reviews: dict, output_path: str = None,
         .usage-model.grok {{ color: #1da1f2; }}
         .usage-model.claude {{ color: #d97706; }}
         .usage-model.gemini {{ color: #8e44ad; }}
+        .usage-model.ollama {{ color: #ff6b35; }}
         .usage-tokens {{ font-family: 'JetBrains Mono', monospace; font-size: 0.8rem; color: var(--text-secondary); }}
         .usage-cost {{ font-size: 0.85rem; font-weight: 600; color: var(--emerald-400); }}
         .usage-total {{ background: linear-gradient(135deg, var(--indigo-500), var(--purple-500)); border-radius: 8px; padding: 0.75rem; }}
@@ -1340,7 +1620,7 @@ def generate_html_report(file_path: str, reviews: dict, output_path: str = None,
             input_tokens = usage.get("input_tokens", 0)
             output_tokens = usage.get("output_tokens", 0)
             cost = calculate_cost(model, input_tokens, output_tokens, power_mode)
-            model_class = "gpt" if "gpt" in model.lower() else ("grok" if "grok" in model.lower() else ("claude" if "claude" in model.lower() else "gemini"))
+            model_class = "gpt" if "gpt" in model.lower() else ("grok" if "grok" in model.lower() else ("claude" if "claude" in model.lower() else ("ollama" if "ollama" in model.lower() else "gemini")))
             html += f'''
                 <div class="usage-item">
                     <span class="usage-model {model_class}">{model.upper()}</span>
@@ -1368,7 +1648,7 @@ def generate_html_report(file_path: str, reviews: dict, output_path: str = None,
         if isinstance(review, dict):
             score = review.get("quality_score", 0) if "error" not in review else "ERR"
             issues_count = len(review.get("issues", [])) if "error" not in review else 0
-            model_class = "gpt" if "gpt" in model.lower() else ("grok" if "grok" in model.lower() else ("claude" if "claude" in model.lower() else "gemini"))
+            model_class = "gpt" if "gpt" in model.lower() else ("grok" if "grok" in model.lower() else ("claude" if "claude" in model.lower() else ("ollama" if "ollama" in model.lower() else "gemini")))
             score_class = "good" if isinstance(score, (int, float)) and score >= 7 else ("medium" if isinstance(score, (int, float)) and score >= 5 else "bad")
 
             html += f'''
@@ -1490,8 +1770,8 @@ def generate_html_report(file_path: str, reviews: dict, output_path: str = None,
         if isinstance(review, dict) and "error" not in review:
             issues = review.get("issues", [])
             summary = review.get("summary", "")
-            model_class = "gpt" if "gpt" in model.lower() else ("grok" if "grok" in model.lower() else ("claude" if "claude" in model.lower() else "gemini"))
-            emoji = "🧠" if "gpt" in model.lower() else ("⚡" if "grok" in model.lower() else ("🔮" if "claude" in model.lower() else "💎"))
+            model_class = "gpt" if "gpt" in model.lower() else ("grok" if "grok" in model.lower() else ("claude" if "claude" in model.lower() else ("ollama" if "ollama" in model.lower() else "gemini")))
+            emoji = "🧠" if "gpt" in model.lower() else ("⚡" if "grok" in model.lower() else ("🔮" if "claude" in model.lower() else ("🦙" if "ollama" in model.lower() else "💎")))
 
             html += f'''
         <div class="section">
@@ -1566,6 +1846,10 @@ class FileWatchHandler(FileSystemEventHandler):
 def main():
     parser = argparse.ArgumentParser(description="AI Council - Multi-Model Code Review")
     parser.add_argument("--db", help="Path to reviews database (default: script directory)")
+    # Global model flags - work for all commands
+    parser.add_argument("--ollama", action="store_true", help="Include Ollama (self-hosted) in review")
+    parser.add_argument("--ollama-url", help="Ollama server URL")
+    parser.add_argument("--ollama-model", help="Ollama model to use")
     subparsers = parser.add_subparsers(dest="command", help="Commands")
 
     # Status command
@@ -1586,12 +1870,12 @@ def main():
     review_parser.add_argument("--issues-all", action="store_true", help="Create GitHub issues for ALL findings")
     review_parser.add_argument("--repo", help="Target repo for issues (default: current git repo)")
     review_parser.add_argument("--synthesize", "-s", action="store_true", help="AI-powered synthesis of all reviews (Council Verdict)")
-    review_parser.add_argument("--synthesizer", choices=['claude', 'gpt-4', 'gemini', 'grok'], help="Specific AI to use for synthesis (default: auto)")
+    review_parser.add_argument("--synthesizer", choices=['claude', 'gpt-4', 'gemini', 'grok', 'ollama'], help="Specific AI to use for synthesis (default: auto)")
 
     # Fix command
     fix_parser = subparsers.add_parser("fix", help="Fix code based on review findings")
     fix_parser.add_argument("file", help="File to fix")
-    fix_parser.add_argument("--fixer", choices=['claude', 'gpt-4', 'gemini', 'grok'], required=True, help="AI to use for fixing")
+    fix_parser.add_argument("--fixer", choices=['claude', 'gpt-4', 'gemini', 'grok', 'ollama'], required=True, help="AI to use for fixing")
     fix_parser.add_argument("--report", help="Path to HTML report with issues")
 
     # Show command
@@ -1614,16 +1898,22 @@ def main():
 
     # Enable optional models and power mode if flags are passed on review command
     enable_gemini = getattr(args, 'gemini', False)
+    enable_ollama = getattr(args, 'ollama', False)
     disable_gpt = getattr(args, 'no_gpt', False)
     disable_claude = getattr(args, 'no_claude', False)
     disable_grok = getattr(args, 'no_grok', False)
     power_mode = getattr(args, 'power', False)
     db_path = getattr(args, 'db', None)
+    ollama_url = getattr(args, 'ollama_url', None)
+    ollama_model = getattr(args, 'ollama_model', None)
     council = AICouncil(
         enable_gemini=enable_gemini,
         enable_gpt=not disable_gpt,
         enable_claude=not disable_claude,
         enable_grok=not disable_grok,
+        enable_ollama=enable_ollama,
+        ollama_url=ollama_url,
+        ollama_model=ollama_model,
         power_mode=power_mode,
         db_path=db_path
     )
@@ -1631,7 +1921,15 @@ def main():
     if args.command == "status":
         print("\n=== AI Council Status ===")
         print(f"Database: {council.config['db_path']}")
-        print(f"Reviewers: {', '.join(council.reviewers.keys()) or 'None configured'}")
+        # Show reviewers with model names
+        reviewer_info = []
+        for name, reviewer in council.reviewers.items():
+            model = getattr(reviewer, 'model', '')
+            if model and name == 'ollama':
+                reviewer_info.append(f"{name} ({model})")
+            else:
+                reviewer_info.append(name)
+        print(f"Reviewers: {', '.join(reviewer_info) or 'None configured'}")
         pending = council.db.get_pending(100)
         print(f"Pending reviews: {len(pending)}")
 
@@ -1663,14 +1961,20 @@ def main():
             print("  Detailed Results")
             print(f"{'='*60}")
 
+            total_models = len(result["reviews"])
+            completed = 0
             for model, review in result["reviews"].items():
+                completed += 1
                 reviews_data[model] = review
                 if "error" in review:
-                    print(f"\n  [{model.upper()}] ERROR: {review['error'][:80]}")
+                    print(f"[!] {model.upper()} ERROR")
+                    print(f"  [{model.upper()}] ERROR: {review['error'][:80]}")
                 else:
                     issues = review.get("issues", [])
                     score = review.get('quality_score', '?')
-                    print(f"\n  [{model.upper()}] Score: {score}/10 | Issues: {len(issues)}")
+                    # Output in format that VS Code extension can parse
+                    print(f"[+] {model.upper()} Score: {score}/10 (0.0s) [{completed}/{total_models}]")
+                    print(f"  [{model.upper()}] Score: {score}/10 | Issues: {len(issues)}")
 
                     # Show top issues by severity
                     severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
@@ -1692,15 +1996,16 @@ def main():
             if usage_by_model:
                 print(format_usage_summary(usage_by_model, power_mode))
 
-        # Run synthesis if --synthesize flag is passed and we have 2+ models
+        # Run synthesis if --synthesize flag is passed and we have 2+ successful models
         synthesis_result = None
         do_synthesize = getattr(args, 'synthesize', False)
-        if do_synthesize and reviews_data and len(reviews_data) >= 2:
+        successful_reviews = {k: v for k, v in reviews_data.items() if "error" not in v}
+        if do_synthesize and len(successful_reviews) >= 2:
             # Read file content for synthesis
             try:
                 code_content = Path(args.file).read_text(encoding="utf-8", errors="ignore")
                 preferred_synth = getattr(args, 'synthesizer', None)
-                synthesis_result = asyncio.run(council.synthesize_reviews(args.file, code_content, reviews_data, preferred_synth))
+                synthesis_result = asyncio.run(council.synthesize_reviews(args.file, code_content, successful_reviews, preferred_synth))
 
                 if "error" not in synthesis_result:
                     print(f"\n{'='*60}")
