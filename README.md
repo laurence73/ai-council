@@ -6,14 +6,15 @@
 
 <p align="center">
   <strong>Multi-Model Code Review System</strong><br>
-  Get parallel code reviews from GPT-4, Grok, Claude, and Gemini - find bugs that single-model reviews miss.
+  Get parallel code reviews from GPT-4, Grok, Claude, Gemini, and Ollama - find bugs that single-model reviews miss.
 </p>
 
 <p align="center">
   <a href="#vs-code-extension">VS Code Extension</a> -
   <a href="#quick-start">Quick Start</a> -
   <a href="#free-models">Free Models</a> -
-  <a href="#power-mode">Power Mode</a>
+  <a href="#power-mode">Power Mode</a> -
+  <a href="#self-hosted-models">Self-Hosted Models</a>
 </p>
 
 ---
@@ -24,29 +25,36 @@
 
 ### Features
 
-- Side panel with model toggles
-- One-click code review
-- Free vs Paid model grouping
-- API key settings in VS Code
-- Real-time progress tracking
-- HTML report generation
+- **Side Panel UI** - Toggle models on/off with one click
+- **Real-time Progress** - Watch each model complete with live score cards
+- **Council Verdict** - AI-synthesized consensus from all reviews
+- **Fix with AI** - Auto-fix issues using any reviewer model
+- **Toggle Persistence** - Your selected reviewers are remembered across sessions
+- **Status Panel** - View configured reviewers and connected accounts
+- **Free vs Paid Grouping** - Clearly separated model tiers
+- **Power Mode** - One-click switch to premium models
+- **HTML Reports** - Beautiful, shareable review reports
 
-### Installation
+### Installation (from Release)
 
 1. Download `ai-council-0.1.0.vsix` from [Releases](https://github.com/laurence73/ai-council/releases)
 2. In VS Code: `Ctrl+Shift+P` -> "Extensions: Install from VSIX..."
 3. Select the downloaded file
 4. Configure API keys in Settings (`Ctrl+,` -> search "AI Council")
 
+### Installation (from Source)
+
+See [Developer Setup](#developer-setup) below to build and install from source.
+
 ### Screenshot
 
 The extension adds an AI Council icon to the Activity Bar with:
 
-- **Free Models**: Gemini, Groq/Llama, Ollama (local)
-- **Paid Models**: GPT-4, Claude, Grok, + more coming soon
-- **Options**: Power Mode, HTML Report toggle
-- **Actions**: Review Current File, Power Review
-- **Tools**: Check Status, Clear Cache, Settings
+- **Free Models**: Gemini, Groq/Llama, Ollama (self-hosted)
+- **Paid Models**: GPT-4, Claude, Grok
+- **Options**: Power Mode toggle, Synthesizer selection
+- **Actions**: Review Current File, Fix with AI
+- **Tools**: Status, Clear Cache, Settings
 
 ---
 
@@ -60,6 +68,7 @@ Instead of relying on a single AI for code review, AI Council runs your code thr
 | **Grok** | Direct feedback, code-optimized, catches edge cases |
 | **Claude** | Security focus, nuanced reasoning, detailed explanations |
 | **Gemini** | Different training data, unique perspective |
+| **Ollama** | Self-hosted, private, no data leaves your network |
 
 **Consensus = High Confidence**: When multiple models agree on an issue, it's almost certainly real.
 
@@ -83,6 +92,46 @@ Several models have **free tiers** - perfect for getting started!
 # Use only Gemini (free)
 python ai_council.py review myfile.cs --gemini --no-gpt --no-claude --no-grok
 ```
+
+---
+
+## Self-Hosted Models
+
+AI Council supports self-hosted LLMs via **Ollama** or any **OpenAI-compatible API**.
+
+### Local Ollama
+
+```bash
+# Start Ollama locally
+ollama serve
+
+# Use with AI Council
+python ai_council.py review myfile.cs --ollama --ollama-url http://localhost:11434
+```
+
+### WoW AI (World of Workflows)
+
+Connect to WoW AI's hosted Ollama instance:
+
+```bash
+python ai_council.py review myfile.cs --ollama \
+  --ollama-url https://wowai-api.worldofworkflows.com:9443 \
+  --ollama-model qwen3.6:35b-mlx
+```
+
+### VS Code Settings for Self-Hosted
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `ai-council.ollamaUrl` | `https://wowai-api.worldofworkflows.com:9443` | Ollama server URL |
+| `ai-council.ollamaModel` | `qwen3.6:35b-mlx` | Model to use |
+| `ai-council.apiKeys.ollama` | `user:pass` | Basic auth (user:pass) or Bearer token |
+
+Supported models on WoW AI:
+- `qwen3.6:35b-mlx` (default)
+- `qwen3-coder-next:latest`
+- `gemma4:12b-mlx`
+- `llama3.2:latest`
 
 ---
 
@@ -133,17 +182,20 @@ Watch as each model completes its review:
     - GPT-4    -> gpt-4-turbo
     - GROK     -> grok-3-mini
     - CLAUDE   -> claude-sonnet-4-5
+    - OLLAMA   -> qwen3.6:35b-mlx
 ============================================================
 
   [~] GPT-4 started...
   [~] GROK started...
   [~] CLAUDE started...
-  [+] GPT-4 Score: 7/10 (15.2s) [1/3]
-  [+] GROK Score: 6/10 (18.5s) [2/3]
-  [+] CLAUDE Score: 7/10 (22.1s) [3/3]
+  [~] OLLAMA started...
+  [+] GPT-4 Score: 7/10 (15.2s) [1/4]
+  [+] GROK Score: 6/10 (18.5s) [2/4]
+  [+] CLAUDE Score: 7/10 (22.1s) [3/4]
+  [+] OLLAMA Score: 8/10 (45.3s) [4/4]
 
 ============================================================
-  Review Complete - Total Time: 22.1s
+  Review Complete - Total Time: 45.3s
 ============================================================
 ```
 
@@ -156,9 +208,28 @@ Know exactly what each review costs:
   GPT-4    1,434 in / 608 out  (~$0.0326)
   GROK     1,616 in / 544 out  (~$0.0162)
   CLAUDE   1,766 in / 1,400 out  (~$0.0263)
+  OLLAMA   2,100 in / 900 out   (~$0.0000)
   ----------------------------------------
-  TOTAL    4,816 in / 2,552 out  (~$0.0751)
+  TOTAL    6,916 in / 3,452 out  (~$0.0751)
 ```
+
+### Council Verdict (AI Synthesis)
+
+After all models complete, get an AI-synthesized verdict:
+
+- **Consensus Score** - Weighted average across all reviewers
+- **Priority Issues** - Critical findings agreed upon by multiple models
+- **Disputed Items** - Where models disagree (manual review needed)
+- **False Positives** - Issues likely to be non-issues
+
+### Fix with AI
+
+Select any reviewer to auto-fix issues:
+
+1. Complete a review
+2. Click "Fix with AI" dropdown
+3. Select a model (Claude, GPT-4, etc.)
+4. Review the diff and apply changes
 
 ### Beautiful HTML Reports
 
@@ -170,6 +241,7 @@ python ai_council.py review myfile.cs --html
 
 Reports include:
 - Score cards for each model
+- Council Verdict synthesis
 - Consensus issues highlighted
 - Token usage breakdown
 - Severity-coded issues (Critical, High, Medium, Low)
@@ -198,7 +270,7 @@ python ai_council.py review myfile.cs --power
 |------|--------|---------------------|
 | Standard | 3 models | ~$0.07 |
 | Power | 3 models | ~$0.30-0.50 |
-| **Free only** | Gemini | **$0.00** |
+| **Free only** | Gemini + Ollama | **$0.00** |
 
 ---
 
@@ -216,17 +288,30 @@ python ai_council.py review <file> --force
 # Include Gemini (4 models)
 python ai_council.py review <file> --gemini
 
+# Include Ollama (self-hosted)
+python ai_council.py review <file> --ollama --ollama-url http://localhost:11434
+
 # Use premium models
 python ai_council.py review <file> --power
 
-# Generate HTML report
-python ai_council.py review <file> --html
+# Generate HTML report with synthesis
+python ai_council.py review <file> --html --synthesize
 
 # Disable specific models
 python ai_council.py review <file> --no-gpt --no-claude
 
 # Free models only
-python ai_council.py review <file> --gemini --no-gpt --no-claude --no-grok
+python ai_council.py review <file> --gemini --ollama --no-gpt --no-claude --no-grok
+```
+
+### Fix Commands
+
+```bash
+# Fix issues using Claude
+python ai_council.py fix <file> --fixer claude
+
+# Fix issues using GPT-4
+python ai_council.py fix <file> --fixer gpt-4
 ```
 
 ### Flags Reference
@@ -235,11 +320,16 @@ python ai_council.py review <file> --gemini --no-gpt --no-claude --no-grok
 |------|-------|-------------|
 | `--force` | `-f` | Bypass cache, force fresh review |
 | `--gemini` | `-g` | Include Gemini in review |
+| `--ollama` | | Include Ollama (self-hosted) |
+| `--ollama-url` | | Ollama server URL |
+| `--ollama-model` | | Ollama model name |
 | `--no-gpt` | | Disable GPT-4 reviewer |
 | `--no-claude` | | Disable Claude reviewer |
 | `--no-grok` | | Disable Grok reviewer |
 | `--power` | `-p` | Use premium models (higher cost) |
 | `--html` | | Generate HTML report |
+| `--synthesize` | | Generate AI council verdict |
+| `--synthesizer` | | Model to use for synthesis (claude, gpt-4, etc.) |
 | `--output` | `-o` | Custom output path for HTML |
 | `--issues` | | Create GitHub issues for consensus findings |
 | `--issues-all` | | Create GitHub issues for ALL findings |
@@ -271,28 +361,26 @@ python ai_council.py review <file> --gemini --no-gpt --no-claude --no-grok
 
 ### Completed
 
-- [x] VS Code Extension - Basic (#22)
-- [x] VS Code Extension - Side Panel UI (#24)
+- [x] VS Code Extension - Side Panel UI
 - [x] API Key Settings in VS Code
 - [x] Free vs Paid Model Grouping
+- [x] Real-time Progress Cards
+- [x] Council Verdict Synthesis
+- [x] Fix with AI
+- [x] Toggle State Persistence
+- [x] Ollama/Self-hosted Model Support
+- [x] Status Panel with Account Info
+- [x] Power Mode Toggle
 
-### Coming Soon - New Models
+### Coming Soon
 
-| Issue | Model | Type | Status |
-|-------|-------|------|--------|
-| [#30](https://github.com/laurence73/ai-council/issues/30) | Mistral Codestral | Paid | Planned |
-| [#31](https://github.com/laurence73/ai-council/issues/31) | DeepSeek Coder | Paid | Planned |
-| [#32](https://github.com/laurence73/ai-council/issues/32) | Qwen 2.5 Coder | Paid | Planned |
-| [#33](https://github.com/laurence73/ai-council/issues/33) | Llama 3.1 (Groq) | **FREE** | Planned |
-| [#34](https://github.com/laurence73/ai-council/issues/34) | Cohere Command R+ | Paid | Planned |
-| [#35](https://github.com/laurence73/ai-council/issues/35) | Ollama (Local) | **FREE** | Planned |
-
-### Future
-
-- [ ] VS Code Extension - Diagnostics Integration (#23)
-- [ ] VS Code Extension - Native TypeScript (#25)
-- [ ] VS Code Extension - Language Server Protocol (#26)
-- [ ] Visual Studio Extension (#27)
+| Feature | Status |
+|---------|--------|
+| Mistral Codestral | Planned |
+| DeepSeek Coder | Planned |
+| Qwen 2.5 Coder | Planned |
+| Cohere Command R+ | Planned |
+| VS Code Diagnostics Integration | Planned |
 
 ---
 
@@ -305,13 +393,14 @@ Create `~/.claude/commands/ai-council.md`:
 ```markdown
 # AI Council Review
 
-Run multi-model code review using GPT-4, Grok, and Claude.
+Run multi-model code review using GPT-4, Grok, Claude, and more.
 
 **Arguments:** `<file_path> [flags]`
 
 **Flags:**
 - `--force` or `-f` - Force re-review
 - `--gemini` or `-g` - Include Gemini
+- `--ollama` - Include Ollama
 - `--power` or `-p` - Use premium models
 - `--html` - Generate HTML report
 
@@ -324,7 +413,7 @@ Then use in Claude Code:
 
 ```
 /ai-council src/MyService.cs --html
-/ai-council src/MyService.cs --power --html
+/ai-council src/MyService.cs --power --html --synthesize
 ```
 
 ---
@@ -339,20 +428,20 @@ Then use in Claude Code:
               |   AI Council     |
               |   Orchestrator   |
               +------------------+
-                   |    |    |
-         +---------+    |    +---------+
-         v              v              v
-    +--------+    +--------+    +--------+
-    | GPT-4  |    |  Grok  |    | Claude |
-    +--------+    +--------+    +--------+
-         |              |              |
-         +------+-------+------+-------+
-                |              |
-                v              v
-         +----------+    +----------+
-         | Consensus|    |  SQLite  |
-         | Engine   |    |  Cache   |
-         +----------+    +----------+
+                   |    |    |    |
+         +---------+    |    |    +---------+
+         v              v    v              v
+    +--------+    +--------+  +--------+  +--------+
+    | GPT-4  |    |  Grok  |  | Claude |  | Ollama |
+    +--------+    +--------+  +--------+  +--------+
+         |              |          |           |
+         +------+-------+----------+-----------+
+                |
+                v
+         +-------------+
+         |  Synthesis  |
+         |   Engine    |
+         +-------------+
                 |
     +-----------+-----------+
     v           v           v
@@ -376,9 +465,108 @@ Then use in Claude Code:
 
 ---
 
+## Developer Setup
+
+Clone the repo and build the VS Code extension locally.
+
+### Prerequisites
+
+- Node.js 18+
+- Python 3.10+
+- VS Code
+
+### Clone and Build
+
+```bash
+# Clone the repo
+git clone https://github.com/laurence73/ai-council.git
+cd ai-council
+
+# Install Python dependencies
+pip install openai httpx anthropic google-generativeai
+
+# Build the VS Code extension
+cd vscode-extension
+npm install
+npm run compile
+npm run package
+
+# Install the extension
+code --install-extension ai-council-0.1.0.vsix --force
+```
+
+### Development Workflow
+
+```bash
+cd vscode-extension
+
+# Compile TypeScript (one-time)
+npm run compile
+
+# Or watch for changes (recommended during development)
+npm run watch
+```
+
+After making changes:
+
+```bash
+# Rebuild and reinstall
+npm run compile && npm run package && code --install-extension ai-council-0.1.0.vsix --force
+```
+
+Then reload VS Code (`Ctrl+Shift+P` -> "Developer: Reload Window").
+
+### Project Structure
+
+```
+ai-council/
+├── ai_council.py              # Main Python CLI (also bundled in extension)
+├── README.md
+├── commands/                   # Claude Code skills
+│   ├── ai-council.md          # /ai-council skill
+│   └── add-council-reviewer.md # Guide for adding new models
+└── vscode-extension/
+    ├── src/
+    │   ├── extension.ts       # Extension entry point
+    │   └── sidePanel.ts       # Main sidebar UI and logic
+    ├── ai_council.py          # Bundled Python script
+    ├── package.json           # Extension manifest and settings
+    └── out/                    # Compiled JS (generated)
+```
+
+### Key Files to Know
+
+| File | Purpose |
+|------|---------|
+| `vscode-extension/src/sidePanel.ts` | Main UI, message handlers, review logic |
+| `vscode-extension/src/extension.ts` | Extension activation, commands |
+| `vscode-extension/ai_council.py` | Python backend (bundled copy) |
+| `vscode-extension/package.json` | Extension settings, commands, UI config |
+
+### Testing Changes
+
+1. Make edits to `.ts` files
+2. Run `npm run compile` (or use `npm run watch`)
+3. Run `npm run package`
+4. Install: `code --install-extension ai-council-0.1.0.vsix --force`
+5. Reload VS Code window
+6. Test in the AI Council sidebar
+
+### Debugging
+
+- Open DevTools: `Ctrl+Shift+I` or `F12`
+- Check Console for `AI Council:` log messages
+- Extension Host logs show Python output
+
+---
+
 ## Contributing
 
 Contributions welcome! Please open an issue first to discuss proposed changes.
+
+### Adding a New Model
+
+See `commands/add-council-reviewer.md` for a complete checklist of all files and changes needed to add a new AI reviewer.
 
 ---
 
