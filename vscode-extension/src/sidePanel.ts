@@ -3,14 +3,121 @@ import * as path from 'path';
 import * as https from 'https';
 import { spawn } from 'child_process';
 
+// Windows CommandLineToArgvW-compatible quoting for a shell-string spawn() call: backslashes
+// are only special when they immediately precede a double quote (or run to the end of the
+// argument, right before the closing quote) - in that case they must be doubled, and the
+// quote escaped. Naive `.replace(/"/g, '\\"')` corrupts a trailing backslash and silently
+// truncates on embedded newlines (e.g. multi-line scope/question text from a <textarea>).
+function winQuoteArg(value: string): string {
+    const normalized = value.replace(/\r?\n/g, ' ');
+    let result = '';
+    let backslashes = 0;
+    for (const ch of normalized) {
+        if (ch === '\\') {
+            backslashes++;
+            continue;
+        }
+        if (ch === '"') {
+            result += '\\'.repeat(backslashes * 2 + 1) + '"';
+            backslashes = 0;
+            continue;
+        }
+        result += '\\'.repeat(backslashes) + ch;
+        backslashes = 0;
+    }
+    result += '\\'.repeat(backslashes * 2);
+    return '"' + result + '"';
+}
+
 interface ReviewOptions {
     enableGpt: boolean;
     enableClaude: boolean;
     enableGrok: boolean;
+    enableGptCli: boolean;
+    enableClaudeCli: boolean;
+    enableGrokCli: boolean;
     enableGemini: boolean;
     enableOllama: boolean;
     powerMode: boolean;
     synthesizer: string;
+}
+
+interface ModelResult {
+    score: number;
+    issues: number;
+    error?: boolean;
+}
+
+// Maps a raw model name from ai_council.py's stdout (e.g. "CLAUDE-CLI", "GPT-4") to the key
+// used in modelResults / the webview's card IDs. CLI seats keep their -cli suffix (distinct
+// card from the API seat); everything else collapses to the bare API-seat key.
+function normalizeModelKey(rawName: string): string {
+    const modelName = rawName.toLowerCase();
+    if (modelName.endsWith('-cli')) { return modelName; }
+    if (modelName.includes('gpt')) { return 'gpt-4'; }
+    if (modelName.includes('claude')) { return 'claude'; }
+    if (modelName.includes('grok')) { return 'grok'; }
+    if (modelName.includes('gemini')) { return 'gemini'; }
+    return modelName;
+}
+
+// Shared stdout-line parser for every command that runs ai_council.py's ProgressTracker
+// (review, scoped-review, scoped-followup all print the same "[+] MODEL Score: N/10 (Xs)
+// [i/total]" / "[!] MODEL ERROR" / "[MODEL] Score: N/10 | Issues: N" lines). Extracted once so
+// review and scoped-review can't drift out of sync with each other's parsing again.
+function parseModelProgressLine(text: string, modelResults: Record<string, ModelResult>): { model: string; data: ModelResult } | null {
+    const scoreMatch = text.match(/\[\+\]\s+([\w-]+)\s+Score:\s*(\d+(?:\.\d+)?)\/10/i);
+    if (scoreMatch) {
+        const modelKey = normalizeModelKey(scoreMatch[1]);
+        const score = parseFloat(scoreMatch[2]);
+        if (!modelResults[modelKey]) {
+            modelResults[modelKey] = { score, issues: 0 };
+        } else {
+            modelResults[modelKey].score = score;
+        }
+        return { model: modelKey, data: { score, issues: modelResults[modelKey].issues || 0, error: false } };
+    }
+
+    const issuesMatch = text.match(/\[([\w-]+)\]\s+Score:\s*\d+(?:\.\d+)?\/10\s*\|\s*Issues:\s*(\d+)/i);
+    if (issuesMatch) {
+        const modelKey = normalizeModelKey(issuesMatch[1]);
+        const issues = parseInt(issuesMatch[2]);
+        if (modelResults[modelKey]) {
+            modelResults[modelKey].issues = issues;
+        }
+        return null;
+    }
+
+    const errorMatch = text.match(/\[!\]\s+([\w-]+)\s+ERROR/i);
+    if (errorMatch) {
+        const modelKey = normalizeModelKey(errorMatch[1]);
+        modelResults[modelKey] = { score: 0, issues: 0, error: true };
+        return { model: modelKey, data: { score: 0, issues: 0, error: true } };
+    }
+
+    return null;
+}
+
+// Full-stdout re-scan for anything the line-by-line parser missed (especially cached rounds,
+// which never emit a live "[~] MODEL started..." line but still print in "Detailed Results").
+function rescanModelResults(stdout: string, modelResults: Record<string, ModelResult>) {
+    const allScoreMatches = stdout.matchAll(/\[\+\]\s+([\w-]+)\s+Score:\s*(\d+(?:\.\d+)?)\/10/gi);
+    for (const match of allScoreMatches) {
+        const modelKey = normalizeModelKey(match[1]);
+        const score = parseFloat(match[2]);
+        if (!modelResults[modelKey] || modelResults[modelKey].error) {
+            modelResults[modelKey] = { score, issues: 0 };
+        }
+    }
+
+    const allIssuesMatches = stdout.matchAll(/\[([\w-]+)\]\s+Score:\s*\d+(?:\.\d+)?\/10\s*\|\s*Issues:\s*(\d+)/gi);
+    for (const match of allIssuesMatches) {
+        const modelKey = normalizeModelKey(match[1]);
+        const issues = parseInt(match[2]);
+        if (modelResults[modelKey]) {
+            modelResults[modelKey].issues = issues;
+        }
+    }
 }
 
 export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
@@ -30,9 +137,12 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
 
     private _getToggleStates(): Record<string, boolean> {
         return this._context.globalState.get('ai-council.toggleStates', {
-            enableGpt: true,
-            enableClaude: true,
-            enableGrok: true,
+            enableGpt: false,
+            enableClaude: false,
+            enableGrok: false,
+            enableGptCli: true,
+            enableClaudeCli: true,
+            enableGrokCli: true,
             enableGemini: false,
             enableOllama: false,
             powerMode: false
@@ -75,7 +185,7 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
 
         // Listen for settings changes and update API key status
         vscode.workspace.onDidChangeConfiguration((e) => {
-            if (e.affectsConfiguration('ai-council.apiKeys')) {
+            if (e.affectsConfiguration('ai-council.apiKeys') || e.affectsConfiguration('ai-council.transport')) {
                 this._sendApiKeyStatus();
             }
         });
@@ -91,14 +201,27 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                         enableGpt: message.enableGpt,
                         enableClaude: message.enableClaude,
                         enableGrok: message.enableGrok,
+                        enableGptCli: !!message.enableGptCli,
+                        enableClaudeCli: !!message.enableClaudeCli,
+                        enableGrokCli: !!message.enableGrokCli,
                         enableGemini: message.enableGemini,
                         enableOllama: message.enableOllama,
                         powerMode: message.powerMode,
                         synthesizer: message.synthesizer || 'auto'
                     });
                     break;
+                case 'saveCliModel':
+                    await vscode.workspace.getConfiguration('ai-council').update(
+                        `cliModels.${message.provider}`,
+                        message.model,
+                        vscode.ConfigurationTarget.Global
+                    );
+                    break;
+                case 'listGrokModels':
+                    await this._listGrokModels();
+                    break;
                 case 'checkApiKey':
-                    await this._checkApiKey(message.modelId, message.name, message.key, message.url, message.free);
+                    await this._checkApiKey(message.modelId, message.name, message.key, message.url, message.free, message.kind);
                     break;
                 case 'clearCache':
                     await this._clearCache();
@@ -113,6 +236,7 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                     // Webview is ready to receive messages
                     this._sendApiKeyStatus();
                     this._sendCacheSize();
+                    this._listGrokModels();
                     // Send saved toggle states
                     const savedToggles = this._getToggleStates();
                     this._view?.webview.postMessage({ type: 'restoreToggles', toggles: savedToggles });
@@ -126,6 +250,9 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                         enableGpt: message.enableGpt,
                         enableClaude: message.enableClaude,
                         enableGrok: message.enableGrok,
+                        enableGptCli: !!message.enableGptCli,
+                        enableClaudeCli: !!message.enableClaudeCli,
+                        enableGrokCli: !!message.enableGrokCli,
                         enableGemini: message.enableGemini,
                         enableOllama: message.enableOllama,
                         powerMode: message.powerMode,
@@ -139,11 +266,32 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                         vscode.env.openExternal(vscode.Uri.file(this._currentReportPath));
                     }
                     break;
+                case 'openReviewDoc':
+                    if (message.path) {
+                        const doc = await vscode.workspace.openTextDocument(message.path);
+                        await vscode.window.showTextDocument(doc);
+                    }
+                    break;
+                case 'scopedReview':
+                    this._scopedReview(message.scope, message.modelConfig);
+                    break;
+                case 'scopedFollowup':
+                    this._scopedFollowup(message.sessionId, message.question, message.modelConfig);
+                    break;
+                case 'scopedFinalize':
+                    this._scopedFinalize(message.sessionId, message.writer, message.modelConfig);
+                    break;
+                case 'runDebate':
+                    this._runDebate(message.sessionId, message.arbiter, message.modelConfig);
+                    break;
+                case 'runConsolidate':
+                    this._runConsolidate(message.sessionId, message.modelConfig);
+                    break;
                 case 'cancelReview':
                     this._cancelReview();
                     break;
                 case 'fixCode':
-                    this._fixCode(message.fixer, message.reportPath);
+                    this._fixCode(message.fixer, message.reportPath, message.modelConfig);
                     break;
             }
         });
@@ -195,7 +343,7 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         }
     }
 
-    private async _fixCode(fixer: string, reportPath: string) {
+    private async _fixCode(fixer: string, reportPath: string, modelConfig?: { enableGptCli?: boolean; enableClaudeCli?: boolean; enableGrokCli?: boolean }) {
         const editor = vscode.window.activeTextEditor;
         if (!editor) {
             vscode.window.showWarningMessage('No file open to fix');
@@ -219,9 +367,22 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             XAI_API_KEY: config.get<string>('apiKeys.xai') || '',
             GOOGLE_API_KEY: config.get<string>('apiKeys.google') || '',
             GROQ_API_KEY: config.get<string>('apiKeys.groq') || '',
+            AI_COUNCIL_TRANSPORT_OPENAI: config.get<string>('transport.openai') || 'auto',
+            AI_COUNCIL_TRANSPORT_ANTHROPIC: config.get<string>('transport.anthropic') || 'auto',
+            AI_COUNCIL_TRANSPORT_XAI: config.get<string>('transport.xai') || 'auto',
+            AI_COUNCIL_CLI_MODEL_OPENAI: config.get<string>('cliModels.openai') || '',
+            AI_COUNCIL_CLI_MODEL_ANTHROPIC: config.get<string>('cliModels.anthropic') || 'sonnet',
+            AI_COUNCIL_CLI_MODEL_XAI: config.get<string>('cliModels.xai') || '',
+            AI_COUNCIL_REVIEW_RUBRIC: config.get<string>('reviewRubric') || '',
         };
 
-        const args = [`"${scriptPath}"`, 'fix', `"${filePath}"`, '--fixer', fixer];
+        // CLI seat flags are global (must precede the subcommand) in ai_council.py's argparse -
+        // without these, self.reviewers never gets a claude-cli/gpt-cli/grok-cli entry to fix with.
+        const args = [`"${scriptPath}"`];
+        if (modelConfig?.enableGptCli) { args.push('--gpt-cli'); }
+        if (modelConfig?.enableClaudeCli) { args.push('--claude-cli'); }
+        if (modelConfig?.enableGrokCli) { args.push('--grok-cli'); }
+        args.push('fix', `"${filePath}"`, '--fixer', fixer);
         if (reportPath) {
             args.push('--report', `"${reportPath}"`);
         }
@@ -333,6 +494,13 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             GOOGLE_API_KEY: config.get<string>('apiKeys.google') || '',
             GROQ_API_KEY: config.get<string>('apiKeys.groq') || '',
             OLLAMA_API_KEY: config.get<string>('apiKeys.ollama') || '',
+            AI_COUNCIL_TRANSPORT_OPENAI: config.get<string>('transport.openai') || 'auto',
+            AI_COUNCIL_TRANSPORT_ANTHROPIC: config.get<string>('transport.anthropic') || 'auto',
+            AI_COUNCIL_TRANSPORT_XAI: config.get<string>('transport.xai') || 'auto',
+            AI_COUNCIL_CLI_MODEL_OPENAI: config.get<string>('cliModels.openai') || '',
+            AI_COUNCIL_CLI_MODEL_ANTHROPIC: config.get<string>('cliModels.anthropic') || 'sonnet',
+            AI_COUNCIL_CLI_MODEL_XAI: config.get<string>('cliModels.xai') || '',
+            AI_COUNCIL_REVIEW_RUBRIC: config.get<string>('reviewRubric') || '',
             OLLAMA_URL: config.get<string>('ollamaUrl') || 'https://wowcentral.worldofworkflows.com',
         };
 
@@ -341,6 +509,9 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         if (options.enableGpt) { enabledModelsList.push('gpt-4'); }
         if (options.enableClaude) { enabledModelsList.push('claude'); }
         if (options.enableGrok) { enabledModelsList.push('grok'); }
+        if (options.enableGptCli) { enabledModelsList.push('gpt-cli'); }
+        if (options.enableClaudeCli) { enabledModelsList.push('claude-cli'); }
+        if (options.enableGrokCli) { enabledModelsList.push('grok-cli'); }
         if (options.enableGemini) { enabledModelsList.push('gemini'); }
         if (options.enableOllama) { enabledModelsList.push('ollama'); }
 
@@ -373,6 +544,11 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             }
         }
 
+        // CLI seat flags are global (must precede the subcommand) in ai_council.py's argparse
+        if (options.enableGptCli) { args.push('--gpt-cli'); }
+        if (options.enableClaudeCli) { args.push('--claude-cli'); }
+        if (options.enableGrokCli) { args.push('--grok-cli'); }
+
         // Add subcommand and its arguments
         args.push('review', `"${filePath}"`, '--html', '--output', `"${reportPath}"`, '--synthesize');
         if (options.synthesizer && options.synthesizer !== 'auto') {
@@ -394,7 +570,7 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         this._currentProcess = reviewProcess;
 
         // Track results for each model
-        const modelResults: Record<string, { score: number; issues: number; error?: boolean }> = {};
+        const modelResults: Record<string, ModelResult> = {};
 
         let stdout = '';
         let stderr = '';
@@ -405,70 +581,9 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             stdout += text;
             console.log('AI Council stdout:', text.substring(0, 200));
 
-            // Parse model completion: "[+] GPT-4 Score: 8/10 (5.2s) [1/3]" (may have leading spaces)
-            const scoreMatch = text.match(/\[\+\]\s+(\w+[-\d]*)\s+Score:\s*(\d+)\/10/i);
-            if (scoreMatch) {
-                const modelName = scoreMatch[1].toLowerCase().replace('-4', '-4');
-                const score = parseInt(scoreMatch[2]);
-
-                // Map model names
-                let modelKey = modelName;
-                if (modelName.includes('gpt')) { modelKey = 'gpt-4'; }
-                else if (modelName.includes('claude')) { modelKey = 'claude'; }
-                else if (modelName.includes('grok')) { modelKey = 'grok'; }
-                else if (modelName.includes('gemini')) { modelKey = 'gemini'; }
-
-                // Initialize or update results (issues will be updated separately)
-                if (!modelResults[modelKey]) {
-                    modelResults[modelKey] = { score, issues: 0 };
-                } else {
-                    modelResults[modelKey].score = score;
-                }
-
-                if (this._view) {
-                    this._view.webview.postMessage({
-                        type: 'reviewProgress',
-                        model: modelKey,
-                        data: { score, issues: modelResults[modelKey].issues || 0, error: false }
-                    });
-                }
-            }
-
-            // Parse issues count: "[MODEL] Score: 8/10 | Issues: 5"
-            const issuesMatch = text.match(/\[(\w+[-\d]*)\]\s+Score:\s*\d+\/10\s*\|\s*Issues:\s*(\d+)/i);
-            if (issuesMatch) {
-                const modelName = issuesMatch[1].toLowerCase();
-                let modelKey = modelName;
-                if (modelName.includes('gpt')) { modelKey = 'gpt-4'; }
-                else if (modelName.includes('claude')) { modelKey = 'claude'; }
-                else if (modelName.includes('grok')) { modelKey = 'grok'; }
-                else if (modelName.includes('gemini')) { modelKey = 'gemini'; }
-
-                const issues = parseInt(issuesMatch[2]);
-                if (modelResults[modelKey]) {
-                    modelResults[modelKey].issues = issues;
-                }
-            }
-
-            // Parse errors: "[!] GPT-4 ERROR" (may have leading spaces)
-            const errorMatch = text.match(/\[!\]\s+(\w+[-\d]*)\s+ERROR/i);
-            if (errorMatch) {
-                const modelName = errorMatch[1].toLowerCase();
-                let modelKey = modelName;
-                if (modelName.includes('gpt')) { modelKey = 'gpt-4'; }
-                else if (modelName.includes('claude')) { modelKey = 'claude'; }
-                else if (modelName.includes('grok')) { modelKey = 'grok'; }
-                else if (modelName.includes('gemini')) { modelKey = 'gemini'; }
-
-                modelResults[modelKey] = { score: 0, issues: 0, error: true };
-
-                if (this._view) {
-                    this._view.webview.postMessage({
-                        type: 'reviewProgress',
-                        model: modelKey,
-                        data: { score: 0, issues: 0, error: true }
-                    });
-                }
+            const update = parseModelProgressLine(text, modelResults);
+            if (update && this._view) {
+                this._view.webview.postMessage({ type: 'reviewProgress', model: update.model, data: update.data });
             }
         });
 
@@ -482,37 +597,7 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             this._isReviewing = false;
             this._currentProcess = null;
 
-            // Parse full stdout for any missed results (especially cached reviews)
-            const allScoreMatches = stdout.matchAll(/\[\+\]\s+(\w+[-\d]*)\s+Score:\s*(\d+)\/10/gi);
-            for (const match of allScoreMatches) {
-                const modelName = match[1].toLowerCase();
-                let modelKey = modelName;
-                if (modelName.includes('gpt')) { modelKey = 'gpt-4'; }
-                else if (modelName.includes('claude')) { modelKey = 'claude'; }
-                else if (modelName.includes('grok')) { modelKey = 'grok'; }
-                else if (modelName.includes('gemini')) { modelKey = 'gemini'; }
-
-                const score = parseInt(match[2]);
-                if (!modelResults[modelKey] || modelResults[modelKey].error) {
-                    modelResults[modelKey] = { score, issues: 0 };
-                }
-            }
-
-            // Parse issues counts
-            const allIssuesMatches = stdout.matchAll(/\[(\w+[-\d]*)\]\s+Score:\s*\d+\/10\s*\|\s*Issues:\s*(\d+)/gi);
-            for (const match of allIssuesMatches) {
-                const modelName = match[1].toLowerCase();
-                let modelKey = modelName;
-                if (modelName.includes('gpt')) { modelKey = 'gpt-4'; }
-                else if (modelName.includes('claude')) { modelKey = 'claude'; }
-                else if (modelName.includes('grok')) { modelKey = 'grok'; }
-                else if (modelName.includes('gemini')) { modelKey = 'gemini'; }
-
-                const issues = parseInt(match[2]);
-                if (modelResults[modelKey]) {
-                    modelResults[modelKey].issues = issues;
-                }
-            }
+            rescanModelResults(stdout, modelResults);
 
             console.log('AI Council: Process closed with code', code, 'results:', JSON.stringify(modelResults));
 
@@ -600,7 +685,7 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             }
 
             // Count enabled models
-            const enabledModels = [options.enableGpt, options.enableClaude, options.enableGrok, options.enableGemini].filter(Boolean).length;
+            const enabledModels = [options.enableGpt, options.enableClaude, options.enableGrok, options.enableGptCli, options.enableClaudeCli, options.enableGrokCli, options.enableGemini, options.enableOllama].filter(Boolean).length;
 
             // Show QuickPick for file selection
             const quickPick = vscode.window.createQuickPick();
@@ -650,6 +735,13 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                 XAI_API_KEY: config.get<string>('apiKeys.xai') || '',
                 GOOGLE_API_KEY: config.get<string>('apiKeys.google') || '',
                 GROQ_API_KEY: config.get<string>('apiKeys.groq') || '',
+                AI_COUNCIL_TRANSPORT_OPENAI: config.get<string>('transport.openai') || 'auto',
+                AI_COUNCIL_TRANSPORT_ANTHROPIC: config.get<string>('transport.anthropic') || 'auto',
+                AI_COUNCIL_TRANSPORT_XAI: config.get<string>('transport.xai') || 'auto',
+            AI_COUNCIL_CLI_MODEL_OPENAI: config.get<string>('cliModels.openai') || '',
+            AI_COUNCIL_CLI_MODEL_ANTHROPIC: config.get<string>('cliModels.anthropic') || 'sonnet',
+            AI_COUNCIL_CLI_MODEL_XAI: config.get<string>('cliModels.xai') || '',
+            AI_COUNCIL_REVIEW_RUBRIC: config.get<string>('reviewRubric') || '',
             };
 
             let completed = 0;
@@ -679,7 +771,12 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                 this.updateStatus(`Reviewing ${completed}/${filesToReview.length}: ${path.basename(file)}...`, true);
 
                 // Build command args - always generate HTML and synthesize
-                const args = [`"${scriptPath}"`, '--db', `"${dbPath}"`, 'review', `"${fullPath}"`, '--html', '--output', `"${reportPath}"`, '--synthesize'];
+                // CLI seat flags are global (must precede the subcommand) in ai_council.py's argparse
+                const args = [`"${scriptPath}"`, '--db', `"${dbPath}"`];
+                if (options.enableGptCli) { args.push('--gpt-cli'); }
+                if (options.enableClaudeCli) { args.push('--claude-cli'); }
+                if (options.enableGrokCli) { args.push('--grok-cli'); }
+                args.push('review', `"${fullPath}"`, '--html', '--output', `"${reportPath}"`, '--synthesize');
                 if (options.synthesizer && options.synthesizer !== 'auto') {
                     args.push('--synthesizer', options.synthesizer);
                 }
@@ -719,6 +816,8 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         });
     }
 
+    // Deletes the whole reviews.db, not a selective eviction - debate_rounds/consolidations
+    // aren't disposable (re-convene continuity, avoids re-rolling a non-deterministic LLM call).
     private async _clearCache() {
         const dbPath = this._getWorkspaceDbPath();
         if (!dbPath) {
@@ -726,14 +825,61 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             return;
         }
 
+        const confirmed = await vscode.window.showWarningMessage(
+            'This deletes ALL AI Council data for this workspace: the review cache, every ' +
+            'Review with Scope session, and any debate/consolidation results not yet exported ' +
+            'to a doc. This cannot be undone. Continue?',
+            { modal: true },
+            'Delete Everything'
+        );
+        if (confirmed !== 'Delete Everything') {
+            return;
+        }
+
         try {
             await vscode.workspace.fs.delete(vscode.Uri.file(dbPath));
-            vscode.window.showInformationMessage('AI Council: Review cache cleared');
+            vscode.window.showInformationMessage('AI Council: All cached/stored review data cleared');
             this.updateStatus('Cache cleared', false);
             this._sendCacheSize(); // Update button after clearing
         } catch (err) {
             vscode.window.showWarningMessage('AI Council: No cache to clear');
         }
+    }
+
+    private async _listGrokModels() {
+        // grok is the only one of the three CLIs that exposes a real model-listing
+        // command; Claude and Codex have no equivalent, so their pickers stay free-text.
+        const proc = spawn('grok models', [], { shell: true });
+        let stdout = '';
+        let stderr = '';
+        proc.stdout?.on('data', (d) => { stdout += d.toString(); });
+        proc.stderr?.on('data', (d) => { stderr += d.toString(); });
+        proc.on('close', (code) => {
+            if (code !== 0 || !stdout.trim()) {
+                if (this._view) {
+                    this._view.webview.postMessage({ type: 'grokModelsResult', ok: false, error: (stderr || 'grok models returned no output').substring(0, 200) });
+                }
+                return;
+            }
+            // Lines look like "  * grok-4.6 (default)" / "  - grok-4.5"
+            const models: string[] = [];
+            let defaultModel: string | null = null;
+            for (const line of stdout.split('\n')) {
+                const m = line.match(/^\s*[*-]\s*([\w.-]+)(\s*\(default\))?/);
+                if (m) {
+                    models.push(m[1]);
+                    if (m[2]) { defaultModel = m[1]; }
+                }
+            }
+            if (this._view) {
+                this._view.webview.postMessage({ type: 'grokModelsResult', ok: models.length > 0, models, defaultModel, error: models.length ? undefined : 'Could not parse grok models output' });
+            }
+        });
+        proc.on('error', (err) => {
+            if (this._view) {
+                this._view.webview.postMessage({ type: 'grokModelsResult', ok: false, error: err.message });
+            }
+        });
     }
 
     private _getWorkspaceDbPath(): string | null {
@@ -742,6 +888,319 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             return null;
         }
         return path.join(workspaceFolders[0].uri.fsPath, '.ai-council', 'reviews.db');
+    }
+
+    private _getApiKeysEnv(): Record<string, string> {
+        const config = vscode.workspace.getConfiguration('ai-council');
+        return {
+            OPENAI_API_KEY: config.get<string>('apiKeys.openai') || '',
+            ANTHROPIC_API_KEY: config.get<string>('apiKeys.anthropic') || '',
+            XAI_API_KEY: config.get<string>('apiKeys.xai') || '',
+            GOOGLE_API_KEY: config.get<string>('apiKeys.google') || '',
+            GROQ_API_KEY: config.get<string>('apiKeys.groq') || '',
+            OLLAMA_API_KEY: config.get<string>('apiKeys.ollama') || '',
+            AI_COUNCIL_TRANSPORT_OPENAI: config.get<string>('transport.openai') || 'auto',
+            AI_COUNCIL_TRANSPORT_ANTHROPIC: config.get<string>('transport.anthropic') || 'auto',
+            AI_COUNCIL_TRANSPORT_XAI: config.get<string>('transport.xai') || 'auto',
+            AI_COUNCIL_CLI_MODEL_OPENAI: config.get<string>('cliModels.openai') || '',
+            AI_COUNCIL_CLI_MODEL_ANTHROPIC: config.get<string>('cliModels.anthropic') || 'sonnet',
+            AI_COUNCIL_CLI_MODEL_XAI: config.get<string>('cliModels.xai') || '',
+            AI_COUNCIL_REVIEW_RUBRIC: config.get<string>('reviewRubric') || '',
+            OLLAMA_URL: config.get<string>('ollamaUrl') || '',
+        };
+    }
+
+    private _runJsonCommand(args: string[]): Promise<{ result?: any; error?: string }> {
+        const config = vscode.workspace.getConfiguration('ai-council');
+        const pythonPath = config.get<string>('pythonPath') || 'python';
+        const command = `${pythonPath} ${args.join(' ')}`;
+        console.log('AI Council: Running scoped command:', command);
+
+        return new Promise((resolve) => {
+            const proc = spawn(command, [], { shell: true, env: { ...process.env, ...this._getApiKeysEnv() } });
+            let stdout = '';
+            let stderr = '';
+            proc.stdout?.on('data', (d) => { stdout += d.toString(); });
+            proc.stderr?.on('data', (d) => { stderr += d.toString(); });
+            proc.on('close', () => {
+                const line = stdout.trim().split('\n').pop() || '';
+                try {
+                    const parsed = JSON.parse(line);
+                    if (parsed.error) {
+                        resolve({ error: parsed.error });
+                    } else {
+                        resolve({ result: parsed });
+                    }
+                } catch (e) {
+                    resolve({ error: (stderr || stdout || 'No output').substring(0, 300) });
+                }
+            });
+            proc.on('error', (err) => resolve({ error: err.message }));
+        });
+    }
+
+    // Same as _runJsonCommand, but also streams the "[DEBATE]"/"[CONSOLIDATE]" stderr stage
+    // markers live instead of leaving the UI on one static "Running..." string for the whole call.
+    private _runJsonCommandWithProgress(args: string[], progressMessageType: string): Promise<{ result?: any; error?: string }> {
+        const config = vscode.workspace.getConfiguration('ai-council');
+        const pythonPath = config.get<string>('pythonPath') || 'python';
+        const command = `${pythonPath} ${args.join(' ')}`;
+        console.log('AI Council: Running scoped command (live):', command);
+
+        return new Promise((resolve) => {
+            const proc = spawn(command, [], { shell: true, env: { ...process.env, ...this._getApiKeysEnv() } });
+            let stdout = '';
+            let stderr = '';
+            let stderrBuf = '';
+            proc.stdout?.on('data', (d) => { stdout += d.toString(); });
+            proc.stderr?.on('data', (d) => {
+                const text = d.toString();
+                stderr += text;
+                stderrBuf += text;
+                const lines = stderrBuf.split('\n');
+                stderrBuf = lines.pop() || '';
+                for (const line of lines) {
+                    const match = line.match(/^\[(DEBATE|CONSOLIDATE)\]\s*(.+)$/);
+                    if (match && this._view) {
+                        this._view.webview.postMessage({ type: progressMessageType, text: match[2] });
+                    }
+                }
+            });
+            proc.on('close', () => {
+                const line = stdout.trim().split('\n').pop() || '';
+                try {
+                    const parsed = JSON.parse(line);
+                    if (parsed.error) {
+                        resolve({ error: parsed.error });
+                    } else {
+                        resolve({ result: parsed });
+                    }
+                } catch (e) {
+                    resolve({ error: (stderr || stdout || 'No output').substring(0, 300) });
+                }
+            });
+            proc.on('error', (err) => resolve({ error: err.message }));
+        });
+    }
+
+    // Global flags (must precede the subcommand) in ai_council.py's argparse: CLI seats and
+    // Ollama. Mirrors _runReview's args-building exactly - this was previously duplicated as
+    // a CLI-seats-only helper, which silently dropped Gemini/Ollama and gave no way to turn
+    // OFF an API seat that has a key configured, for every scoped-review command.
+    private _modelSeatGlobalArgs(modelConfig?: Partial<ReviewOptions>): string[] {
+        const args: string[] = [];
+        const config = vscode.workspace.getConfiguration('ai-council');
+        if (modelConfig?.enableOllama) {
+            args.push('--ollama');
+            const ollamaUrl = config.get<string>('ollamaUrl');
+            if (ollamaUrl) { args.push('--ollama-url', `"${ollamaUrl}"`); }
+            const ollamaModel = config.get<string>('ollamaModel');
+            if (ollamaModel) { args.push('--ollama-model', ollamaModel); }
+        }
+        if (modelConfig?.enableGptCli) { args.push('--gpt-cli'); }
+        if (modelConfig?.enableClaudeCli) { args.push('--claude-cli'); }
+        if (modelConfig?.enableGrokCli) { args.push('--grok-cli'); }
+        return args;
+    }
+
+    // Subcommand-level flags that follow the scoped-* subcommand name.
+    private _modelSeatSubcommandArgs(modelConfig?: Partial<ReviewOptions>): string[] {
+        const args: string[] = [];
+        if (modelConfig?.enableGemini) { args.push('--gemini'); }
+        if (modelConfig && !modelConfig.enableGpt) { args.push('--no-gpt'); }
+        if (modelConfig && !modelConfig.enableClaude) { args.push('--no-claude'); }
+        if (modelConfig && !modelConfig.enableGrok) { args.push('--no-grok'); }
+        if (modelConfig?.powerMode) { args.push('--power'); }
+        return args;
+    }
+
+    // Spawns a scoped-review/scoped-followup command with LIVE progress (same mechanism as
+    // _runReview: parse "[+] MODEL Score:..." lines as they stream, post reviewProgress for
+    // each model card), then reads the structured result back from --json-output once the
+    // process closes. Unlike _runJsonCommand, this never blocks the UI with no feedback until
+    // the whole run finishes.
+    private async _runScopedCommandWithProgress(
+        args: string[],
+        resultMessageType: string,
+        progressMessageType: string
+    ): Promise<void> {
+        const config = vscode.workspace.getConfiguration('ai-council');
+        const pythonPath = config.get<string>('pythonPath') || 'python';
+        const jsonOutputPath = path.join(require('os').tmpdir(), `ai-council-scoped-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
+        const fullArgs = [...args, '--json-output', `"${jsonOutputPath}"`];
+        const command = `${pythonPath} ${fullArgs.join(' ')}`;
+        console.log('AI Council: Running scoped command (live):', command);
+
+        const modelResults: Record<string, ModelResult> = {};
+        let stdout = '';
+        let stderr = '';
+
+        const proc = spawn(command, [], { shell: true, env: { ...process.env, ...this._getApiKeysEnv() } });
+
+        proc.stdout?.on('data', (d) => {
+            const text = d.toString();
+            stdout += text;
+            const update = parseModelProgressLine(text, modelResults);
+            if (update && this._view) {
+                this._view.webview.postMessage({ type: progressMessageType, model: update.model, data: update.data });
+            }
+        });
+        proc.stderr?.on('data', (d) => { stderr += d.toString(); });
+
+        await new Promise<void>((resolve) => {
+            proc.on('close', () => resolve());
+            proc.on('error', (err) => { stderr += err.message; resolve(); });
+        });
+
+        rescanModelResults(stdout, modelResults);
+
+        const fs = require('fs');
+        let result: any = undefined;
+        let error: string | undefined;
+        try {
+            const raw = fs.readFileSync(jsonOutputPath, 'utf-8');
+            fs.unlinkSync(jsonOutputPath);
+            const parsed = JSON.parse(raw);
+            if (parsed.error) {
+                error = parsed.error;
+            } else {
+                result = parsed;
+            }
+        } catch (e) {
+            error = (stderr || stdout || 'No output').substring(0, 300);
+        }
+
+        this._view?.webview.postMessage({ type: resultMessageType, result, error, liveModelResults: modelResults });
+    }
+
+    private async _scopedReview(scope: string, modelConfig?: Partial<ReviewOptions>) {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) {
+            this._view?.webview.postMessage({ type: 'scopedReviewResult', error: 'No file open to review' });
+            return;
+        }
+        const filePath = editor.document.uri.fsPath;
+        const scriptPath = this._getScriptPath();
+        const dbPath = this._getWorkspaceDbPath();
+        if (!dbPath) {
+            this._view?.webview.postMessage({ type: 'scopedReviewResult', error: 'No workspace folder open' });
+            return;
+        }
+
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        const workspaceRoot = workspaceFolders?.[0]?.uri.fsPath || path.dirname(filePath);
+        const reportsDir = path.join(workspaceRoot, '.ai-council', 'reports');
+        const fs = require('fs');
+        if (!fs.existsSync(reportsDir)) { fs.mkdirSync(reportsDir, { recursive: true }); }
+        const fileBaseName = path.basename(filePath, path.extname(filePath)).substring(0, 30);
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        const reportPath = path.join(reportsDir, `scoped-review-${fileBaseName}-${timestamp}.html`);
+
+        const models: string[] = [];
+        if (modelConfig?.enableGpt) { models.push('gpt-4'); }
+        if (modelConfig?.enableClaude) { models.push('claude'); }
+        if (modelConfig?.enableGrok) { models.push('grok'); }
+        if (modelConfig?.enableGptCli) { models.push('gpt-cli'); }
+        if (modelConfig?.enableClaudeCli) { models.push('claude-cli'); }
+        if (modelConfig?.enableGrokCli) { models.push('grok-cli'); }
+        if (modelConfig?.enableGemini) { models.push('gemini'); }
+        if (modelConfig?.enableOllama) { models.push('ollama'); }
+        this._view?.webview.postMessage({ type: 'scopedRoundStart', roundNum: 0, models });
+
+        const args = [`"${scriptPath}"`, '--db', `"${dbPath}"`, ...this._modelSeatGlobalArgs(modelConfig),
+            'scoped-review', `"${filePath}"`, '--scope', winQuoteArg(scope),
+            ...this._modelSeatSubcommandArgs(modelConfig), '--html', '--output', `"${reportPath}"`];
+
+        await this._runScopedCommandWithProgress(args, 'scopedReviewResult', 'scopedRoundProgress');
+    }
+
+    private async _scopedFollowup(sessionId: string, question: string, modelConfig?: Partial<ReviewOptions>) {
+        const dbPath = this._getWorkspaceDbPath();
+        if (!dbPath) {
+            this._view?.webview.postMessage({ type: 'scopedFollowupResult', error: 'No workspace folder open' });
+            return;
+        }
+        const scriptPath = this._getScriptPath();
+
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        const reportsDir = workspaceFolders?.[0]?.uri.fsPath ? path.join(workspaceFolders[0].uri.fsPath, '.ai-council', 'reports') : undefined;
+        let reportArgs: string[] = [];
+        if (reportsDir) {
+            const fs = require('fs');
+            if (!fs.existsSync(reportsDir)) { fs.mkdirSync(reportsDir, { recursive: true }); }
+            const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+            const reportPath = path.join(reportsDir, `scoped-followup-${sessionId.slice(0, 8)}-${timestamp}.html`);
+            reportArgs = ['--html', '--output', `"${reportPath}"`];
+        }
+
+        const models: string[] = [];
+        if (modelConfig?.enableGpt) { models.push('gpt-4'); }
+        if (modelConfig?.enableClaude) { models.push('claude'); }
+        if (modelConfig?.enableGrok) { models.push('grok'); }
+        if (modelConfig?.enableGptCli) { models.push('gpt-cli'); }
+        if (modelConfig?.enableClaudeCli) { models.push('claude-cli'); }
+        if (modelConfig?.enableGrokCli) { models.push('grok-cli'); }
+        if (modelConfig?.enableGemini) { models.push('gemini'); }
+        if (modelConfig?.enableOllama) { models.push('ollama'); }
+        this._view?.webview.postMessage({ type: 'scopedRoundStart', models });
+
+        const args = [`"${scriptPath}"`, '--db', `"${dbPath}"`, ...this._modelSeatGlobalArgs(modelConfig),
+            'scoped-followup', '--session', `"${sessionId}"`, '--question', winQuoteArg(question),
+            ...this._modelSeatSubcommandArgs(modelConfig), ...reportArgs];
+
+        await this._runScopedCommandWithProgress(args, 'scopedFollowupResult', 'scopedRoundProgress');
+    }
+
+    private async _scopedFinalize(sessionId: string, writer: string, modelConfig?: Partial<ReviewOptions>) {
+        const dbPath = this._getWorkspaceDbPath();
+        if (!dbPath) {
+            this._view?.webview.postMessage({ type: 'scopedFinalizeResult', error: 'No workspace folder open' });
+            return;
+        }
+        const scriptPath = this._getScriptPath();
+
+        const args = [`"${scriptPath}"`, '--db', `"${dbPath}"`, ...this._modelSeatGlobalArgs(modelConfig),
+            'scoped-finalize', '--session', `"${sessionId}"`,
+            ...this._modelSeatSubcommandArgs(modelConfig), '--json'];
+        if (writer) {
+            args.push('--writer', writer);
+        }
+
+        const { result, error } = await this._runJsonCommand(args);
+        this._view?.webview.postMessage({ type: 'scopedFinalizeResult', result, error });
+    }
+
+    private async _runDebate(sessionId: string, arbiter: string | null, modelConfig?: Partial<ReviewOptions>) {
+        const dbPath = this._getWorkspaceDbPath();
+        if (!dbPath) {
+            this._view?.webview.postMessage({ type: 'debateResult', error: 'No workspace folder open' });
+            return;
+        }
+        const scriptPath = this._getScriptPath();
+
+        const args = [`"${scriptPath}"`, '--db', `"${dbPath}"`, ...this._modelSeatGlobalArgs(modelConfig),
+            'debate', '--session', `"${sessionId}"`, '--json'];
+        if (arbiter) {
+            args.push('--mode', 'arbiter', '--arbiter', arbiter);
+        }
+
+        const { result, error } = await this._runJsonCommandWithProgress(args, 'debateProgress');
+        this._view?.webview.postMessage({ type: 'debateResult', result, error });
+    }
+
+    private async _runConsolidate(sessionId: string, modelConfig?: Partial<ReviewOptions>) {
+        const dbPath = this._getWorkspaceDbPath();
+        if (!dbPath) {
+            this._view?.webview.postMessage({ type: 'consolidateResult', error: 'No workspace folder open' });
+            return;
+        }
+        const scriptPath = this._getScriptPath();
+
+        const args = [`"${scriptPath}"`, '--db', `"${dbPath}"`, ...this._modelSeatGlobalArgs(modelConfig),
+            'consolidate', '--session', `"${sessionId}"`, '--json'];
+
+        const { result, error } = await this._runJsonCommandWithProgress(args, 'debateProgress');
+        this._view?.webview.postMessage({ type: 'consolidateResult', result, error });
     }
 
     private async _sendCacheSize() {
@@ -775,7 +1234,7 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         }
     }
 
-    private async _showStatus(toggles?: { gpt: boolean; claude: boolean; grok: boolean; gemini: boolean; ollama: boolean }) {
+    private async _showStatus(toggles?: { gpt: boolean; claude: boolean; grok: boolean; gptCli?: boolean; claudeCli?: boolean; grokCli?: boolean; gemini: boolean; ollama: boolean }) {
         const config = vscode.workspace.getConfiguration('ai-council');
         const pythonPath = config.get<string>('pythonPath') || 'python';
         const scriptPath = this._getScriptPath();
@@ -789,6 +1248,13 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             GOOGLE_API_KEY: config.get<string>('apiKeys.google') || '',
             GROQ_API_KEY: config.get<string>('apiKeys.groq') || '',
             OLLAMA_API_KEY: config.get<string>('apiKeys.ollama') || '',
+            AI_COUNCIL_TRANSPORT_OPENAI: config.get<string>('transport.openai') || 'auto',
+            AI_COUNCIL_TRANSPORT_ANTHROPIC: config.get<string>('transport.anthropic') || 'auto',
+            AI_COUNCIL_TRANSPORT_XAI: config.get<string>('transport.xai') || 'auto',
+            AI_COUNCIL_CLI_MODEL_OPENAI: config.get<string>('cliModels.openai') || '',
+            AI_COUNCIL_CLI_MODEL_ANTHROPIC: config.get<string>('cliModels.anthropic') || 'sonnet',
+            AI_COUNCIL_CLI_MODEL_XAI: config.get<string>('cliModels.xai') || '',
+            AI_COUNCIL_REVIEW_RUBRIC: config.get<string>('reviewRubric') || '',
             OLLAMA_URL: config.get<string>('ollamaUrl') || '',
         };
 
@@ -830,6 +1296,9 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         if (toggles?.gpt && apiKeys.OPENAI_API_KEY) selectedReviewers.push('gpt-4');
         if (toggles?.claude && apiKeys.ANTHROPIC_API_KEY) selectedReviewers.push('claude');
         if (toggles?.grok && apiKeys.XAI_API_KEY) selectedReviewers.push('grok');
+        if (toggles?.gptCli) selectedReviewers.push('gpt-cli');
+        if (toggles?.claudeCli) selectedReviewers.push('claude-cli');
+        if (toggles?.grokCli) selectedReviewers.push('grok-cli');
         if (toggles?.gemini && apiKeys.GOOGLE_API_KEY) selectedReviewers.push('gemini');
         if (toggles?.ollama && ollamaUrl && apiKeys.OLLAMA_API_KEY) {
             selectedReviewers.push(`ollama (${ollamaModel || 'default'})`);
@@ -922,17 +1391,38 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         return orgInfo;
     }
 
-    private async _checkApiKey(modelId: string, name: string, key: string, url: string, free?: boolean) {
-        const config = vscode.workspace.getConfiguration('ai-council');
+    private async _cliOnPath(bin: string): Promise<boolean> {
+        const { execFile } = await import('child_process');
+        return new Promise((resolve) => {
+            const cmd = process.platform === 'win32' ? 'where' : 'which';
+            execFile(cmd, [bin], { windowsHide: true }, (err) => resolve(!err));
+        });
+    }
 
-        // Check if API key exists in VS Code settings
+    private async _checkApiKey(modelId: string, name: string, key: string, url: string, free?: boolean, kind?: string) {
+        const config = vscode.workspace.getConfiguration('ai-council');
+        const seatKind = kind || 'api';
+
+        if (seatKind === 'cli') {
+            const binMap: Record<string, string> = { openai: 'codex', anthropic: 'claude', xai: 'grok' };
+            const bin = binMap[key];
+            const ok = bin ? await this._cliOnPath(bin) : false;
+            if (!ok) {
+                await vscode.window.showWarningMessage(
+                    `${name} needs the ${bin || 'CLI'} app on PATH (and logged in)`
+                );
+                this._view?.webview.postMessage({ type: 'uncheckModel', modelId });
+            }
+            return;
+        }
+
         const settingsKey = config.get<string>(`apiKeys.${key}`) || '';
         const hasKey = Boolean(settingsKey.trim());
 
         if (!hasKey) {
             const freeNote = free ? ' (FREE tier available!)' : '';
             const result = await vscode.window.showWarningMessage(
-                `${name} requires an API key${freeNote}`,
+                `${name} needs an API key${freeNote}`,
                 'Open Settings',
                 'Get API Key'
             );
@@ -943,7 +1433,6 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                 vscode.env.openExternal(vscode.Uri.parse(url));
             }
 
-            // Uncheck the toggle since key is missing
             this._view?.webview.postMessage({
                 type: 'uncheckModel',
                 modelId: modelId
@@ -1018,32 +1507,48 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         const modelKeys = ['openai', 'anthropic', 'xai', 'google', 'groq'];
         const keyStatus: Record<string, boolean> = {};
         const orgInfo: Record<string, string | null> = {};
+        const seatMeta: Record<string, string> = {};
 
         for (const key of modelKeys) {
             const settingsKey = config.get<string>(`apiKeys.${key}`) || '';
             keyStatus[key] = Boolean(settingsKey.trim());
+            seatMeta[key] = keyStatus[key] ? 'api' : 'missing';
         }
 
-        // Special handling for Ollama - check URL configuration (API key is optional)
+        const cliBins: Record<string, string> = {
+            'openai-cli': 'codex',
+            'anthropic-cli': 'claude',
+            'xai-cli': 'grok',
+        };
+        for (const [statusKey, bin] of Object.entries(cliBins)) {
+            const ok = await this._cliOnPath(bin);
+            keyStatus[statusKey] = ok;
+            seatMeta[statusKey] = ok ? 'cli' : 'missing';
+        }
+
         const ollamaUrl = config.get<string>('ollamaUrl') || '';
         keyStatus['ollama'] = Boolean(ollamaUrl.trim());
 
-        // Fetch org info for OpenAI if key exists
         const openaiKey = config.get<string>('apiKeys.openai') || '';
         if (openaiKey.trim()) {
             orgInfo.openai = await this._fetchOpenAIOrg(openaiKey.trim());
         }
 
-        console.log('AI Council: Sending API key status', keyStatus, 'org info', orgInfo);
+        console.log('AI Council: Sending seat status', keyStatus, seatMeta);
 
         if (this._view) {
+            const cliModels = {
+                openai: config.get<string>('cliModels.openai') || '',
+                anthropic: config.get<string>('cliModels.anthropic') || 'sonnet',
+                xai: config.get<string>('cliModels.xai') || '',
+            };
             this._view.webview.postMessage({
                 type: 'apiKeyStatus',
                 status: keyStatus,
-                orgInfo: orgInfo
+                seatMeta: seatMeta,
+                orgInfo: orgInfo,
+                cliModels: cliModels
             });
-        } else {
-            console.log('AI Council: No view available to send status');
         }
     }
 
@@ -1183,6 +1688,16 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             opacity: 0.8;
         }
 
+        /* !important so this wins over every color variant's own background/:hover. */
+        .btn:disabled,
+        .btn:disabled:hover,
+        .btn:disabled:active {
+            background: var(--vscode-button-secondaryBackground, #3a3d41) !important;
+            color: var(--vscode-disabledForeground, #6b6b6b) !important;
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
         .btn-primary {
             background: linear-gradient(135deg, #14b8a6 0%, #0d9488 100%);
             color: white;
@@ -1219,6 +1734,15 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
 
         .btn-commit:hover {
             background: linear-gradient(135deg, #0f766e 0%, #115e59 100%);
+        }
+
+        .btn-scoped {
+            background: linear-gradient(135deg, #7c3aed 0%, #5b21b6 100%);
+            color: white;
+        }
+
+        .btn-scoped:hover {
+            background: linear-gradient(135deg, #8b5cf6 0%, #7c3aed 100%);
         }
 
         .toggle-group {
@@ -1852,6 +2376,228 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             transform: none;
         }
 
+        /* Scoped Review */
+        .scoped-review-panel {
+            display: none;
+            margin-top: 10px;
+            padding: 12px;
+            background: var(--vscode-editor-background);
+            border: 1px solid var(--vscode-widget-border);
+            border-radius: 8px;
+        }
+
+        .scoped-review-panel textarea {
+            width: 100%;
+            min-height: 60px;
+            resize: vertical;
+            background: var(--vscode-input-background);
+            color: var(--vscode-input-foreground);
+            border: 1px solid var(--vscode-input-border);
+            border-radius: 6px;
+            padding: 8px;
+            font-family: inherit;
+            font-size: 12px;
+            box-sizing: border-box;
+        }
+
+        .scoped-review-panel .btn {
+            width: 100%;
+            margin-top: 8px;
+        }
+
+        .scoped-round {
+            margin-top: 10px;
+        }
+
+        .scoped-round-title {
+            font-size: 11px;
+            font-weight: 600;
+            opacity: 0.7;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 8px;
+        }
+
+        .scoped-round-elapsed {
+            text-transform: none;
+            letter-spacing: normal;
+            font-weight: 400;
+            font-family: 'JetBrains Mono', monospace;
+            opacity: 0.8;
+        }
+
+        /* Round cards reuse .model-card/.model-icon/.score-badge/.review-summary as-is -
+           same live spinner -> checkmark/error -> score-badge sequence as "Review Current
+           File", and the same "Open Full Report" pattern for full issue detail. */
+
+        .scoped-followup-row {
+            display: flex;
+            gap: 6px;
+            margin-top: 10px;
+        }
+
+        .scoped-finalize-row {
+            display: flex;
+            gap: 6px;
+            margin-top: 10px;
+            align-items: center;
+        }
+
+        .scoped-finalize-row select {
+            flex: 1;
+        }
+
+        /* Debate */
+        #debateStartRow, #debateSection {
+            margin-top: 10px;
+            padding-top: 10px;
+            border-top: 1px solid var(--vscode-widget-border);
+        }
+
+        .debate-consensus-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 6px;
+        }
+
+        .debate-consensus-label {
+            font-size: 11px;
+            font-weight: 600;
+            opacity: 0.8;
+            flex-shrink: 0;
+        }
+
+        .debate-consensus-bar {
+            flex: 1;
+            height: 8px;
+            border-radius: 4px;
+            background: var(--vscode-input-background);
+            overflow: hidden;
+        }
+
+        .debate-consensus-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #ef4444 0%, #f59e0b 50%, #22c55e 100%);
+            width: 0%;
+            transition: width 0.4s ease;
+        }
+
+        .debate-consensus-pct {
+            font-size: 12px;
+            font-weight: 700;
+            font-family: 'JetBrains Mono', monospace;
+            flex-shrink: 0;
+            min-width: 40px;
+            text-align: right;
+        }
+
+        .debate-token-usage {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            margin-bottom: 10px;
+            font-size: 10px;
+            opacity: 0.75;
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        .debate-token-usage span {
+            padding: 2px 6px;
+            border-radius: 4px;
+            background: var(--vscode-input-background);
+        }
+
+        .debate-round {
+            margin-bottom: 10px;
+            padding: 10px;
+            background: var(--vscode-editor-background);
+            border: 1px solid var(--vscode-panel-border);
+            border-radius: 8px;
+        }
+
+        .debate-round-header {
+            font-size: 11px;
+            font-weight: 600;
+            opacity: 0.7;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 8px;
+        }
+
+        .debate-cluster {
+            margin-bottom: 10px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid var(--vscode-panel-border);
+        }
+
+        .debate-cluster:last-child {
+            border-bottom: none;
+            margin-bottom: 0;
+            padding-bottom: 0;
+        }
+
+        .debate-cluster-summary {
+            font-size: 12px;
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+
+        .debate-cluster-members {
+            font-size: 10px;
+            opacity: 0.6;
+            margin-bottom: 6px;
+        }
+
+        .debate-position {
+            font-size: 11px;
+            margin: 4px 0;
+            padding-left: 8px;
+            border-left: 3px solid var(--vscode-widget-border);
+        }
+
+        .debate-position.agree { border-left-color: #22c55e; }
+        .debate-position.dispute { border-left-color: #ef4444; }
+        .debate-position.refine { border-left-color: #f59e0b; }
+
+        .debate-position-model {
+            font-weight: 700;
+            text-transform: uppercase;
+            font-size: 10px;
+            margin-right: 4px;
+        }
+
+        .debate-ruling {
+            font-size: 11px;
+            margin-top: 6px;
+            padding: 6px 8px;
+            border-radius: 6px;
+            background: rgba(139, 92, 246, 0.1);
+            border-left: 3px solid #8b5cf6;
+        }
+
+        .consolidated-finding {
+            margin: 8px 0;
+            padding: 8px 10px;
+            border-radius: 6px;
+            background: var(--vscode-input-background);
+        }
+
+        .consolidated-finding-severity {
+            font-weight: 700;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 11px;
+            margin-right: 4px;
+        }
+
+        .consolidated-open-question {
+            margin: 8px 0;
+            padding: 8px 10px;
+            border-radius: 6px;
+            background: rgba(245, 158, 11, 0.1);
+            border-left: 3px solid #f59e0b;
+        }
+
         .cancel-review-btn {
             width: 100%;
             margin-top: 12px;
@@ -2072,33 +2818,51 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                 </div>
             </div>
             <div style="margin-top: 12px;">
-                <div class="section-title" style="color: #f59e0b;">&#36; PAID MODELS</div>
+                <div class="section-title" style="color: #f59e0b;">&#36; API SEATS (keys)</div>
                 <div class="toggle-group">
                     <div class="toggle-item" id="toggle-enableGpt">
-                        <span class="toggle-label"><span class="model-name-text" data-standard="GPT-4" data-power="GPT-6 Astra">GPT-4</span><span class="key-status" id="key-openai" title="API Key Status"></span></span>
+                        <span class="toggle-label"><span class="model-name-text" data-standard="GPT-4 API" data-power="GPT-6 API">GPT-4 API</span><span class="key-status" id="key-openai" title="API Key Status"></span></span>
                         <label class="toggle-switch gpt">
-                            <input type="checkbox" id="enableGpt" checked>
+                            <input type="checkbox" id="enableGpt">
                             <span class="toggle-slider"></span>
                         </label>
                     </div>
                     <div class="toggle-item" id="toggle-enableClaude">
-                        <span class="toggle-label"><span class="model-name-text" data-standard="Claude" data-power="Claude Fable">Claude</span><span class="key-status" id="key-anthropic" title="API Key Status"></span></span>
+                        <span class="toggle-label"><span class="model-name-text" data-standard="Claude API" data-power="Claude API">Claude API</span><span class="key-status" id="key-anthropic" title="API Key Status"></span></span>
                         <label class="toggle-switch claude">
-                            <input type="checkbox" id="enableClaude" checked>
+                            <input type="checkbox" id="enableClaude">
                             <span class="toggle-slider"></span>
                         </label>
                     </div>
                     <div class="toggle-item" id="toggle-enableGrok">
-                        <span class="toggle-label"><span class="model-name-text" data-standard="Grok" data-power="Grok-3">Grok</span><span class="key-status" id="key-xai" title="API Key Status"></span></span>
+                        <span class="toggle-label"><span class="model-name-text" data-standard="Grok API" data-power="Grok API">Grok API</span><span class="key-status" id="key-xai" title="API Key Status"></span></span>
                         <label class="toggle-switch grok">
-                            <input type="checkbox" id="enableGrok" checked>
+                            <input type="checkbox" id="enableGrok">
                             <span class="toggle-slider"></span>
                         </label>
                     </div>
-                    <div class="toggle-item" style="opacity: 0.5;">
-                        <span class="toggle-label">Mistral <span class="model-badge badge-coming">#30</span></span>
-                        <label class="toggle-switch mistral">
-                            <input type="checkbox" id="enableMistral" disabled>
+                </div>
+
+                <div class="section-title">&#128187; CLI SEATS (subscriptions)</div>
+                <div class="toggle-group">
+                    <div class="toggle-item" id="toggle-enableGptCli">
+                        <span class="toggle-label"><span class="model-name-text" data-standard="Codex CLI" data-power="Codex CLI">Codex CLI</span><span class="key-status" id="key-openai-cli" title="CLI Status"></span></span>
+                        <label class="toggle-switch gpt">
+                            <input type="checkbox" id="enableGptCli" checked>
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                    <div class="toggle-item" id="toggle-enableClaudeCli">
+                        <span class="toggle-label"><span class="model-name-text" data-standard="Claude CLI" data-power="Claude CLI">Claude CLI</span><span class="key-status" id="key-anthropic-cli" title="CLI Status"></span></span>
+                        <label class="toggle-switch claude">
+                            <input type="checkbox" id="enableClaudeCli" checked>
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                    <div class="toggle-item" id="toggle-enableGrokCli">
+                        <span class="toggle-label"><span class="model-name-text" data-standard="Grok CLI" data-power="Grok CLI">Grok CLI</span><span class="key-status" id="key-xai-cli" title="CLI Status"></span></span>
+                        <label class="toggle-switch grok">
+                            <input type="checkbox" id="enableGrokCli" checked>
                             <span class="toggle-slider"></span>
                         </label>
                     </div>
@@ -2108,6 +2872,26 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                             <input type="checkbox" id="enableDeepseek" disabled>
                             <span class="toggle-slider"></span>
                         </label>
+                    </div>
+                    <div class="cli-model-row" style="display:flex;flex-direction:column;gap:6px;margin:8px 0 4px 0;padding:8px;border:1px solid var(--vscode-widget-border);border-radius:6px;">
+                        <div style="font-size:11px;opacity:0.85;">CLI models (subscription)</div>
+                        <label style="display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:12px;">
+                            <span>Claude</span>
+                            <input type="text" id="cliModelAnthropic" placeholder="Auto (e.g. sonnet, opus, haiku)" style="flex:1;max-width:160px;background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border);border-radius:4px;padding:2px 6px;">
+                        </label>
+                        <label style="display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:12px;">
+                            <span>Codex</span>
+                            <input type="text" id="cliModelOpenai" placeholder="Auto (account-dependent)" style="flex:1;max-width:160px;background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border);border-radius:4px;padding:2px 6px;">
+                        </label>
+                        <label style="display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:12px;">
+                            <span>Grok</span>
+                            <select id="cliModelXai" style="flex:1;max-width:160px;">
+                                <option value="">Auto</option>
+                                <option value="grok-4.6">grok-4.6</option>
+                                <option value="grok-4.5">grok-4.5</option>
+                            </select>
+                        </label>
+                        <div id="cliModelNote" style="font-size:10px;opacity:0.6;">Claude/Codex have no model-listing command - type a name your subscription supports, or leave blank for Auto. Grok's list is read live from <code>grok models</code>.</div>
                     </div>
                     <div class="toggle-item" style="opacity: 0.5;">
                         <span class="toggle-label">Qwen <span class="model-badge badge-coming">#32</span></span>
@@ -2168,6 +2952,54 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         <button class="btn btn-commit" onclick="reviewCommit()">
             <span class="icon">&#128230;</span> Review Current Commit
         </button>
+        <button class="btn btn-scoped" onclick="toggleScopedReviewPanel()">
+            <span class="icon">&#128172;</span> Review with Scope
+        </button>
+    </div>
+
+    <div class="scoped-review-panel" id="scopedReviewPanel">
+        <div id="scopedScopeInput">
+            <div style="font-size:11px;opacity:0.85;margin-bottom:6px;">What should the council focus on?</div>
+            <textarea id="scopedScopeText" placeholder="e.g. Review this based on how it handles concurrent access to the shared cache"></textarea>
+            <button class="btn btn-primary" onclick="startScopedReview()">Start Scoped Review</button>
+        </div>
+        <div id="scopedRounds"></div>
+
+        <!-- Pickers show on panel open (enabled seats); action buttons start disabled until setScopedSessionReady() confirms round 0 finished. -->
+        <div id="debateStartRow" style="display:none;">
+            <div id="debateArbiterRow" style="display:none;margin-top:8px;">
+                <div style="font-size:11px;opacity:0.85;margin-bottom:4px;">Arbiter (rules on disputes instead of debating):</div>
+                <select id="debateArbiterSelect" style="width:100%;"></select>
+            </div>
+            <button class="btn btn-scoped" onclick="startDebate()" id="startDebateBtn" disabled title="Run the initial scoped review first">&#9878; Debate Findings</button>
+        </div>
+
+        <div id="debateSection" style="display:none;">
+            <div class="debate-consensus-row">
+                <div class="debate-consensus-label">Consensus</div>
+                <div class="debate-consensus-bar"><div class="debate-consensus-fill" id="debateConsensusFill"></div></div>
+                <div class="debate-consensus-pct" id="debateConsensusPct">0%</div>
+            </div>
+            <div id="debateTokenUsage" class="debate-token-usage"></div>
+            <div id="debateRoundsContainer"></div>
+            <!-- Hidden until a debate round finishes - revealed in renderDebateRound(). -->
+            <button class="btn btn-scoped" onclick="reconveneDebate()" id="reconveneBtn" style="display:none;">&#128260; Re-convene</button>
+            <button class="btn btn-primary" onclick="runConsolidate()" id="consolidateBtn" style="display:none;">&#10003; Consolidate Final Review</button>
+            <div id="consolidatedSection"></div>
+        </div>
+
+        <div class="scoped-finalize-row">
+            <select id="scopedWriterSelect"></select>
+            <button class="btn btn-primary" onclick="finalizeScopedReview()" id="finalizeScopedBtn" disabled title="Run the initial scoped review first">Create Review Doc</button>
+        </div>
+
+        <div id="scopedFollowup" style="display:none;">
+            <div class="scoped-followup-row">
+                <textarea id="scopedFollowupText" placeholder="Ask the council a follow-up..." style="min-height:40px;"></textarea>
+            </div>
+            <button class="btn btn-primary" onclick="submitScopedFollowup()">Ask Follow-up</button>
+        </div>
+        <div id="scopedStatus" style="font-size:11px;opacity:0.7;margin-top:8px;"></div>
     </div>
 
     <div class="divider"></div>
@@ -2255,11 +3087,14 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
 
         // Model to API key mapping
         const modelApiKeys = {
-            'enableGpt': { name: 'GPT-4', key: 'openai', url: 'https://platform.openai.com/api-keys' },
-            'enableClaude': { name: 'Claude', key: 'anthropic', url: 'https://console.anthropic.com/' },
-            'enableGrok': { name: 'Grok', key: 'xai', url: 'https://console.x.ai/' },
-            'enableGemini': { name: 'Gemini', key: 'google', url: 'https://aistudio.google.com/app/apikey', free: true },
-            'enableOllama': { name: 'Ollama', key: 'ollama', url: '', free: true }
+            'enableGpt': { name: 'GPT-4 API', key: 'openai', url: 'https://platform.openai.com/api-keys', kind: 'api' },
+            'enableClaude': { name: 'Claude API', key: 'anthropic', url: 'https://console.anthropic.com/', kind: 'api' },
+            'enableGrok': { name: 'Grok API', key: 'xai', url: 'https://console.x.ai/', kind: 'api' },
+            'enableGptCli': { name: 'Codex CLI', key: 'openai', url: '', kind: 'cli' },
+            'enableClaudeCli': { name: 'Claude CLI', key: 'anthropic', url: '', kind: 'cli' },
+            'enableGrokCli': { name: 'Grok CLI', key: 'xai', url: '', kind: 'cli' },
+            'enableGemini': { name: 'Gemini', key: 'google', url: 'https://aistudio.google.com/app/apikey', free: true, kind: 'api' },
+            'enableOllama': { name: 'Ollama', key: 'ollama', url: '', free: true, kind: 'api' }
         };
 
         // Save toggle states to persist across sessions
@@ -2268,6 +3103,9 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                 enableGpt: document.getElementById('enableGpt')?.checked || false,
                 enableClaude: document.getElementById('enableClaude')?.checked || false,
                 enableGrok: document.getElementById('enableGrok')?.checked || false,
+                enableGptCli: document.getElementById('enableGptCli')?.checked || false,
+                enableClaudeCli: document.getElementById('enableClaudeCli')?.checked || false,
+                enableGrokCli: document.getElementById('enableGrokCli')?.checked || false,
                 enableGemini: document.getElementById('enableGemini')?.checked || false,
                 enableOllama: document.getElementById('enableOllama')?.checked || false,
                 powerMode: document.getElementById('powerMode')?.checked || false
@@ -2290,6 +3128,24 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                             });
                         }
                         saveToggleStates();
+                        const scopedPanel = document.getElementById('scopedReviewPanel');
+                        if (scopedPanel && scopedPanel.style.display === 'block') {
+                            refreshScopedPickers();
+                        }
+                    });
+                }
+            });
+
+            // CLI model selectors
+            [
+                ['cliModelAnthropic', 'anthropic'],
+                ['cliModelOpenai', 'openai'],
+                ['cliModelXai', 'xai']
+            ].forEach(([id, provider]) => {
+                const el = document.getElementById(id);
+                if (el) {
+                    el.addEventListener('change', function() {
+                        vscode.postMessage({ command: 'saveCliModel', provider: provider, model: this.value });
                     });
                 }
             });
@@ -2312,6 +3168,9 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                 enableGpt: document.getElementById('enableGpt').checked,
                 enableClaude: document.getElementById('enableClaude').checked,
                 enableGrok: document.getElementById('enableGrok').checked,
+                enableGptCli: document.getElementById('enableGptCli')?.checked || false,
+                enableClaudeCli: document.getElementById('enableClaudeCli')?.checked || false,
+                enableGrokCli: document.getElementById('enableGrokCli')?.checked || false,
                 enableGemini: document.getElementById('enableGemini').checked,
                 enableOllama: document.getElementById('enableOllama').checked,
                 powerMode: document.getElementById('powerMode').checked,
@@ -2331,9 +3190,12 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         function runReview() {
             const config = getModelConfig();
             const enabledModels = [];
-            if (config.enableGpt) enabledModels.push('GPT');
-            if (config.enableClaude) enabledModels.push('Claude');
-            if (config.enableGrok) enabledModels.push('Grok');
+            if (config.enableGpt) enabledModels.push('GPT-API');
+            if (config.enableClaude) enabledModels.push('Claude-API');
+            if (config.enableGrok) enabledModels.push('Grok-API');
+            if (config.enableGptCli) enabledModels.push('Codex-CLI');
+            if (config.enableClaudeCli) enabledModels.push('Claude-CLI');
+            if (config.enableGrokCli) enabledModels.push('Grok-CLI');
             if (config.enableGemini) enabledModels.push('Gemini');
             if (config.enableOllama) enabledModels.push('Ollama');
 
@@ -2356,6 +3218,517 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             });
         }
 
+        function toggleScopedReviewPanel() {
+            const panel = document.getElementById('scopedReviewPanel');
+            const isOpen = panel.style.display === 'block';
+            panel.style.display = isOpen ? 'none' : 'block';
+            if (!isOpen) {
+                refreshScopedPickers();
+            }
+        }
+
+        function scoreClass(score) {
+            if (score >= 7) return 'good';
+            if (score >= 5) return 'medium';
+            return 'low';
+        }
+
+        function escapeHtml(s) {
+            const d = document.createElement('div');
+            d.textContent = s == null ? '' : String(s);
+            return d.innerHTML;
+        }
+
+        let scopedRoundCounter = 0;
+
+        // Starts a new round: builds the SAME live model-card grid as "Review Current File"
+        // (spinner -> checkmark/error -> score badge, updated in place as progress streams
+        // in) instead of a static "Running council..." line with no feedback, and instead of
+        // a bespoke inline issue-list summary. Full results live in the generated HTML report,
+        // opened the same way "Review Current File" opens its report.
+// Ticks every second so a still-"Analyzing..." card shows how long it's actually been running
+// - the only way to tell "this is slow" from "this is stuck" without checking the dev console.
+        const scopedRoundTimers = {};
+
+        function startScopedRound(label, models) {
+            scopedRoundCounter++;
+            const roundId = 'scoped-round-' + scopedRoundCounter;
+            const container = document.getElementById('scopedRounds');
+            const div = document.createElement('div');
+            div.className = 'scoped-round';
+            div.id = roundId;
+
+            let html = '<div class="scoped-round-title">' + escapeHtml(label) +
+                ' <span class="scoped-round-elapsed" id="' + roundId + '-elapsed"></span></div>' +
+                '<div class="scoped-round-cards" id="' + roundId + '-cards">';
+            html += models.map(m => {
+                const cfg = MODEL_DISPLAY[m] || { name: m, icon: '?', class: '' };
+                return '<div class="model-card reviewing ' + cfg.class + '" id="' + roundId + '-card-' + m + '">' +
+                    '<div class="model-card-left">' +
+                        '<div class="model-icon ' + cfg.class + '">' + cfg.icon + '</div>' +
+                        '<div class="model-info">' +
+                            '<span class="model-name">' + escapeHtml(cfg.name) + '</span>' +
+                            '<span class="model-status" id="' + roundId + '-status-' + m + '">Analyzing...</span>' +
+                        '</div>' +
+                    '</div>' +
+                    '<div class="model-card-right">' +
+                        '<div class="model-spinner" id="' + roundId + '-spinner-' + m + '"></div>' +
+                        '<span class="score-badge" id="' + roundId + '-score-' + m + '" style="display:none;">-</span>' +
+                    '</div>' +
+                '</div>';
+            }).join('');
+            html += '</div><div id="' + roundId + '-summary"></div>';
+
+            div.innerHTML = html;
+            container.appendChild(div);
+
+            const startTime = Date.now();
+            const timerId = setInterval(() => {
+                const elapsedEl = document.getElementById(roundId + '-elapsed');
+                if (!elapsedEl) { clearInterval(timerId); delete scopedRoundTimers[roundId]; return; }
+                const secs = Math.floor((Date.now() - startTime) / 1000);
+                elapsedEl.textContent = '(' + secs + 's)';
+                // Per-card elapsed, so a slow single seat is visible, not just the round overall.
+                for (const m of models) {
+                    const card = document.getElementById(roundId + '-card-' + m);
+                    const status = document.getElementById(roundId + '-status-' + m);
+                    if (card && status && card.classList.contains('reviewing')) {
+                        status.textContent = 'Analyzing... (' + secs + 's)';
+                    }
+                }
+            }, 1000);
+            scopedRoundTimers[roundId] = timerId;
+
+            return roundId;
+        }
+
+        function stopScopedRoundTimer(roundId) {
+            if (scopedRoundTimers[roundId]) {
+                clearInterval(scopedRoundTimers[roundId]);
+                delete scopedRoundTimers[roundId];
+            }
+            const elapsedEl = document.getElementById(roundId + '-elapsed');
+            if (elapsedEl) { elapsedEl.textContent = ''; }
+        }
+
+        function updateScopedRoundProgress(roundId, model, data) {
+            const card = document.getElementById(roundId + '-card-' + model);
+            const status = document.getElementById(roundId + '-status-' + model);
+            const spinner = document.getElementById(roundId + '-spinner-' + model);
+            const scoreBadge = document.getElementById(roundId + '-score-' + model);
+            if (!card) return;
+
+            card.classList.remove('reviewing');
+            if (data.error) {
+                card.classList.add('error');
+                if (status) status.textContent = 'Error';
+                if (spinner) spinner.outerHTML = '<div class="error-x">!</div>';
+            } else {
+                card.classList.add('complete');
+                if (status) status.textContent = data.issues + ' issue' + (data.issues === 1 ? '' : 's') + ' found';
+                if (spinner) spinner.outerHTML = '<div class="checkmark"></div>';
+                if (scoreBadge) {
+                    const score = data.score || 0;
+                    scoreBadge.textContent = score + '/10';
+                    scoreBadge.className = 'score-badge ' + scoreClass(score);
+                    scoreBadge.style.display = 'inline-block';
+                }
+            }
+        }
+
+        // Backfills any card still showing "Analyzing..." from the final result data - a card
+        // can be stuck if its live "[+] MODEL Score:..." stdout line was never matched (e.g.
+        // served from cache, a slow/cut-off write, or a regex miss) even though the round
+        // genuinely finished and the real per-model result exists in reviews.
+        function reconcileScopedRoundCards(roundId, reviews) {
+            for (const [model, review] of Object.entries(reviews || {})) {
+                const card = document.getElementById(roundId + '-card-' + model);
+                if (!card || !card.classList.contains('reviewing')) { continue; }
+                if (review.error) {
+                    updateScopedRoundProgress(roundId, model, { error: true });
+                } else {
+                    updateScopedRoundProgress(roundId, model, { score: review.quality_score || 0, issues: (review.issues || []).length });
+                }
+            }
+        }
+
+        function finishScopedRound(roundId, consensus, reportPath, reviews) {
+            stopScopedRoundTimer(roundId);
+            reconcileScopedRoundCards(roundId, reviews);
+            const summary = document.getElementById(roundId + '-summary');
+            if (!summary) return;
+            const avgScore = (consensus.average_score ?? 0).toFixed(1);
+            let html = '<div class="review-summary" style="display:block;">' +
+                '<div class="summary-header">' +
+                    '<span class="summary-title">Round Consensus</span>' +
+                    '<span class="consensus-score score-badge ' + scoreClass(consensus.average_score ?? 0) + '">' + avgScore + '/10</span>' +
+                '</div>' +
+                '<div class="summary-stats">' +
+                    '<span class="stat-item">Agreed: <span class="stat-value">' + (consensus.consensus_issues || []).length + '</span></span>' +
+                    '<span class="stat-item">Unique: <span class="stat-value">' + (consensus.unique_insights || []).length + '</span></span>' +
+                '</div>';
+            if (reportPath) {
+                // No inline onclick with embedded data here - a Windows path routinely
+                // contains characters (quotes if ever present, and JSON.stringify's own
+                // escaping) that can terminate the onclick="..." attribute early and leave
+                // the browser trying to parse the leftover text as script, which is exactly
+                // what broke this button ("Unexpected end of input"). Wire the handler via
+                // addEventListener with reportPath captured in a closure instead.
+                html += '<button class="open-report-btn" id="' + roundId + '-open-report">&#128196; Open Full Report</button>';
+            }
+            html += '</div>';
+            summary.innerHTML = html;
+
+            if (reportPath) {
+                const btn = document.getElementById(roundId + '-open-report');
+                if (btn) {
+                    btn.addEventListener('click', () => openScopedReport(reportPath));
+                }
+            }
+        }
+
+        function openScopedReport(reportPath) {
+            vscode.postMessage({ command: 'openReport', path: reportPath });
+        }
+
+        function setScopedStatus(text) {
+            document.getElementById('scopedStatus').textContent = text || '';
+        }
+
+        // Enabled seats straight from the toggle checkboxes (Model Selection panel) - the
+        // arbiter and doc-writer pickers inside Review with Scope must reflect this the
+        // instant the panel opens, not wait for a round to run and report back which seats
+        // "worked." A seat toggled on but not yet exercised is still a valid pick here.
+        function getEnabledSeats() {
+            const config = getModelConfig();
+            const seats = [];
+            if (config.enableGpt) seats.push('gpt-4');
+            if (config.enableClaude) seats.push('claude');
+            if (config.enableGrok) seats.push('grok');
+            if (config.enableGptCli) seats.push('gpt-cli');
+            if (config.enableClaudeCli) seats.push('claude-cli');
+            if (config.enableGrokCli) seats.push('grok-cli');
+            if (config.enableGemini) seats.push('gemini');
+            if (config.enableOllama) seats.push('ollama');
+            return seats;
+        }
+
+        function populateScopedWriterOptions() {
+            const sel = document.getElementById('scopedWriterSelect');
+            if (!sel) return;
+            const enabledSeats = getEnabledSeats();
+            const previousValue = sel.value;
+
+            sel.innerHTML = enabledSeats.map(m => {
+                const cfg = MODEL_DISPLAY[m] || { name: m };
+                return '<option value="' + m + '">' + escapeHtml(cfg.name) + '</option>';
+            }).join('');
+
+            if (enabledSeats.includes(previousValue)) {
+                sel.value = previousValue;
+            }
+        }
+
+        // Debate requires 3+ enabled seats (see run_debate_round in ai_council.py). 4+ seats
+        // unlocks arbiter mode (one seat rules on disputes instead of debating); with exactly
+        // 3, all_to_all is the only option since there's no spare seat for an arbiter.
+        function setupDebateSection() {
+            const enabledSeats = getEnabledSeats();
+            const startRow = document.getElementById('debateStartRow');
+            const arbiterRow = document.getElementById('debateArbiterRow');
+            if (!startRow || !arbiterRow) return;
+
+            if (enabledSeats.length < 3) {
+                startRow.style.display = 'none';
+                return;
+            }
+            startRow.style.display = 'block';
+
+            if (enabledSeats.length >= 4) {
+                arbiterRow.style.display = 'block';
+                const sel = document.getElementById('debateArbiterSelect');
+                const previousValue = sel.value;
+                sel.innerHTML = enabledSeats.map(m => {
+                    const cfg = MODEL_DISPLAY[m] || { name: m };
+                    return '<option value="' + m + '">' + escapeHtml(cfg.name) + '</option>';
+                }).join('');
+                if (enabledSeats.includes(previousValue)) { sel.value = previousValue; }
+            } else {
+                arbiterRow.style.display = 'none';
+            }
+        }
+
+        // Refreshes both pickers - called when the Review with Scope panel opens and on
+        // every seat toggle change while it may be open, so it never shows a stale seat list.
+        function refreshScopedPickers() {
+            populateScopedWriterOptions();
+            setupDebateSection();
+        }
+
+        // Disabled for the duration of the async call so a second click can't race the same session/cache row.
+        function setDebateButtonsDisabled(disabled) {
+            for (const id of ['startDebateBtn', 'reconveneBtn', 'consolidateBtn']) {
+                const btn = document.getElementById(id);
+                if (btn) { btn.disabled = disabled; }
+            }
+        }
+
+        // Enabled only once a real session exists; called with false again when a new scoped review starts.
+        function setScopedSessionReady(ready) {
+            const startDebateBtn = document.getElementById('startDebateBtn');
+            const finalizeBtn = document.getElementById('finalizeScopedBtn');
+            if (startDebateBtn) {
+                startDebateBtn.disabled = !ready;
+                startDebateBtn.title = ready ? '' : 'Run the initial scoped review first';
+            }
+            if (finalizeBtn) {
+                finalizeBtn.disabled = !ready;
+                finalizeBtn.title = ready ? '' : 'Run the initial scoped review first';
+            }
+        }
+
+        // Ticks elapsed seconds onto the status text so a long single call (e.g. Ollama's 180s timeout) doesn't read as a hang.
+        let debateProgressTimer = null;
+        let debateProgressBaseLabel = '';
+        let debateProgressStartMs = 0;
+
+        function startDebateProgress(label) {
+            stopDebateProgressTimer();
+            debateProgressBaseLabel = label;
+            debateProgressStartMs = Date.now();
+            setScopedStatus(label + ' (0s)');
+            setDebateButtonsDisabled(true);
+            debateProgressTimer = setInterval(() => {
+                const el = document.getElementById('scopedStatus');
+                if (!el) { stopDebateProgressTimer(); return; }
+                const elapsed = Math.floor((Date.now() - debateProgressStartMs) / 1000);
+                setScopedStatus(debateProgressBaseLabel + ' (' + elapsed + 's)');
+            }, 1000);
+        }
+
+        function updateDebateProgressLabel(label) {
+            debateProgressBaseLabel = label;
+            const elapsed = Math.floor((Date.now() - debateProgressStartMs) / 1000);
+            setScopedStatus(label + ' (' + elapsed + 's)');
+        }
+
+        function stopDebateProgressTimer() {
+            if (debateProgressTimer) {
+                clearInterval(debateProgressTimer);
+                debateProgressTimer = null;
+            }
+        }
+
+        // Ollama can take up to its 180s timeout to fail - warn up front so a long wait reads as known, not hung.
+        function debateStartLabel(arbiter) {
+            return arbiter === 'ollama'
+                ? 'Debate round starting... (Ollama is arbiter - can take up to 3 min if slow)'
+                : 'Debate round starting...';
+        }
+
+        function startDebate() {
+            if (!currentScopedSessionId) {
+                setScopedStatus('Run the initial scoped review first.');
+                return;
+            }
+            const enabledSeats = getEnabledSeats();
+            const arbiter = enabledSeats.length >= 4 ? document.getElementById('debateArbiterSelect').value : null;
+            const config = getModelConfig();
+            resetScopedTokenUsage();
+            startDebateProgress(debateStartLabel(arbiter));
+            document.getElementById('debateSection').style.display = 'block';
+            document.getElementById('debateRoundsContainer').innerHTML = '';
+            document.getElementById('consolidatedSection').innerHTML = '';
+            vscode.postMessage({ command: 'runDebate', sessionId: currentScopedSessionId, arbiter: arbiter, modelConfig: config });
+        }
+
+        function reconveneDebate() {
+            if (!currentScopedSessionId) {
+                setScopedStatus('Run the initial scoped review first.');
+                return;
+            }
+            const enabledSeats = getEnabledSeats();
+            const arbiter = enabledSeats.length >= 4 ? document.getElementById('debateArbiterSelect').value : null;
+            const config = getModelConfig();
+            startDebateProgress(debateStartLabel(arbiter));
+            vscode.postMessage({ command: 'runDebate', sessionId: currentScopedSessionId, arbiter: arbiter, modelConfig: config });
+        }
+
+        function runConsolidate() {
+            if (!currentScopedSessionId) {
+                setScopedStatus('Run the initial scoped review first.');
+                return;
+            }
+            const config = getModelConfig();
+            startDebateProgress('Consolidating...');
+            vscode.postMessage({ command: 'runConsolidate', sessionId: currentScopedSessionId, modelConfig: config });
+        }
+
+        // Running total across debate+consolidate; only startDebate() (round 1) resets it, so consolidation can't erase it.
+        let scopedTokenUsageTotals = {};
+
+        function resetScopedTokenUsage() {
+            scopedTokenUsageTotals = {};
+            const el = document.getElementById('debateTokenUsage');
+            if (el) { el.innerHTML = ''; }
+        }
+
+        function renderTokenUsage(tokenUsage) {
+            const el = document.getElementById('debateTokenUsage');
+            if (!el || !tokenUsage) { return; }
+            for (const [model, u] of Object.entries(tokenUsage)) {
+                const existing = scopedTokenUsageTotals[model];
+                const unknown = u.input_tokens == null || u.output_tokens == null || u.partial;
+                if (unknown) {
+                    // Sticky: once "not reported," a later real number doesn't erase that gap.
+                    scopedTokenUsageTotals[model] = { unknown: true };
+                } else if (existing && !existing.unknown) {
+                    scopedTokenUsageTotals[model] = {
+                        input_tokens: existing.input_tokens + u.input_tokens,
+                        output_tokens: existing.output_tokens + u.output_tokens,
+                    };
+                } else if (!existing) {
+                    scopedTokenUsageTotals[model] = { input_tokens: u.input_tokens, output_tokens: u.output_tokens };
+                }
+                // else: existing is already marked unknown - leave it, per the stickiness above.
+            }
+            el.innerHTML = Object.entries(scopedTokenUsageTotals).map(([model, u]) => {
+                const cfg = MODEL_DISPLAY[model] || { name: model };
+                // Some seats (self-hosted Ollama in particular) don't report usage at all -
+                // show that honestly instead of a fabricated "0 in / 0 out" that reads as a
+                // real, confirmed measurement rather than an absence.
+                const text = u.unknown
+                    ? 'usage not reported'
+                    : u.input_tokens + ' in / ' + u.output_tokens + ' out';
+                return '<span>' + escapeHtml(cfg.name) + ': ' + text + '</span>';
+            }).join('');
+        }
+
+        function renderDebateRound(result) {
+            const container = document.getElementById('debateRoundsContainer');
+            const div = document.createElement('div');
+            div.className = 'debate-round';
+
+            const modeLabel = result.mode === 'arbiter' ? 'Arbiter (' + escapeHtml(result.arbiter || '') + ')' : 'All-to-all';
+            let html = '<div class="debate-round-header">Round ' + result.debate_round_num + ' - ' + modeLabel + '</div>';
+
+            const arbiterRulings = (result.positions || {})._arbiter_ruling || {};
+
+            for (const c of result.clusters || []) {
+                html += '<div class="debate-cluster">';
+                html += '<div class="debate-cluster-summary">' + escapeHtml(c.summary) + '</div>';
+                html += '<div class="debate-cluster-members">Raised by: ' + c.members.map(m => escapeHtml(m.model)).join(', ') + '</div>';
+
+                for (const [model, positions] of Object.entries(result.positions || {})) {
+                    if (model === '_arbiter_ruling' || positions.error) { continue; }
+                    const pos = positions[c.cluster_id];
+                    if (!pos) { continue; }
+                    html += '<div class="debate-position ' + escapeHtml(pos.stance || '') + '">' +
+                        '<span class="debate-position-model">' + escapeHtml(model) + '</span>' +
+                        escapeHtml(pos.stance || '') + ' - ' + escapeHtml(pos.reasoning || '') +
+                        '</div>';
+                }
+
+                const ruling = arbiterRulings[c.cluster_id];
+                if (ruling) {
+                    html += '<div class="debate-ruling">ARBITER: ' + escapeHtml(ruling.verdict || '') + ' (' + escapeHtml(ruling.final_severity || '') + ') - ' + escapeHtml(ruling.reasoning || '') + '</div>';
+                }
+                html += '</div>';
+            }
+
+            div.innerHTML = html;
+            container.appendChild(div);
+
+            const fill = document.getElementById('debateConsensusFill');
+            const pctLabel = document.getElementById('debateConsensusPct');
+            if (fill) { fill.style.width = result.consensus_pct + '%'; }
+            if (pctLabel) { pctLabel.textContent = result.consensus_pct + '%'; }
+
+            renderTokenUsage(result.token_usage);
+
+            // A round now exists, so reveal the buttons startDebate() left hidden.
+            const reconveneBtn = document.getElementById('reconveneBtn');
+            const consolidateBtn = document.getElementById('consolidateBtn');
+            if (reconveneBtn) { reconveneBtn.style.display = 'inline-block'; }
+            if (consolidateBtn) { consolidateBtn.style.display = 'inline-block'; }
+        }
+
+        function renderConsolidated(result) {
+            const el = document.getElementById('consolidatedSection');
+            let html = '<div class="review-summary" style="display:block;margin-top:10px;">' +
+                '<div class="summary-header"><span class="summary-title">Final Consolidated Review</span></div>' +
+                '<div style="font-size:12px;margin:8px 0;">' + escapeHtml(result.summary || '') + '</div>';
+            html += '</div>';
+
+            for (const f of result.findings || []) {
+                html += '<div class="consolidated-finding">' +
+                    '<span class="consolidated-finding-severity">[' + escapeHtml(f.severity || '?') + ']</span>' +
+                    escapeHtml(f.description || '') +
+                    '<div style="margin-top:4px;opacity:0.85;">&#128161; ' + escapeHtml(f.fix || '') + '</div>' +
+                    '</div>';
+            }
+
+            if ((result.open_questions || []).length > 0) {
+                html += '<div style="font-size:11px;font-weight:600;margin:10px 0 4px 0;opacity:0.8;">OPEN QUESTIONS</div>';
+                for (const q of result.open_questions) {
+                    html += '<div class="consolidated-open-question">' +
+                        '<div>' + escapeHtml(q.question || '') + '</div>' +
+                        '<div style="margin-top:4px;opacity:0.8;font-size:10px;">' + escapeHtml(q.why_unresolved || '') + '</div>' +
+                        '</div>';
+                }
+            }
+
+            renderTokenUsage(result.usage);
+            el.innerHTML = html;
+        }
+
+        function startScopedReview() {
+            const scope = document.getElementById('scopedScopeText').value.trim();
+            if (!scope) {
+                setScopedStatus('Enter a scope/request first.');
+                return;
+            }
+            const config = getModelConfig();
+            document.getElementById('scopedScopeInput').style.display = 'none';
+            document.getElementById('scopedRounds').innerHTML = '';
+            setScopedStatus('');
+            currentScopedSessionId = null;
+            setScopedSessionReady(false);
+            vscode.postMessage({ command: 'scopedReview', scope: scope, modelConfig: config });
+        }
+
+        function submitScopedFollowup() {
+            if (!currentScopedSessionId) {
+                setScopedStatus('Run the initial scoped review first.');
+                return;
+            }
+            const question = document.getElementById('scopedFollowupText').value.trim();
+            if (!question) {
+                setScopedStatus('Enter a follow-up question first.');
+                return;
+            }
+            const btn = document.querySelector('#scopedFollowup button.btn-primary');
+            if (btn && btn.disabled) { return; } // already in flight - no double-submit
+            if (btn) { btn.disabled = true; }
+            const config = getModelConfig();
+            setScopedStatus('Asking follow-up...');
+            vscode.postMessage({ command: 'scopedFollowup', sessionId: currentScopedSessionId, question: question, modelConfig: config });
+        }
+
+        function finalizeScopedReview() {
+            if (!currentScopedSessionId) {
+                setScopedStatus('Run the initial scoped review first.');
+                return;
+            }
+            const finalizeBtn = document.getElementById('finalizeScopedBtn');
+            if (finalizeBtn && finalizeBtn.disabled) { return; } // already in flight - no double-submit
+            if (finalizeBtn) { finalizeBtn.disabled = true; }
+            const writer = document.getElementById('scopedWriterSelect').value;
+            const config = getModelConfig();
+            setScopedStatus('Writing review doc...');
+            vscode.postMessage({ command: 'scopedFinalize', sessionId: currentScopedSessionId, writer: writer, modelConfig: config });
+        }
+
         function clearCache() {
             vscode.postMessage({ command: 'clearCache' });
         }
@@ -2368,6 +3741,9 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                 gpt: document.getElementById('enableGpt')?.checked || false,
                 claude: document.getElementById('enableClaude')?.checked || false,
                 grok: document.getElementById('enableGrok')?.checked || false,
+                gptCli: document.getElementById('enableGptCli')?.checked || false,
+                claudeCli: document.getElementById('enableClaudeCli')?.checked || false,
+                grokCli: document.getElementById('enableGrokCli')?.checked || false,
                 gemini: document.getElementById('enableGemini')?.checked || false,
                 ollama: document.getElementById('enableOllama')?.checked || false
             };
@@ -2396,6 +3772,9 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         // Review Panel State
         let currentReportPath = '';
         let reviewStartTime = 0;
+        let savedCliModels = null;
+        let currentScopedSessionId = null;
+        let currentScopedRoundId = null;
 
         function closeReviewPanel() {
             document.getElementById('reviewPanel').style.display = 'none';
@@ -2414,12 +3793,25 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                 fixBtn.innerHTML = '&#9881; Fixing...';
             }
             const fixer = document.getElementById('fixerSelect').value;
-            vscode.postMessage({ command: 'fixCode', fixer: fixer, reportPath: currentReportPath });
+            vscode.postMessage({ command: 'fixCode', fixer: fixer, reportPath: currentReportPath, modelConfig: getModelConfig() });
         }
 
         function cancelReview() {
             vscode.postMessage({ command: 'cancelReview' });
         }
+
+        // Shared model display metadata - single source of truth for name/icon/class across
+        // the review panel's cards and the scoped-review UI (writer picker, round rendering).
+        const MODEL_DISPLAY = {
+            'gpt-4': { name: 'GPT-4 API', icon: 'G', class: 'gpt' },
+            'claude': { name: 'Claude API', icon: 'C', class: 'claude' },
+            'grok': { name: 'Grok API', icon: 'X', class: 'grok' },
+            'gpt-cli': { name: 'Codex CLI', icon: 'G', class: 'gpt' },
+            'claude-cli': { name: 'Claude CLI', icon: 'C', class: 'claude' },
+            'grok-cli': { name: 'Grok CLI', icon: 'X', class: 'grok' },
+            'gemini': { name: 'Gemini', icon: 'G', class: 'gemini' },
+            'ollama': { name: 'Ollama', icon: 'O', class: 'ollama' }
+        };
 
         function startReviewPanel(fileName, models) {
             console.log('AI Council: startReviewPanel called', fileName, models);
@@ -2442,15 +3834,7 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             if (cancelBtn) cancelBtn.style.display = 'flex';
             currentReportPath = '';
 
-            // Build model cards
-            const modelConfig = {
-                'gpt-4': { name: 'GPT-4', icon: 'G', class: 'gpt' },
-                'claude': { name: 'Claude', icon: 'C', class: 'claude' },
-                'grok': { name: 'Grok', icon: 'X', class: 'grok' },
-                'gemini': { name: 'Gemini', icon: 'G', class: 'gemini' },
-                'ollama': { name: 'Ollama', icon: 'O', class: 'ollama' }
-            };
-
+            const modelConfig = MODEL_DISPLAY;
             container.innerHTML = models.map(m => {
                 const cfg = modelConfig[m] || { name: m, icon: '?', class: '' };
                 return '<div class="model-card reviewing ' + cfg.class + '" id="card-' + m + '">' +
@@ -2631,6 +4015,9 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             'enableGpt': 'openai',
             'enableClaude': 'anthropic',
             'enableGrok': 'xai',
+            'enableGptCli': 'openai-cli',
+            'enableClaudeCli': 'anthropic-cli',
+            'enableGrokCli': 'xai-cli',
             'enableGemini': 'google',
             'enableOllama': 'ollama'
         };
@@ -2648,15 +4035,20 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
 
                     // Show org name if available
                     const org = orgInfo && orgInfo[key];
+                    const isCli = String(key).endsWith('-cli');
                     if (org && orgSpan) {
                         orgSpan.textContent = org;
                         orgSpan.style.display = 'inline';
                         indicator.title = 'API Key Configured - ' + org;
                     } else if (orgSpan) {
                         orgSpan.style.display = 'none';
-                        indicator.title = hasKey ? 'API Key Configured' : 'API Key Missing - Click toggle to configure';
+                        indicator.title = hasKey
+                            ? (isCli ? 'CLI ready (subscription)' : 'API Key Configured')
+                            : (isCli ? 'CLI missing on PATH' : 'API Key Missing - Click toggle to configure');
                     } else {
-                        indicator.title = hasKey ? 'API Key Configured' : 'API Key Missing - Click toggle to configure';
+                        indicator.title = hasKey
+                            ? (isCli ? 'CLI ready (subscription)' : 'API Key Configured')
+                            : (isCli ? 'CLI missing on PATH' : 'API Key Missing - Click toggle to configure');
                     }
                 }
             });
@@ -2718,6 +4110,114 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                     break;
                 case 'apiKeyStatus':
                     updateKeyStatus(message.status, message.orgInfo);
+                    if (message.cliModels) {
+                        savedCliModels = message.cliModels;
+                        const map = {
+                            cliModelOpenai: message.cliModels.openai,
+                            cliModelAnthropic: message.cliModels.anthropic,
+                            cliModelXai: message.cliModels.xai
+                        };
+                        Object.entries(map).forEach(([id, val]) => {
+                            const el = document.getElementById(id);
+                            if (el && val) el.value = val;
+                        });
+                    }
+                    break;
+                case 'grokModelsResult':
+                    // Only replace the static list if discovery actually succeeded -
+                    // on failure, leave the curated fallback options in place.
+                    if (message.ok && Array.isArray(message.models) && message.models.length > 0) {
+                        const sel = document.getElementById('cliModelXai');
+                        if (sel) {
+                            const previousValue = (savedCliModels && savedCliModels.xai) || sel.value;
+                            sel.innerHTML = '<option value="">Auto' + (message.defaultModel ? ' (' + message.defaultModel + ')' : '') + '</option>' +
+                                message.models.map(m => '<option value="' + m + '">' + m + '</option>').join('');
+                            if (previousValue && message.models.includes(previousValue)) {
+                                sel.value = previousValue;
+                            }
+                        }
+                    } else {
+                        console.log('AI Council: grok models discovery unavailable, keeping static list:', message.error);
+                    }
+                    break;
+                case 'scopedRoundStart':
+                    currentScopedRoundId = startScopedRound(
+                        message.roundNum === 0 ? 'Round 0 - Initial Scope' : 'Follow-up round',
+                        message.models || []
+                    );
+                    break;
+                case 'scopedRoundProgress':
+                    if (currentScopedRoundId) {
+                        updateScopedRoundProgress(currentScopedRoundId, message.model, message.data);
+                    }
+                    break;
+                case 'scopedReviewResult':
+                    if (message.error) {
+                        setScopedStatus('Error: ' + message.error);
+                        document.getElementById('scopedScopeInput').style.display = 'block';
+                        break;
+                    }
+                    currentScopedSessionId = message.result.session_id;
+                    setScopedSessionReady(true);
+                    if (currentScopedRoundId) {
+                        finishScopedRound(currentScopedRoundId, message.result.consensus || {}, message.result.report_path, message.result.reviews);
+                    }
+                    document.getElementById('scopedFollowup').style.display = 'block';
+                    document.getElementById('scopedFollowupText').value = '';
+                    break;
+                case 'scopedFollowupResult': {
+                    const followupBtn = document.querySelector('#scopedFollowup button.btn-primary');
+                    if (followupBtn) { followupBtn.disabled = false; }
+                    if (message.error) {
+                        setScopedStatus('Error: ' + message.error);
+                        break;
+                    }
+                    if (currentScopedRoundId) {
+                        finishScopedRound(currentScopedRoundId, message.result.consensus || {}, message.result.report_path, message.result.reviews);
+                    }
+                    document.getElementById('scopedFollowupText').value = '';
+                    setScopedStatus('');
+                    break;
+                }
+                case 'scopedFinalizeResult': {
+                    const finalizeBtn = document.getElementById('finalizeScopedBtn');
+                    if (finalizeBtn) { finalizeBtn.disabled = false; }
+                    if (message.error) {
+                        setScopedStatus('Error: ' + message.error);
+                        break;
+                    }
+                    const requestedWriter = document.getElementById('scopedWriterSelect').value;
+                    const actualWriter = message.result.writer;
+                    // Belt-and-suspenders: server now errors instead of substituting, but say so loudly if it ever differs.
+                    const substitutionNote = actualWriter !== requestedWriter
+                        ? ' (requested ' + requestedWriter.toUpperCase() + ', but that seat was unavailable)'
+                        : '';
+                    setScopedStatus('Review doc written by ' + actualWriter.toUpperCase() + substitutionNote + ': ' + message.result.output_path);
+                    vscode.postMessage({ command: 'openReviewDoc', path: message.result.output_path });
+                    break;
+                }
+                case 'debateProgress':
+                    updateDebateProgressLabel(message.text);
+                    break;
+                case 'debateResult':
+                    stopDebateProgressTimer();
+                    setDebateButtonsDisabled(false);
+                    if (message.error) {
+                        setScopedStatus('Error: ' + message.error);
+                        break;
+                    }
+                    renderDebateRound(message.result);
+                    setScopedStatus('');
+                    break;
+                case 'consolidateResult':
+                    stopDebateProgressTimer();
+                    setDebateButtonsDisabled(false);
+                    if (message.error) {
+                        setScopedStatus('Error: ' + message.error);
+                        break;
+                    }
+                    renderConsolidated(message.result);
+                    setScopedStatus(message.result.cached ? 'Showing cached consolidation.' : '');
                     break;
                 case 'uncheckModel':
                     const checkbox = document.getElementById(message.modelId);
@@ -2738,6 +4238,9 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                             'enableGpt': 'enableGpt',
                             'enableClaude': 'enableClaude',
                             'enableGrok': 'enableGrok',
+                            'enableGptCli': 'enableGptCli',
+                            'enableClaudeCli': 'enableClaudeCli',
+                            'enableGrokCli': 'enableGrokCli',
                             'enableGemini': 'enableGemini',
                             'enableOllama': 'enableOllama',
                             'powerMode': 'powerMode'

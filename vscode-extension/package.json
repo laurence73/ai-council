@@ -151,9 +151,68 @@
         },
         "ai-council.defaultMode": {
           "type": "string",
-          "enum": ["standard", "power"],
+          "enum": [
+            "standard",
+            "power"
+          ],
           "default": "standard",
           "description": "Default review mode"
+        },
+        "ai-council.transport.openai": {
+          "type": "string",
+          "enum": [
+            "api",
+            "cli",
+            "auto"
+          ],
+          "default": "auto",
+          "description": "OpenAI/GPT auth: api (API key), cli (codex CLI subscription login), or auto (prefer CLI if installed)."
+        },
+        "ai-council.transport.anthropic": {
+          "type": "string",
+          "enum": [
+            "api",
+            "cli",
+            "auto"
+          ],
+          "default": "auto",
+          "description": "Anthropic/Claude auth: api (API key), cli (claude CLI subscription login), or auto (prefer CLI if installed)."
+        },
+        "ai-council.transport.xai": {
+          "type": "string",
+          "enum": [
+            "api",
+            "cli",
+            "auto"
+          ],
+          "default": "auto",
+          "description": "xAI/Grok auth: api (API key), cli (grok CLI subscription login), or auto (prefer CLI if installed)."
+        },
+        "ai-council.cliModels.anthropic": {
+          "type": "string",
+          "default": "",
+          "description": "Model for Claude CLI seat (subscription). The claude CLI has no model-listing command, so this is free text, not a picklist - leave blank for Auto, or type an alias your subscription supports (e.g. sonnet, opus, haiku)."
+        },
+        "ai-council.cliModels.openai": {
+          "type": "string",
+          "default": "",
+          "description": "Model for Codex/GPT CLI seat (subscription). The codex CLI has no model-listing command, and valid names are gated by ChatGPT account entitlement (a wrong guess fails with 'not supported when using Codex with a ChatGPT account') - leave blank for Auto unless you know a specific model your account supports."
+        },
+        "ai-council.cliModels.xai": {
+          "type": "string",
+          "default": "",
+          "enum": [
+            "",
+            "grok-4.6",
+            "grok-4.5"
+          ],
+          "description": "Model for Grok CLI seat (subscription). The extension reads the live list from `grok models` at startup and repopulates this picker; these enum values are only the fallback shown before that completes or if it fails."
+        },
+        "ai-council.reviewRubric": {
+          "type": "string",
+          "editPresentation": "multilineText",
+          "default": "",
+          "description": "What the council should look for during a review (layer 2). Leave blank for the built-in default (bugs, security, performance, code quality, architecture). This does NOT replace the permanent integrity rule (layer 1: no manufactured findings, no rubber-stamped consensus) - that always applies and cannot be edited here."
         }
       }
     },
