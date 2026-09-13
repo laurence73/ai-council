@@ -357,6 +357,68 @@ python ai_council.py fix <file> --fixer gpt-4
 
 ---
 
+## CLI Subscriptions (No API Key Required)
+
+If you have a **Claude Code**, **Codex**, or **Grok CLI** subscription, you can use AI Council **without API keys** - reviews are included in your subscription.
+
+### How It Works
+
+AI Council detects installed CLI tools and uses them instead of API calls:
+
+| CLI Tool | Subscription | Install |
+|----------|--------------|---------|
+| `claude` | Claude Code / Claude Pro | [claude.ai/download](https://claude.ai/download) |
+| `codex` | ChatGPT Plus / Pro | [openai.com/chatgpt/download](https://openai.com/chatgpt/download) |
+| `grok` | X Premium | [x.ai/grok](https://x.ai/grok) |
+
+### VS Code Extension
+
+In the extension sidebar, expand **MODEL SELECTION** to see:
+
+- **API KEYS** - Traditional pay-per-use API access
+- **CLI SEATS (subscriptions)** - Use your existing subscriptions
+
+Toggle on the CLI seats you want to use. The extension auto-detects which CLIs are installed and logged in.
+
+### Transport Settings
+
+Control how each provider authenticates:
+
+| Setting | Options | Default |
+|---------|---------|---------|
+| `ai-council.transport.openai` | `api`, `cli`, `auto` | `auto` |
+| `ai-council.transport.anthropic` | `api`, `cli`, `auto` | `auto` |
+| `ai-council.transport.xai` | `api`, `cli`, `auto` | `auto` |
+
+- **auto** - Prefer CLI if installed, fall back to API key
+- **cli** - Only use CLI subscription (fails if not installed)
+- **api** - Only use API key (ignores CLI even if installed)
+
+### CLI Commands
+
+```bash
+# Use Claude CLI subscription instead of API
+python ai_council.py review myfile.cs --claude-cli --no-claude
+
+# Use all three CLI subscriptions
+python ai_council.py review myfile.cs --gpt-cli --claude-cli --grok-cli --no-gpt --no-claude --no-grok
+
+# Mix CLI and API (Claude CLI + GPT API + Gemini API)
+python ai_council.py review myfile.cs --claude-cli --no-claude --gemini
+```
+
+### Cost Savings
+
+| Seat | API Cost | CLI Subscription |
+|------|----------|------------------|
+| Claude | ~$0.03/review | **$0** (included) |
+| GPT-4 | ~$0.03/review | **$0** (included) |
+| Grok | ~$0.02/review | **$0** (included) |
+
+If you already pay for Claude Pro ($20/mo), ChatGPT Plus ($20/mo), or X Premium - your AI Council reviews are essentially free.
+
+---
+
 ## Roadmap
 
 ### Completed
@@ -371,6 +433,7 @@ python ai_council.py fix <file> --fixer gpt-4
 - [x] Ollama/Self-hosted Model Support
 - [x] Status Panel with Account Info
 - [x] Power Mode Toggle
+- [x] CLI Subscriptions - Use Claude/Codex/Grok CLIs instead of API keys
 
 ### Coming Soon
 

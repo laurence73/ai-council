@@ -223,8 +223,8 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                 case 'checkApiKey':
                     await this._checkApiKey(message.modelId, message.name, message.key, message.url, message.free, message.kind);
                     break;
-                case 'clearCache':
-                    await this._clearCache();
+                case 'clearCacheConfirmed':
+                    await this._clearCacheConfirmed();
                     break;
                 case 'showStatus':
                     await this._showStatus(message.toggles);
@@ -818,31 +818,20 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
 
     // Deletes the whole reviews.db, not a selective eviction - debate_rounds/consolidations
     // aren't disposable (re-convene continuity, avoids re-rolling a non-deterministic LLM call).
-    private async _clearCache() {
+    // Confirmation is handled in the webview modal.
+    private async _clearCacheConfirmed() {
         const dbPath = this._getWorkspaceDbPath();
         if (!dbPath) {
-            vscode.window.showWarningMessage('AI Council: No workspace open');
-            return;
-        }
-
-        const confirmed = await vscode.window.showWarningMessage(
-            'This deletes ALL AI Council data for this workspace: the review cache, every ' +
-            'Review with Scope session, and any debate/consolidation results not yet exported ' +
-            'to a doc. This cannot be undone. Continue?',
-            { modal: true },
-            'Delete Everything'
-        );
-        if (confirmed !== 'Delete Everything') {
+            this.updateStatus('No workspace open', false);
             return;
         }
 
         try {
             await vscode.workspace.fs.delete(vscode.Uri.file(dbPath));
-            vscode.window.showInformationMessage('AI Council: All cached/stored review data cleared');
             this.updateStatus('Cache cleared', false);
-            this._sendCacheSize(); // Update button after clearing
+            this._sendCacheSize();
         } catch (err) {
-            vscode.window.showWarningMessage('AI Council: No cache to clear');
+            this.updateStatus('No cache to clear', false);
         }
     }
 
@@ -2684,19 +2673,71 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             margin-top: 8px;
         }
 
-        .synthesizer-select {
+        /* Consistent dropdown styling for all selects */
+        select {
             background: var(--vscode-dropdown-background);
             color: var(--vscode-dropdown-foreground);
             border: 1px solid var(--vscode-dropdown-border);
             border-radius: 4px;
-            padding: 4px 8px;
+            padding: 6px 10px;
             font-size: 11px;
             cursor: pointer;
+            appearance: none;
+            -webkit-appearance: none;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23888' d='M3 4.5L6 8l3-3.5H3z'/%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 8px center;
+            padding-right: 28px;
+        }
+
+        select:hover {
+            border-color: var(--vscode-focusBorder);
+        }
+
+        select:focus {
+            outline: none;
+            border-color: var(--vscode-focusBorder);
+            box-shadow: 0 0 0 1px var(--vscode-focusBorder);
+        }
+
+        select option {
+            background: var(--vscode-dropdown-background);
+            color: var(--vscode-dropdown-foreground);
+            padding: 6px;
+        }
+
+        .synthesizer-select {
             min-width: 130px;
         }
 
-        .synthesizer-select:focus {
-            outline: 1px solid var(--vscode-focusBorder);
+        .cli-model-select,
+        .cli-model-input {
+            flex: 1;
+            max-width: 160px;
+        }
+
+        .cli-model-input {
+            background: var(--vscode-input-background);
+            color: var(--vscode-input-foreground);
+            border: 1px solid var(--vscode-input-border);
+            border-radius: 4px;
+            padding: 6px 10px;
+            font-size: 11px;
+        }
+
+        .cli-model-input:hover {
+            border-color: var(--vscode-focusBorder);
+        }
+
+        .cli-model-input:focus {
+            outline: none;
+            border-color: var(--vscode-focusBorder);
+            box-shadow: 0 0 0 1px var(--vscode-focusBorder);
+        }
+
+        #debateArbiterSelect,
+        #scopedWriterSelect {
+            width: 100%;
         }
 
         /* API Key status indicators */
@@ -2725,6 +2766,77 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         @keyframes pulse-missing {
             0%, 100% { opacity: 1; }
             50% { opacity: 0.5; }
+        }
+
+        /* Confirmation Modal */
+        .modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.6);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+            backdrop-filter: blur(2px);
+        }
+
+        .modal-dialog {
+            background: var(--vscode-editor-background);
+            border: 1px solid var(--vscode-widget-border);
+            border-radius: 8px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+            max-width: 400px;
+            width: 90%;
+            overflow: hidden;
+        }
+
+        .modal-header {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 14px 16px;
+            border-bottom: 1px solid var(--vscode-widget-border);
+            background: var(--vscode-titleBar-activeBackground);
+        }
+
+        .modal-icon {
+            font-size: 20px;
+            color: #f59e0b;
+        }
+
+        .modal-title {
+            font-weight: 600;
+            font-size: 13px;
+            color: var(--vscode-foreground);
+        }
+
+        .modal-body {
+            padding: 16px;
+            font-size: 12px;
+            line-height: 1.5;
+            color: var(--vscode-foreground);
+        }
+
+        .modal-footer {
+            display: flex;
+            justify-content: flex-end;
+            gap: 8px;
+            padding: 12px 16px;
+            border-top: 1px solid var(--vscode-widget-border);
+            background: var(--vscode-titleBar-activeBackground);
+        }
+
+        .btn-danger {
+            background: #dc2626 !important;
+            border-color: #dc2626 !important;
+        }
+
+        .btn-danger:hover {
+            background: #b91c1c !important;
+            border-color: #b91c1c !important;
         }
 
         /* Organization name display */
@@ -2877,21 +2989,33 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                         <div style="font-size:11px;opacity:0.85;">CLI models (subscription)</div>
                         <label style="display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:12px;">
                             <span>Claude</span>
-                            <input type="text" id="cliModelAnthropic" placeholder="Auto (e.g. sonnet, opus, haiku)" style="flex:1;max-width:160px;background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border);border-radius:4px;padding:2px 6px;">
+                            <select id="cliModelAnthropic" class="cli-model-select">
+                                <option value="">Auto</option>
+                                <option value="sonnet">sonnet</option>
+                                <option value="opus">opus</option>
+                                <option value="haiku">haiku</option>
+                                <option value="fable">fable</option>
+                            </select>
                         </label>
                         <label style="display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:12px;">
                             <span>Codex</span>
-                            <input type="text" id="cliModelOpenai" placeholder="Auto (account-dependent)" style="flex:1;max-width:160px;background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border);border-radius:4px;padding:2px 6px;">
+                            <select id="cliModelOpenai" class="cli-model-select">
+                                <option value="">Auto</option>
+                                <option value="o3">o3</option>
+                                <option value="o4-mini">o4-mini</option>
+                                <option value="gpt-5.2">gpt-5.2</option>
+                                <option value="gpt-5">gpt-5</option>
+                            </select>
                         </label>
                         <label style="display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:12px;">
                             <span>Grok</span>
-                            <select id="cliModelXai" style="flex:1;max-width:160px;">
+                            <select id="cliModelXai" class="cli-model-select">
                                 <option value="">Auto</option>
                                 <option value="grok-4.6">grok-4.6</option>
                                 <option value="grok-4.5">grok-4.5</option>
                             </select>
                         </label>
-                        <div id="cliModelNote" style="font-size:10px;opacity:0.6;">Claude/Codex have no model-listing command - type a name your subscription supports, or leave blank for Auto. Grok's list is read live from <code>grok models</code>.</div>
+                        <div id="cliModelNote" style="font-size:10px;opacity:0.6;">Grok's list updates live from <code>grok models</code>. Custom models via VS Code settings.</div>
                     </div>
                     <div class="toggle-item" style="opacity: 0.5;">
                         <span class="toggle-label">Qwen <span class="model-badge badge-coming">#32</span></span>
@@ -2969,7 +3093,7 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         <div id="debateStartRow" style="display:none;">
             <div id="debateArbiterRow" style="display:none;margin-top:8px;">
                 <div style="font-size:11px;opacity:0.85;margin-bottom:4px;">Arbiter (rules on disputes instead of debating):</div>
-                <select id="debateArbiterSelect" style="width:100%;"></select>
+                <select id="debateArbiterSelect"></select>
             </div>
             <button class="btn btn-scoped" onclick="startDebate()" id="startDebateBtn" disabled title="Run the initial scoped review first">&#9878; Debate Findings</button>
         </div>
@@ -3014,6 +3138,23 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
 
     <div class="status-bar" id="statusBar">
         Ready
+    </div>
+
+    <!-- Confirmation Modal -->
+    <div class="modal-overlay" id="confirmModal" style="display: none;">
+        <div class="modal-dialog">
+            <div class="modal-header">
+                <span class="modal-icon">&#9888;</span>
+                <span class="modal-title" id="modalTitle">Confirm Action</span>
+            </div>
+            <div class="modal-body" id="modalBody">
+                Are you sure?
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-danger" id="modalConfirmBtn" onclick="modalConfirm()">Confirm</button>
+                <button class="btn" onclick="modalCancel()">Cancel</button>
+            </div>
+        </div>
     </div>
 
     <div class="status-panel" id="statusPanel" style="display: none;">
@@ -3729,8 +3870,36 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             vscode.postMessage({ command: 'scopedFinalize', sessionId: currentScopedSessionId, writer: writer, modelConfig: config });
         }
 
+        let modalCallback = null;
+
+        function showConfirmModal(title, body, confirmText, onConfirm) {
+            document.getElementById('modalTitle').textContent = title;
+            document.getElementById('modalBody').textContent = body;
+            document.getElementById('modalConfirmBtn').textContent = confirmText;
+            modalCallback = onConfirm;
+            document.getElementById('confirmModal').style.display = 'flex';
+        }
+
+        function modalConfirm() {
+            document.getElementById('confirmModal').style.display = 'none';
+            if (modalCallback) modalCallback();
+            modalCallback = null;
+        }
+
+        function modalCancel() {
+            document.getElementById('confirmModal').style.display = 'none';
+            modalCallback = null;
+        }
+
         function clearCache() {
-            vscode.postMessage({ command: 'clearCache' });
+            showConfirmModal(
+                'Clear AI Council Data',
+                'This deletes ALL AI Council data for this workspace: the review cache, every Review with Scope session, and any debate/consolidation results not yet exported to a doc. This cannot be undone.',
+                'Delete Everything',
+                function() {
+                    vscode.postMessage({ command: 'clearCacheConfirmed' });
+                }
+            );
         }
 
         function showStatus() {
