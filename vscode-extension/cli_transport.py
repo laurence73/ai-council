@@ -314,6 +314,14 @@ class CliReviewer:
 
         stdout = (stdout_b or b"").decode("utf-8", errors="replace")
         stderr = (stderr_b or b"").decode("utf-8", errors="replace")
+
+        # Detect auth errors in stderr
+        auth_keywords = ["refresh token", "sign in again", "unauthorized", "login", "authentication", "401"]
+        stderr_lower = stderr.lower()
+        if any(kw in stderr_lower for kw in auth_keywords):
+            cli_name = self.binary.split("/")[-1].split("\\")[-1]
+            raise RuntimeError(f"AUTH_REQUIRED:{cli_name}:{self.model} - Login expired. Run '{cli_name} logout && {cli_name} login' in terminal.")
+
         if proc.returncode not in (0, None) and not stdout.strip():
             raise RuntimeError(f"{self.model} CLI exited {proc.returncode}: {(stderr or stdout)[:500]}")
 
@@ -451,7 +459,31 @@ class CliReviewer:
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
 
+    async def check_auth(self) -> dict:
+        """Quick auth check - returns {"ok": True} or {"ok": False, "error": "..."}"""
+        import sys
+        print(f"[AUTH-CHECK-V3] {self.model} checking auth...", file=sys.stderr, flush=True)
+        try:
+            raw, _ = await self._call_api("Reply with just: OK", mode="ping")
+            print(f"[AUTH-CHECK-V3] {self.model} got response: {raw[:100] if raw else 'EMPTY'}", file=sys.stderr, flush=True)
+            return {"ok": True}
+        except RuntimeError as e:
+            err = str(e)
+            print(f"[AUTH-CHECK-V3] {self.model} RuntimeError: {err[:100]}", file=sys.stderr, flush=True)
+            return {"ok": False, "error": err}
+        except Exception as e:
+            print(f"[AUTH-CHECK-V3] {self.model} Exception: {str(e)[:100]}", file=sys.stderr, flush=True)
+            return {"ok": False, "error": str(e)}
+
     async def review(self, code: str, file_path: str, scope: str = None) -> dict:
+        # Quick auth pre-check
+        auth = await self.check_auth()
+        if not auth.get("ok"):
+            import sys
+            err_msg = auth.get("error", "CLI auth check failed")
+            print(f"[AUTH-FAIL] {self.model} returning error: {err_msg[:80]}", file=sys.stderr, flush=True)
+            return {"error": err_msg, "issues": [], "quality_score": 0, "_transport": "cli"}
+
         max_chars = 40000
         body = code if len(code) <= max_chars else code[:max_chars] + "\n...(truncated for CLI review)..."
         prompt = (

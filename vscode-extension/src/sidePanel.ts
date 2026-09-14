@@ -45,7 +45,7 @@ interface ReviewOptions {
 interface ModelResult {
     score: number;
     issues: number;
-    error?: boolean;
+    error?: boolean | string;
 }
 
 // Maps a raw model name from ai_council.py's stdout (e.g. "CLAUDE-CLI", "GPT-4") to the key
@@ -100,7 +100,22 @@ function parseModelProgressLine(text: string, modelResults: Record<string, Model
 
 // Full-stdout re-scan for anything the line-by-line parser missed (especially cached rounds,
 // which never emit a live "[~] MODEL started..." line but still print in "Detailed Results").
-function rescanModelResults(stdout: string, modelResults: Record<string, ModelResult>) {
+function rescanModelResults(stdout: string, modelResults: Record<string, ModelResult>, stderr?: string) {
+    // Check stderr for auth errors
+    if (stderr && stderr.includes('AUTH_REQUIRED')) {
+        // Extract CLI name (e.g., "codex" from "AUTH_REQUIRED:codex.cmd:...")
+        const authMatch = stderr.match(/AUTH_REQUIRED:([^:]+):/);
+        if (authMatch) {
+            let cliName = authMatch[1].replace(/\.cmd$/, '').replace(/\.exe$/, '');
+            // Map CLI name to model key
+            const cliToModel: Record<string, string> = { codex: 'gpt-cli', claude: 'claude-cli', grok: 'grok-cli' };
+            const modelKey = cliToModel[cliName.toLowerCase()] || cliName + '-cli';
+            if (modelResults[modelKey]) {
+                modelResults[modelKey].error = 'AUTH_REQUIRED:' + cliName;
+            }
+        }
+    }
+
     const allScoreMatches = stdout.matchAll(/\[\+\]\s+([\w-]+)\s+Score:\s*(\d+(?:\.\d+)?)\/10/gi);
     for (const match of allScoreMatches) {
         const modelKey = normalizeModelKey(match[1]);
@@ -225,6 +240,11 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                     break;
                 case 'clearCacheConfirmed':
                     await this._clearCacheConfirmed();
+                    break;
+                case 'openTerminal':
+                    const terminal = vscode.window.createTerminal(message.cli + ' Login');
+                    terminal.show();
+                    terminal.sendText(message.cli + ' logout && ' + message.cli + ' login');
                     break;
                 case 'showStatus':
                     await this._showStatus(message.toggles);
@@ -370,9 +390,9 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             AI_COUNCIL_TRANSPORT_OPENAI: config.get<string>('transport.openai') || 'auto',
             AI_COUNCIL_TRANSPORT_ANTHROPIC: config.get<string>('transport.anthropic') || 'auto',
             AI_COUNCIL_TRANSPORT_XAI: config.get<string>('transport.xai') || 'auto',
-            AI_COUNCIL_CLI_MODEL_OPENAI: config.get<string>('cliModels.openai') || '',
-            AI_COUNCIL_CLI_MODEL_ANTHROPIC: config.get<string>('cliModels.anthropic') || 'sonnet',
-            AI_COUNCIL_CLI_MODEL_XAI: config.get<string>('cliModels.xai') || '',
+            AI_COUNCIL_CLI_MODEL_OPENAI: '',
+            AI_COUNCIL_CLI_MODEL_ANTHROPIC: '',
+            AI_COUNCIL_CLI_MODEL_XAI: '',
             AI_COUNCIL_REVIEW_RUBRIC: config.get<string>('reviewRubric') || '',
         };
 
@@ -497,9 +517,9 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             AI_COUNCIL_TRANSPORT_OPENAI: config.get<string>('transport.openai') || 'auto',
             AI_COUNCIL_TRANSPORT_ANTHROPIC: config.get<string>('transport.anthropic') || 'auto',
             AI_COUNCIL_TRANSPORT_XAI: config.get<string>('transport.xai') || 'auto',
-            AI_COUNCIL_CLI_MODEL_OPENAI: config.get<string>('cliModels.openai') || '',
-            AI_COUNCIL_CLI_MODEL_ANTHROPIC: config.get<string>('cliModels.anthropic') || 'sonnet',
-            AI_COUNCIL_CLI_MODEL_XAI: config.get<string>('cliModels.xai') || '',
+            AI_COUNCIL_CLI_MODEL_OPENAI: '',
+            AI_COUNCIL_CLI_MODEL_ANTHROPIC: '',
+            AI_COUNCIL_CLI_MODEL_XAI: '',
             AI_COUNCIL_REVIEW_RUBRIC: config.get<string>('reviewRubric') || '',
             OLLAMA_URL: config.get<string>('ollamaUrl') || 'https://wowcentral.worldofworkflows.com',
         };
@@ -597,7 +617,7 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             this._isReviewing = false;
             this._currentProcess = null;
 
-            rescanModelResults(stdout, modelResults);
+            rescanModelResults(stdout, modelResults, stderr);
 
             console.log('AI Council: Process closed with code', code, 'results:', JSON.stringify(modelResults));
 
@@ -738,9 +758,9 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                 AI_COUNCIL_TRANSPORT_OPENAI: config.get<string>('transport.openai') || 'auto',
                 AI_COUNCIL_TRANSPORT_ANTHROPIC: config.get<string>('transport.anthropic') || 'auto',
                 AI_COUNCIL_TRANSPORT_XAI: config.get<string>('transport.xai') || 'auto',
-            AI_COUNCIL_CLI_MODEL_OPENAI: config.get<string>('cliModels.openai') || '',
-            AI_COUNCIL_CLI_MODEL_ANTHROPIC: config.get<string>('cliModels.anthropic') || 'sonnet',
-            AI_COUNCIL_CLI_MODEL_XAI: config.get<string>('cliModels.xai') || '',
+            AI_COUNCIL_CLI_MODEL_OPENAI: '',
+            AI_COUNCIL_CLI_MODEL_ANTHROPIC: '',
+            AI_COUNCIL_CLI_MODEL_XAI: '',
             AI_COUNCIL_REVIEW_RUBRIC: config.get<string>('reviewRubric') || '',
             };
 
@@ -891,9 +911,9 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             AI_COUNCIL_TRANSPORT_OPENAI: config.get<string>('transport.openai') || 'auto',
             AI_COUNCIL_TRANSPORT_ANTHROPIC: config.get<string>('transport.anthropic') || 'auto',
             AI_COUNCIL_TRANSPORT_XAI: config.get<string>('transport.xai') || 'auto',
-            AI_COUNCIL_CLI_MODEL_OPENAI: config.get<string>('cliModels.openai') || '',
-            AI_COUNCIL_CLI_MODEL_ANTHROPIC: config.get<string>('cliModels.anthropic') || 'sonnet',
-            AI_COUNCIL_CLI_MODEL_XAI: config.get<string>('cliModels.xai') || '',
+            AI_COUNCIL_CLI_MODEL_OPENAI: '',
+            AI_COUNCIL_CLI_MODEL_ANTHROPIC: '',
+            AI_COUNCIL_CLI_MODEL_XAI: '',
             AI_COUNCIL_REVIEW_RUBRIC: config.get<string>('reviewRubric') || '',
             OLLAMA_URL: config.get<string>('ollamaUrl') || '',
         };
@@ -1041,7 +1061,7 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             proc.on('error', (err) => { stderr += err.message; resolve(); });
         });
 
-        rescanModelResults(stdout, modelResults);
+        rescanModelResults(stdout, modelResults, stderr);
 
         const fs = require('fs');
         let result: any = undefined;
@@ -1240,9 +1260,9 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             AI_COUNCIL_TRANSPORT_OPENAI: config.get<string>('transport.openai') || 'auto',
             AI_COUNCIL_TRANSPORT_ANTHROPIC: config.get<string>('transport.anthropic') || 'auto',
             AI_COUNCIL_TRANSPORT_XAI: config.get<string>('transport.xai') || 'auto',
-            AI_COUNCIL_CLI_MODEL_OPENAI: config.get<string>('cliModels.openai') || '',
-            AI_COUNCIL_CLI_MODEL_ANTHROPIC: config.get<string>('cliModels.anthropic') || 'sonnet',
-            AI_COUNCIL_CLI_MODEL_XAI: config.get<string>('cliModels.xai') || '',
+            AI_COUNCIL_CLI_MODEL_OPENAI: '',
+            AI_COUNCIL_CLI_MODEL_ANTHROPIC: '',
+            AI_COUNCIL_CLI_MODEL_XAI: '',
             AI_COUNCIL_REVIEW_RUBRIC: config.get<string>('reviewRubric') || '',
             OLLAMA_URL: config.get<string>('ollamaUrl') || '',
         };
@@ -1255,6 +1275,7 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         // Start org info fetch immediately
         console.log('AI Council: Starting org info fetch...');
         const orgInfoPromise = this._fetchAllOrgInfo(apiKeys);
+        const cliModelsPromise = this._getCliDefaultModels();
 
         // Build args - global flags must come BEFORE the subcommand
         const ollamaUrl = config.get<string>('ollamaUrl');
@@ -1338,8 +1359,8 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             });
         });
 
-        // Wait for both to complete
-        const [status, orgInfo] = await Promise.all([statusPromise, orgInfoPromise]);
+        // Wait for all to complete
+        const [status, orgInfo, cliModels] = await Promise.all([statusPromise, orgInfoPromise, cliModelsPromise]);
 
         // Override reviewers with our computed list from toggles
         status.reviewers = selectedReviewers.length > 0 ? selectedReviewers.join(', ') : 'None selected';
@@ -1354,12 +1375,13 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         }
 
         if (this._view) {
-            console.log('AI Council: Sending to webview - orgInfo:', JSON.stringify(orgInfo));
+            console.log('AI Council: Sending to webview - orgInfo:', JSON.stringify(orgInfo), 'cliModels:', JSON.stringify(cliModels));
             this._view.webview.postMessage({
                 type: 'statusPanel',
                 loading: false,
                 status,
-                orgInfo
+                orgInfo,
+                cliModels
             });
         }
     }
@@ -1386,6 +1408,65 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             const cmd = process.platform === 'win32' ? 'where' : 'which';
             execFile(cmd, [bin], { windowsHide: true }, (err) => resolve(!err));
         });
+    }
+
+    private async _getCliDefaultModels(): Promise<Record<string, string>> {
+        const models: Record<string, string> = {};
+        const os = require('os');
+        const fs = require('fs');
+        const path = require('path');
+
+        // Check all CLIs in parallel
+        const [claudeOnPath, codexOnPath, grokOnPath] = await Promise.all([
+            this._cliOnPath('claude'),
+            this._cliOnPath('codex'),
+            this._cliOnPath('grok')
+        ]);
+
+        // Claude - no model preference stored, uses API default
+        if (claudeOnPath) {
+            models.claude = 'default';
+        }
+
+        // Codex - read from ~/.codex/config.toml
+        if (codexOnPath) {
+            try {
+                const configPath = path.join(os.homedir(), '.codex', 'config.toml');
+                const configContent = fs.readFileSync(configPath, 'utf-8');
+                const modelMatch = configContent.match(/^model\s*=\s*"([^"]+)"/m);
+                if (modelMatch) {
+                    models.codex = modelMatch[1];
+                } else {
+                    models.codex = 'default';
+                }
+            } catch {
+                models.codex = 'default';
+            }
+        }
+
+        // Grok: parse `grok models` output for actual default
+        if (grokOnPath) {
+            try {
+                const grokOutput = await new Promise<string>((resolve) => {
+                    const proc = spawn('grok', ['models'], { shell: true });
+                    let out = '';
+                    proc.stdout?.on('data', (d) => { out += d.toString(); });
+                    proc.on('close', () => resolve(out));
+                    proc.on('error', () => resolve(''));
+                    setTimeout(() => { try { proc.kill(); } catch {} resolve(out); }, 5000);
+                });
+                const defaultMatch = grokOutput.match(/Default model:\s*(\S+)/i);
+                if (defaultMatch) {
+                    models.grok = defaultMatch[1];
+                } else {
+                    models.grok = 'default';
+                }
+            } catch {
+                models.grok = 'default';
+            }
+        }
+
+        return models;
     }
 
     private async _checkApiKey(modelId: string, name: string, key: string, url: string, free?: boolean, kind?: string) {
@@ -2985,38 +3066,6 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                             <span class="toggle-slider"></span>
                         </label>
                     </div>
-                    <div class="cli-model-row" style="display:flex;flex-direction:column;gap:6px;margin:8px 0 4px 0;padding:8px;border:1px solid var(--vscode-widget-border);border-radius:6px;">
-                        <div style="font-size:11px;opacity:0.85;">CLI models (subscription)</div>
-                        <label style="display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:12px;">
-                            <span>Claude</span>
-                            <select id="cliModelAnthropic" class="cli-model-select">
-                                <option value="">Auto</option>
-                                <option value="sonnet">sonnet</option>
-                                <option value="opus">opus</option>
-                                <option value="haiku">haiku</option>
-                                <option value="fable">fable</option>
-                            </select>
-                        </label>
-                        <label style="display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:12px;">
-                            <span>Codex</span>
-                            <select id="cliModelOpenai" class="cli-model-select">
-                                <option value="">Auto</option>
-                                <option value="o3">o3</option>
-                                <option value="o4-mini">o4-mini</option>
-                                <option value="gpt-5.2">gpt-5.2</option>
-                                <option value="gpt-5">gpt-5</option>
-                            </select>
-                        </label>
-                        <label style="display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:12px;">
-                            <span>Grok</span>
-                            <select id="cliModelXai" class="cli-model-select">
-                                <option value="">Auto</option>
-                                <option value="grok-4.6">grok-4.6</option>
-                                <option value="grok-4.5">grok-4.5</option>
-                            </select>
-                        </label>
-                        <div id="cliModelNote" style="font-size:10px;opacity:0.6;">Grok's list updates live from <code>grok models</code>. Custom models via VS Code settings.</div>
-                    </div>
                     <div class="toggle-item" style="opacity: 0.5;">
                         <span class="toggle-label">Qwen <span class="model-badge badge-coming">#32</span></span>
                         <label class="toggle-switch qwen">
@@ -3891,6 +3940,19 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             modalCallback = null;
         }
 
+        var pendingLoginCli = null;
+        function showLoginPrompt(cliName) {
+            pendingLoginCli = cliName;
+            showConfirmModal(
+                cliName.charAt(0).toUpperCase() + cliName.slice(1) + ' Login Required',
+                'Your ' + cliName + ' CLI session has expired. Click below to open a terminal and re-authenticate.',
+                'Open Terminal',
+                function() {
+                    vscode.postMessage({ command: 'openTerminal', cli: pendingLoginCli });
+                }
+            );
+        }
+
         function clearCache() {
             showConfirmModal(
                 'Clear AI Council Data',
@@ -4036,12 +4098,26 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
 
             if (data.error) {
                 card.classList.add('error');
-                status.textContent = 'Error';
-                spinner.outerHTML = '<div class="error-x">!</div>';
+                var errStr = typeof data.error === 'string' ? data.error : '';
+                if (errStr.indexOf('AUTH_REQUIRED') >= 0) {
+                    var cliName = errStr.split(':')[1] || 'cli';
+                    var link = document.createElement('a');
+                    link.href = '#';
+                    link.textContent = 'Login Required';
+                    link.style.color = '#f59e0b';
+                    link.style.textDecoration = 'underline';
+                    link.style.cursor = 'pointer';
+                    link.onclick = function(e) { e.preventDefault(); showLoginPrompt(cliName); };
+                    status.textContent = '';
+                    status.appendChild(link);
+                } else {
+                    status.textContent = 'Error';
+                }
+                if (spinner) spinner.outerHTML = '<div class="error-x">!</div>';
             } else {
                 card.classList.add('complete');
                 status.textContent = data.issues + ' issues found';
-                spinner.outerHTML = '<div class="checkmark"></div>';
+                if (spinner) spinner.outerHTML = '<div class="checkmark"></div>';
 
                 // Show score
                 const score = data.score || 0;
@@ -4099,8 +4175,22 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                 }
                 if (status) {
                     if (data.error) {
-                        status.textContent = 'Error';
-                        status.style.color = '#ef4444';
+                        var errStr = typeof data.error === 'string' ? data.error : '';
+                        if (errStr.indexOf('AUTH_REQUIRED') >= 0) {
+                            var cliName = errStr.split(':')[1] || 'cli';
+                            var link = document.createElement('a');
+                            link.href = '#';
+                            link.textContent = 'Login Required';
+                            link.style.color = '#f59e0b';
+                            link.style.textDecoration = 'underline';
+                            link.style.cursor = 'pointer';
+                            link.onclick = function(e) { e.preventDefault(); showLoginPrompt(cliName); };
+                            status.textContent = '';
+                            status.appendChild(link);
+                        } else {
+                            status.textContent = 'Error';
+                            status.style.color = '#ef4444';
+                        }
                     } else {
                         status.textContent = (data.score || 0) + '/10';
                         status.style.color = data.score >= 7 ? '#22c55e' : (data.score >= 5 ? '#f59e0b' : '#ef4444');
@@ -4452,9 +4542,28 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                             }
                         }
 
+                        // Build CLI models HTML if available
+                        var cliHtml = '';
+                        if (message.cliModels) {
+                            var cliEntries = [];
+                            if (message.cliModels.claude) {
+                                cliEntries.push('<div class="status-row"><span class="status-label" style="color:#d97706;">Claude CLI:</span><span class="status-value">' + message.cliModels.claude + '</span></div>');
+                            }
+                            if (message.cliModels.codex) {
+                                cliEntries.push('<div class="status-row"><span class="status-label" style="color:#10a37f;">Codex CLI:</span><span class="status-value">' + message.cliModels.codex + '</span></div>');
+                            }
+                            if (message.cliModels.grok) {
+                                cliEntries.push('<div class="status-row"><span class="status-label" style="color:#1da1f2;">Grok CLI:</span><span class="status-value">' + message.cliModels.grok + '</span></div>');
+                            }
+                            if (cliEntries.length > 0) {
+                                cliHtml = '<div class="status-section-title">CLI Models</div>' + cliEntries.join('');
+                            }
+                        }
+
                         // Restore the panel content structure FIRST
                         document.getElementById('statusPanelContent').innerHTML =
                             orgHtml +
+                            cliHtml +
                             '<div class="status-section-title">System</div>' +
                             '<div class="status-row"><span class="status-label">Database:</span><span class="status-value" id="statusDb">-</span></div>' +
                             '<div class="status-row"><span class="status-label">Reviewers:</span><span class="status-value" id="statusReviewers">-</span></div>' +

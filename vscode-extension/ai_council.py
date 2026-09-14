@@ -376,6 +376,8 @@ class ProgressTracker:
 
         if error:
             print(f"  [!] {model.upper()} ERROR ({elapsed}) [{completed}/{total}]")
+            # Print error detail for TypeScript parser to capture
+            print(f"  [{model.upper()}] ERROR: {str(error)[:200]}")
         else:
             print(f"  [+] {model.upper()} Score: {score}/10 ({elapsed}) [{completed}/{total}]")
 
@@ -1426,6 +1428,10 @@ class AICouncil:
             completed = await asyncio.gather(*tasks)
             for model_name, review in completed:
                 results[model_name] = review
+                # Print error immediately for TypeScript parser
+                if "error" in review:
+                    print(f"  [!] {model_name.upper()} ERROR", flush=True)
+                    print(f"  [{model_name.upper()}] ERROR: {str(review['error'])[:200]}", flush=True)
                 self.db.add_review(str(file_path), file_hash, model_name, review)
 
         # Stop spinner and print summary
