@@ -10,8 +10,7 @@ cd vscode-extension && npm run compile && npm run package
 
 ## Current Issues to Fix
 
-1. **Power Mode toggle** - Not switching model names (GPT-4 → GPT-6 Astra, etc.)
-2. **API Key status dots** - Not showing green/red indicators
+(none tracked here currently)
 
 ## Debug
 Open DevTools (`F12`) and check Console for `AI Council:` messages.
@@ -21,9 +20,8 @@ Open DevTools (`F12`) and check Console for `AI Council:` messages.
 - `ai-council.apiKeys.anthropic`
 - `ai-council.apiKeys.xai`
 - `ai-council.apiKeys.google` (FREE)
-- `ai-council.apiKeys.groq` (FREE)
 
 ## Key Files
 - `vscode-extension/src/sidePanel.ts` - Main sidebar UI and logic
 - `vscode-extension/package.json` - Extension manifest
-- `ai_council.py` - Python review engine
+- `vscode-extension/ai_council.py` - Python review engine (the only copy that runs)

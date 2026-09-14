@@ -655,13 +655,13 @@ pip install -r requirements.txt</code></pre>
 
         <h3>Step 3: Test It</h3>
         <pre data-lang="bash"><code><span class="code-comment"># Check which reviewers are active</span>
-python ai_council.py status
+python vscode-extension/ai_council.py status
 
 <span class="code-comment"># Review a file</span>
-python ai_council.py review <span class="code-string">"path/to/your/code.cs"</span>
+python vscode-extension/ai_council.py review <span class="code-string">"path/to/your/code.cs"</span>
 
 <span class="code-comment"># Force re-review (bypass cache)</span>
-python ai_council.py review <span class="code-string">"path/to/your/code.cs"</span> --force</code></pre>
+python vscode-extension/ai_council.py review <span class="code-string">"path/to/your/code.cs"</span> --force</code></pre>
 
         <h2><span class="icon">💻</span> CLI Commands</h2>
 
@@ -671,31 +671,31 @@ python ai_council.py review <span class="code-string">"path/to/your/code.cs"</sp
                 <th>Description</th>
             </tr>
             <tr>
-                <td><code>python ai_council.py status</code></td>
+                <td><code>python vscode-extension/ai_council.py status</code></td>
                 <td>Show active reviewers and pending queue</td>
             </tr>
             <tr>
-                <td><code>python ai_council.py review &lt;file&gt;</code></td>
+                <td><code>python vscode-extension/ai_council.py review &lt;file&gt;</code></td>
                 <td>Review a file with all active models</td>
             </tr>
             <tr>
-                <td><code>python ai_council.py review &lt;file&gt; --force</code></td>
+                <td><code>python vscode-extension/ai_council.py review &lt;file&gt; --force</code></td>
                 <td>Force re-review (ignore cache)</td>
             </tr>
             <tr>
-                <td><code>python ai_council.py show &lt;file&gt;</code></td>
+                <td><code>python vscode-extension/ai_council.py show &lt;file&gt;</code></td>
                 <td>Show cached reviews for a file</td>
             </tr>
             <tr>
-                <td><code>python ai_council.py queue &lt;file&gt;</code></td>
+                <td><code>python vscode-extension/ai_council.py queue &lt;file&gt;</code></td>
                 <td>Queue file for background review</td>
             </tr>
             <tr>
-                <td><code>python ai_council.py process</code></td>
+                <td><code>python vscode-extension/ai_council.py process</code></td>
                 <td>Process pending review queue</td>
             </tr>
             <tr>
-                <td><code>python ai_council.py watch --path &lt;dir&gt;</code></td>
+                <td><code>python vscode-extension/ai_council.py watch --path &lt;dir&gt;</code></td>
                 <td>Watch directory for file changes</td>
             </tr>
         </table>
@@ -722,13 +722,14 @@ python ai_council.py review <span class="code-string">"path/to/your/code.cs"</sp
         </div>
 
         <h3>Option A: Auto-Queue via Hooks</h3>
-        <p>Add to <code>~/.claude/settings.json</code>:</p>
+        <p>Add to <code>~/.claude/settings.json</code>. Set <code>AI_COUNCIL_WORKSPACE</code> to the same project folder you review from the VS Code extension - both write to <code>&lt;workspace&gt;/.ai-council/reviews.db</code>, so a queued file lands where the extension can actually see it:</p>
         <pre data-lang="json"><code>{
   <span class="code-string">"hooks"</span>: {
     <span class="code-string">"PostToolUse"</span>: [
       {
         <span class="code-string">"matcher"</span>: <span class="code-string">"^(Edit|Write)$"</span>,
-        <span class="code-string">"command"</span>: <span class="code-string">"python \"C:/AI COUNCIL/queue_review.py\" \"$TOOL_INPUT_file_path\""</span>
+        <span class="code-string">"command"</span>: <span class="code-string">"python \"/absolute/path/to/your/ai-council/checkout/queue_review.py\" \"$TOOL_INPUT_file_path\""</span>,
+        <span class="code-string">"env"</span>: { <span class="code-string">"AI_COUNCIL_WORKSPACE"</span>: <span class="code-string">"C:/path/to/your/project"</span> }
       }
     ]
   }
@@ -738,18 +739,19 @@ python ai_council.py review <span class="code-string">"path/to/your/code.cs"</sp
             <div class="tip-icon">💡</div>
             <div class="tip-content">
                 <h4>How it works</h4>
-                <p>Every time Claude uses Edit or Write tools, the file is automatically queued for GPT-4/Grok review. Run <code>python ai_council.py process</code> periodically to process the queue.</p>
+                <p>Every time Claude uses Edit or Write tools, the file is added to that workspace's <code>queue</code> table. Run <code>python vscode-extension/ai_council.py --db "&lt;workspace&gt;/.ai-council/reviews.db" process</code> periodically to process the queue.</p>
             </div>
         </div>
 
         <h3>Option B: MCP Server (Query Reviews)</h3>
-        <p>Add to <code>~/.claude/settings.json</code>:</p>
+        <p>Add to <code>~/.claude/settings.json</code>. <code>AI_COUNCIL_WORKSPACE</code> here too, for the same reason - it's how the server finds the workspace database the extension actually wrote to:</p>
         <pre data-lang="json"><code>{
   <span class="code-string">"mcpServers"</span>: {
     <span class="code-string">"ai-council"</span>: {
       <span class="code-string">"command"</span>: <span class="code-string">"python"</span>,
-      <span class="code-string">"args"</span>: [<span class="code-string">"C:/AI COUNCIL/mcp_server.py"</span>],
+      <span class="code-string">"args"</span>: [<span class="code-string">"/absolute/path/to/your/ai-council/checkout/mcp_server.py"</span>],
       <span class="code-string">"env"</span>: {
+        <span class="code-string">"AI_COUNCIL_WORKSPACE"</span>: <span class="code-string">"C:/path/to/your/project"</span>,
         <span class="code-string">"OPENAI_API_KEY"</span>: <span class="code-string">"sk-..."</span>,
         <span class="code-string">"XAI_API_KEY"</span>: <span class="code-string">"xai-..."</span>
       }
@@ -941,8 +943,8 @@ python ai_council.py review <span class="code-string">"path/to/your/code.cs"</sp
                 <th>Purpose</th>
             </tr>
             <tr>
-                <td><code>ai_council.py</code></td>
-                <td>Main CLI and orchestrator</td>
+                <td><code>vscode-extension/ai_council.py</code></td>
+                <td>Main CLI and orchestrator (the only copy that runs)</td>
             </tr>
             <tr>
                 <td><code>queue_review.py</code></td>
@@ -953,8 +955,8 @@ python ai_council.py review <span class="code-string">"path/to/your/code.cs"</sp
                 <td>MCP server for Claude Code integration</td>
             </tr>
             <tr>
-                <td><code>reviews.db</code></td>
-                <td>SQLite database (auto-created, gitignored)</td>
+                <td><code>&lt;workspace&gt;/.ai-council/reviews.db</code></td>
+                <td>Per-workspace SQLite database (auto-created, gitignored) - the extension, MCP server, and queue hook all read/write the same one via <code>AI_COUNCIL_WORKSPACE</code></td>
             </tr>
             <tr>
                 <td><code>requirements.txt</code></td>

@@ -1,7 +1,7 @@
 {
   "name": "ai-council",
   "displayName": "AI Council - Multi-Model Code Review",
-  "description": "Get parallel code reviews from GPT-4, Grok, Claude, and Gemini - find bugs that single-model reviews miss.",
+  "description": "Get parallel code reviews from GPT-4, Grok, Claude, Gemini, and self-hosted Ollama - via API keys or your existing CLI subscriptions - with scoped review, debate, and consolidation.",
   "version": "0.1.0",
   "publisher": "laurence73",
   "engines": {
@@ -42,6 +42,16 @@
         "icon": "$(zap)"
       },
       {
+        "command": "ai-council.reviewCommit",
+        "title": "AI Council: Review Current Commit",
+        "icon": "$(git-commit)"
+      },
+      {
+        "command": "ai-council.reviewWithScope",
+        "title": "AI Council: Review with Scope",
+        "icon": "$(comment-discussion)"
+      },
+      {
         "command": "ai-council.showLastReview",
         "title": "AI Council: Show Last Review"
       },
@@ -55,7 +65,7 @@
         {
           "command": "ai-council.reviewFile",
           "group": "navigation",
-          "when": "editorLangId =~ /csharp|javascript|typescript|python|java|go|rust|cpp|c/"
+          "when": "editorLangId =~ /csharp|razor|javascript|javascriptreact|typescript|typescriptreact|python|java|go|rust|cpp|c/"
         }
       ],
       "editor/context": [
@@ -68,13 +78,18 @@
           "command": "ai-council.reviewFilePower",
           "group": "ai-council@2",
           "when": "editorTextFocus"
+        },
+        {
+          "command": "ai-council.reviewWithScope",
+          "group": "ai-council@3",
+          "when": "editorTextFocus"
         }
       ],
       "explorer/context": [
         {
           "command": "ai-council.reviewFile",
           "group": "ai-council@1",
-          "when": "resourceExtname =~ /\\.(cs|js|ts|py|java|go|rs|cpp|c|jsx|tsx)$/"
+          "when": "resourceExtname =~ /\\.(cs|razor|js|ts|py|java|go|rs|cpp|c|jsx|tsx)$/"
         }
       ]
     },
@@ -111,19 +126,14 @@
           "default": "",
           "description": "Google API Key (for Gemini - FREE!). Get yours at: https://aistudio.google.com/app/apikey"
         },
-        "ai-council.apiKeys.groq": {
-          "type": "string",
-          "default": "",
-          "description": "Groq API Key (for Llama - FREE!). Get yours at: https://console.groq.com/"
-        },
         "ai-council.apiKeys.ollama": {
           "type": "string",
-          "default": "wowgateway:biS4pjsPMd1XOn5L7llC4",
+          "default": "",
           "description": "WoW AI auth (user:pass for Basic auth, or Bearer token)"
         },
         "ai-council.ollamaUrl": {
           "type": "string",
-          "default": "https://wowai-api.worldofworkflows.com:9443",
+          "default": "",
           "description": "WoW AI / Ollama server URL"
         },
         "ai-council.ollamaModel": {
@@ -142,71 +152,7 @@
         "ai-council.autoReviewOnSave": {
           "type": "boolean",
           "default": false,
-          "description": "Automatically queue files for review on save"
-        },
-        "ai-council.showInlineHints": {
-          "type": "boolean",
-          "default": true,
-          "description": "Show inline hints for issues at specific line numbers"
-        },
-        "ai-council.defaultMode": {
-          "type": "string",
-          "enum": [
-            "standard",
-            "power"
-          ],
-          "default": "standard",
-          "description": "Default review mode"
-        },
-        "ai-council.transport.openai": {
-          "type": "string",
-          "enum": [
-            "api",
-            "cli",
-            "auto"
-          ],
-          "default": "auto",
-          "description": "OpenAI/GPT auth: api (API key), cli (codex CLI subscription login), or auto (prefer CLI if installed)."
-        },
-        "ai-council.transport.anthropic": {
-          "type": "string",
-          "enum": [
-            "api",
-            "cli",
-            "auto"
-          ],
-          "default": "auto",
-          "description": "Anthropic/Claude auth: api (API key), cli (claude CLI subscription login), or auto (prefer CLI if installed)."
-        },
-        "ai-council.transport.xai": {
-          "type": "string",
-          "enum": [
-            "api",
-            "cli",
-            "auto"
-          ],
-          "default": "auto",
-          "description": "xAI/Grok auth: api (API key), cli (grok CLI subscription login), or auto (prefer CLI if installed)."
-        },
-        "ai-council.cliModels.anthropic": {
-          "type": "string",
-          "default": "",
-          "description": "Model for Claude CLI seat (subscription). The claude CLI has no model-listing command, so this is free text, not a picklist - leave blank for Auto, or type an alias your subscription supports (e.g. sonnet, opus, haiku)."
-        },
-        "ai-council.cliModels.openai": {
-          "type": "string",
-          "default": "",
-          "description": "Model for Codex/GPT CLI seat (subscription). The codex CLI has no model-listing command, and valid names are gated by ChatGPT account entitlement (a wrong guess fails with 'not supported when using Codex with a ChatGPT account') - leave blank for Auto unless you know a specific model your account supports."
-        },
-        "ai-council.cliModels.xai": {
-          "type": "string",
-          "default": "",
-          "enum": [
-            "",
-            "grok-4.6",
-            "grok-4.5"
-          ],
-          "description": "Model for Grok CLI seat (subscription). The extension reads the live list from `grok models` at startup and repopulates this picker; these enum values are only the fallback shown before that completes or if it fails."
+          "description": "Run a full review immediately whenever a supported source file is saved. Requires the AI Council sidebar (or any AI Council command) to have run at least once this window session - saves before that won't trigger a review, since the extension only activates on first use, not at VS Code startup."
         },
         "ai-council.reviewRubric": {
           "type": "string",

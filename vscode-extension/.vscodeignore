@@ -6,3 +6,8 @@ tsconfig.json
 **/*.map
 node_modules/**
 *.vsix
+reviews.db
+reports/**
+__pycache__/**
+**/__pycache__/**
+*.pyc

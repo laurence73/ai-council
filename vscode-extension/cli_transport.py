@@ -81,27 +81,23 @@ REVIEW_JSON_SCHEMA = {
     "required": ["issues", "summary", "quality_score"],
 }
 
-# Sensible subscription defaults / picker options
-CLI_MODEL_CHOICES = {
-    "anthropic": ["sonnet", "opus", "haiku", "claude-sonnet-4-5", "claude-opus-4-5"],
-    "xai": ["grok-4.6", "grok-4.5"],
-    "openai": ["gpt-5.2", "gpt-5", "o3", "o4-mini", "codex"],
-}
-
 CLI_MODEL_DEFAULTS = {
-    "anthropic": "sonnet",
-    "xai": "grok-4.6",
-    # No default: valid model names are gated by the ChatGPT account's entitlement,
-    # and a hardcoded guess (e.g. "gpt-5.2") errors as "not supported when using
-    # Codex with a ChatGPT account" for accounts that don't have it. Omitting -m
-    # lets codex exec pick a model the account can actually use.
+    # No forced defaults for any provider - the extension no longer offers a model picker or
+    # ships an opinionated guess (e.g. "sonnet"), since that silently overrode whatever the
+    # user's own CLI login/account actually resolves to by default. Omitting --model/-m lets
+    # each CLI pick whatever its own active session/account default actually is; the
+    # AI_COUNCIL_CLI_MODEL_* env vars remain a manual override for someone who wants one.
+    "anthropic": "",
+    "xai": "",
     "openai": "",
 }
 
+# Provider -> CLI binary name. Used to build the reviewer's display name (f"{PROVIDER_CLI[p]}-cli")
+# and to check/spawn the actual binary.
 PROVIDER_CLI = {
-    "openai": ("codex", "AI_COUNCIL_TRANSPORT_OPENAI", "gpt-4"),
-    "anthropic": ("claude", "AI_COUNCIL_TRANSPORT_ANTHROPIC", "claude"),
-    "xai": ("grok", "AI_COUNCIL_TRANSPORT_XAI", "grok"),
+    "openai": "codex",
+    "anthropic": "claude",
+    "xai": "grok",
 }
 
 API_KEY_ENV = {
@@ -243,25 +239,6 @@ def extract_json_object(text: str) -> Optional[dict]:
     return None
 
 
-def resolve_transport(provider: str, explicit: Optional[str] = None) -> str:
-    env_name = PROVIDER_CLI.get(provider, (None, None, None))[1]
-    raw = (explicit or (os.environ.get(env_name) if env_name else None) or "auto").strip().lower()
-    if raw not in ("api", "cli", "auto"):
-        raw = "auto"
-    cli_name = PROVIDER_CLI[provider][0]
-    has_cli = bool(find_cli(cli_name))
-    has_key = bool(os.environ.get(API_KEY_ENV[provider], "").strip())
-    if raw == "cli":
-        return "cli" if has_cli else "none"
-    if raw == "api":
-        return "api" if has_key else "none"
-    if has_cli:
-        return "cli"
-    if has_key:
-        return "api"
-    return "none"
-
-
 def resolve_cli_model(provider: str, explicit: Optional[str] = None) -> str:
     env_name = CLI_MODEL_ENV.get(provider)
     raw = (explicit or (os.environ.get(env_name) if env_name else None) or "").strip()
@@ -273,16 +250,19 @@ class CliReviewer:
         self.provider = provider
         self.binary = binary
         self.cli_model = model or resolve_cli_model(provider)
-        self.model = f"{PROVIDER_CLI[provider][0]}-cli:{self.cli_model}" if self.cli_model else f"{PROVIDER_CLI[provider][0]}-cli"
+        self.model = f"{PROVIDER_CLI[provider]}-cli:{self.cli_model}" if self.cli_model else f"{PROVIDER_CLI[provider]}-cli"
         self.timeout = timeout
 
     @staticmethod
     def _normalize_usage(raw_usage: dict) -> dict:
-        """Each CLI's usage envelope uses different key names - normalize to one shape."""
-        if not isinstance(raw_usage, dict):
-            return {"input_tokens": 0, "output_tokens": 0}
-        input_tokens = raw_usage.get("input_tokens", raw_usage.get("prompt_tokens", 0)) or 0
-        output_tokens = raw_usage.get("output_tokens", raw_usage.get("completion_tokens", 0)) or 0
+        """Each CLI's usage envelope uses different key names - normalize to one shape.
+        Missing/unparseable usage becomes None (not a fabricated 0): a real zero and "this CLI
+        didn't report usage for this call" must stay distinguishable, same pattern already used
+        by OllamaReviewer and the debate token-usage accumulator (ai_council.py's _add_usage)."""
+        if not isinstance(raw_usage, dict) or not raw_usage:
+            return {"input_tokens": None, "output_tokens": None}
+        input_tokens = raw_usage.get("input_tokens", raw_usage.get("prompt_tokens"))
+        output_tokens = raw_usage.get("output_tokens", raw_usage.get("completion_tokens"))
         return {"input_tokens": input_tokens, "output_tokens": output_tokens}
 
     async def _run(self, argv: list, cwd: Path, stdin_text: Optional[str] = None, plain_text: bool = False) -> tuple:
@@ -325,7 +305,7 @@ class CliReviewer:
         if proc.returncode not in (0, None) and not stdout.strip():
             raise RuntimeError(f"{self.model} CLI exited {proc.returncode}: {(stderr or stdout)[:500]}")
 
-        no_usage = {"input_tokens": 0, "output_tokens": 0}
+        no_usage = {"input_tokens": None, "output_tokens": None}
 
         # plain_text (fix mode): unwrap straight to the model's actual reply text,
         # rather than leaving JSON extraction (extract_json_object) to the caller.
@@ -413,11 +393,21 @@ class CliReviewer:
             plain_text = mode != "review"
 
             if self.provider == "anthropic":
+                # dontAsk (not bypassPermissions) + an explicit Read-only allowlist: reviewed
+                # source/scope text reaches this CLI, so a prompt-injected file must not be able
+                # to trigger a Write/Bash/etc. tool call - verified empirically that dontAsk
+                # still denies any tool outside --allowedTools. --restricted additionally
+                # confines Read itself to work_dir (+ --add-dir, unused here) - verified
+                # empirically that a prompt asking to read a file outside work_dir via a
+                # relative ../ path is denied (permission_denials shows the Read call itself
+                # blocked, not just the model declining), while a real in-work_dir read still
+                # succeeds normally.
                 argv = [
                     self.binary, "-p",
                     "--output-format", "json",
-                    "--permission-mode", "bypassPermissions",
+                    "--permission-mode", "dontAsk",
                     "--allowedTools", "Read",
+                    "--restricted",
                 ]
                 if plain_text:
                     user = (
@@ -439,11 +429,28 @@ class CliReviewer:
                 return await self._run(argv, work_dir, plain_text=plain_text)
 
             if self.provider == "xai":
+                # dontAsk + a read_file-only allowlist, same reasoning as the anthropic branch
+                # above - verified empirically that this combination denies shell/write tool
+                # calls while still allowing the CLI to read prompt.txt without a --always-approve
+                # blanket auto-approval of every tool.
+                #
+                # KNOWN GAP (unlike the anthropic branch's --restricted): read_file itself is
+                # NOT path-scoped to work_dir here. Tested `grok --sandbox <profile>` against a
+                # "read ../outside-file" prompt-injection scenario with several plausible
+                # profile names (strict, sandboxed, readonly, read-only, workdir, cwd-only,
+                # default, restricted) - none blocked the read; the file's real content was
+                # returned every time. No documented list of valid --sandbox profile values was
+                # found. A prompt-injected reviewed file can therefore still get this CLI to
+                # read an arbitrary file the process account can access. Needs either a
+                # confirmed-correct --sandbox profile name from xAI's own docs, or a different
+                # mechanism (e.g. running the CLI itself inside an OS-level sandbox/restricted
+                # account) before this can be closed the same way the anthropic branch was.
                 argv = [
                     self.binary,
                     "--prompt-file", str(prompt_path),
                     "--output-format", "json",
-                    "--always-approve",
+                    "--permission-mode", "dontAsk",
+                    "--tools", "read_file",
                     "--cwd", str(work_dir),
                 ]
                 if self.cli_model:

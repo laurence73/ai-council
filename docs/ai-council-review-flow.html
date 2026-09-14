@@ -310,7 +310,7 @@
 
         <div class="section">
             <h2>⚙️ Environment Setup</h2>
-            <p style="color: var(--text-secondary); margin-bottom: 1rem;">Required API keys in <code>C:\AI COUNCIL\.env</code>:</p>
+            <p style="color: var(--text-secondary); margin-bottom: 1rem;">For direct CLI use, API keys can go in <code>vscode-extension\.env</code> (or plain environment variables). The VS Code extension itself reads keys from its own Settings instead - it never touches this file.</p>
             <div class="json-block">
 <span class="json-key">OPENAI_API_KEY</span>=sk-proj-...     <span style="color: var(--zinc-500)"># GPT-4 (required)</span>
 <span class="json-key">XAI_API_KEY</span>=xai-...            <span style="color: var(--zinc-500)"># Grok (required)</span>
@@ -327,19 +327,19 @@
                     <th>Models Used</th>
                 </tr>
                 <tr>
-                    <td><code>python ai_council.py review file.py</code></td>
+                    <td><code>python vscode-extension/ai_council.py review file.py</code></td>
                     <td>GPT-4 + Grok + Claude (3 models)</td>
                 </tr>
                 <tr>
-                    <td><code>python ai_council.py review file.py --gemini</code></td>
+                    <td><code>python vscode-extension/ai_council.py review file.py --gemini</code></td>
                     <td>GPT-4 + Grok + Claude + Gemini (4 models)</td>
                 </tr>
                 <tr>
-                    <td><code>python ai_council.py review file.py --html</code></td>
+                    <td><code>python vscode-extension/ai_council.py review file.py --html</code></td>
                     <td>3 models + HTML report</td>
                 </tr>
                 <tr>
-                    <td><code>python ai_council.py review file.py --force</code></td>
+                    <td><code>python vscode-extension/ai_council.py review file.py --force</code></td>
                     <td>3 models, bypass cache</td>
                 </tr>
             </table>

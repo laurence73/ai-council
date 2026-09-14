@@ -10,6 +10,7 @@ import sqlite3
 import hashlib
 import argparse
 import uuid
+import html as html_module
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -70,15 +71,13 @@ except ImportError:
     HAS_ANTHROPIC = False
 
 try:
-    from cli_transport import CliReviewer, find_cli, resolve_transport, resolve_cli_model, PROVIDER_CLI, CLI_MODEL_CHOICES, extract_json_object
+    from cli_transport import CliReviewer, find_cli, resolve_cli_model, PROVIDER_CLI, extract_json_object
     HAS_CLI_TRANSPORT = True
 except ImportError:
     HAS_CLI_TRANSPORT = False
     CliReviewer = None
     def find_cli(name):
         return None
-    def resolve_transport(provider, explicit=None):
-        return "api"
     def extract_json_object(text):
         return None
 
@@ -89,7 +88,7 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 DEFAULT_CONFIG = {
     "repo_path": os.environ.get("AI_COUNCIL_REPO", str(Path.cwd())),
     "db_path": str(SCRIPT_DIR / "reviews.db"),
-    "watch_patterns": ["*.cs", "*.razor", "*.ts", "*.tsx", "*.js", "*.py", "*.go", "*.rs"],
+    "watch_patterns": ["*.cs", "*.razor", "*.ts", "*.tsx", "*.js", "*.jsx", "*.py", "*.go", "*.rs", "*.java", "*.cpp", "*.c"],
     "ignore_patterns": ["bin", "obj", "publish", "node_modules", ".git", "__pycache__", "venv"],
     "models": {
         "gpt-4": {"enabled": True, "api_key_env": "OPENAI_API_KEY"},
@@ -148,16 +147,24 @@ def calculate_cost(model: str, input_tokens: int, output_tokens: int, power_mode
 
 
 def format_usage_summary(usage_by_model: dict, power_mode: bool = False) -> str:
-    """Format token usage summary for console output"""
+    """Format token usage summary for console output. A seat that didn't report usage (None,
+    not a fabricated 0 - some CLI seats and Ollama genuinely don't return it) is shown as
+    "usage unavailable" and excluded from the totals, which are marked partial rather than
+    silently understating real usage as a smaller confirmed number."""
     mode_label = " (POWER MODE)" if power_mode else ""
     lines = [f"\n[Token Usage{mode_label}]"]
     total_input = 0
     total_output = 0
     total_cost = 0.0
+    partial = False
 
     for model, usage in usage_by_model.items():
-        input_tokens = usage.get("input_tokens", 0)
-        output_tokens = usage.get("output_tokens", 0)
+        input_tokens = usage.get("input_tokens")
+        output_tokens = usage.get("output_tokens")
+        if input_tokens is None or output_tokens is None:
+            partial = True
+            lines.append(f"  {model.upper():8s} usage not reported")
+            continue
         cost = calculate_cost(model, input_tokens, output_tokens, power_mode)
         total_input += input_tokens
         total_output += output_tokens
@@ -165,7 +172,8 @@ def format_usage_summary(usage_by_model: dict, power_mode: bool = False) -> str:
         lines.append(f"  {model.upper():8s} {input_tokens:,} in / {output_tokens:,} out  (~${cost:.4f})")
 
     lines.append("  " + "-" * 40)
-    lines.append(f"  {'TOTAL':8s} {total_input:,} in / {total_output:,} out  (~${total_cost:.4f})")
+    total_label = "TOTAL (partial)" if partial else "TOTAL"
+    lines.append(f"  {total_label:8s} {total_input:,} in / {total_output:,} out  (~${total_cost:.4f})")
     return "\n".join(lines)
 
 
@@ -524,18 +532,70 @@ class ReviewDatabase:
             CREATE INDEX IF NOT EXISTS idx_debate_rounds_session ON debate_rounds(session_id);
         """)
         self.conn.commit()
+        self._migrate_reviews_cache_key()
 
-    def add_review(self, file_path: str, file_hash: str, model: str, review: dict):
+    def _migrate_reviews_cache_key(self):
+        # A cache lookup keyed on file_hash + model alone can silently serve a review from a
+        # different power mode, resolved model ID, or rubric than the current request -
+        # ALTER TABLE (not CREATE TABLE IF NOT EXISTS, which never touches an existing table)
+        # so a pre-existing reviews.db picks up the missing columns instead of the cache
+        # lookup below silently matching against columns that don't exist yet.
+        existing_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(reviews)")}
+        for column, ddl in (
+            ("model_id", "ALTER TABLE reviews ADD COLUMN model_id TEXT"),
+            ("power_mode", "ALTER TABLE reviews ADD COLUMN power_mode INTEGER"),
+            ("rubric_hash", "ALTER TABLE reviews ADD COLUMN rubric_hash TEXT"),
+        ):
+            if column not in existing_columns:
+                self.conn.execute(ddl)
+        self.conn.commit()
+        self._migrate_consolidation_cache_key()
+
+    def _migrate_consolidation_cache_key(self):
+        # UNIQUE(session_id, debate_round_num) alone means INSERT OR REPLACE in
+        # save_consolidation silently destroys a different consolidator's saved result for the
+        # same round, and get_cached_consolidation can return the wrong consolidator's answer
+        # as though it were the one just requested. consolidated_by must be part of the
+        # uniqueness constraint - SQLite can't ALTER a table's UNIQUE constraint in place, so
+        # this rebuilds the table (only when the old constraint is still in effect) and copies
+        # existing rows across; a pre-existing reviews.db with saved consolidations keeps them.
+        cursor = self.conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='debate_consolidations'")
+        row = cursor.fetchone()
+        if not row or "UNIQUE(session_id, debate_round_num, consolidated_by)" in (row[0] or ""):
+            return
+        self.conn.executescript("""
+            ALTER TABLE debate_consolidations RENAME TO debate_consolidations_old;
+            CREATE TABLE debate_consolidations (
+                id INTEGER PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                debate_round_num INTEGER NOT NULL,
+                consolidated_by TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(session_id, debate_round_num, consolidated_by)
+            );
+            INSERT INTO debate_consolidations (id, session_id, debate_round_num, consolidated_by, result_json, created_at)
+                SELECT id, session_id, debate_round_num, consolidated_by, result_json, created_at FROM debate_consolidations_old;
+            DROP TABLE debate_consolidations_old;
+        """)
+        self.conn.commit()
+
+    def add_review(self, file_path: str, file_hash: str, model: str, review: dict,
+                    model_id: str = None, power_mode: bool = False, rubric_hash: str = None):
         self.conn.execute("""
-            INSERT INTO reviews (file_path, file_hash, model, review_json, quality_score, issue_count)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO reviews (file_path, file_hash, model, review_json, quality_score, issue_count,
+                                  model_id, power_mode, rubric_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             file_path,
             file_hash,
             model,
             json.dumps(review),
             review.get("quality_score", 0),
-            len(review.get("issues", []))
+            len(review.get("issues", [])),
+            model_id,
+            int(power_mode),
+            rubric_hash,
         ))
         self.conn.commit()
 
@@ -549,13 +609,20 @@ class ReviewDatabase:
         """, (file_path, limit))
         return [{"model": r[0], "review": json.loads(r[1]), "created_at": r[2]} for r in cursor]
 
-    def get_latest_by_hash(self, file_hash: str) -> list:
+    def get_latest_by_hash(self, file_hash: str, power_mode: bool = False, rubric_hash: str = None) -> list:
+        # Must match power_mode and rubric_hash exactly (not just file_hash + model) - otherwise
+        # a row cached under a different power mode or rubric could be served as though it came
+        # from the current request. ORDER BY + a per-model row_number so callers see each
+        # model's single MOST RECENT matching review, not an arbitrary one from unordered rows.
         cursor = self.conn.execute("""
-            SELECT model, review_json
-            FROM reviews
-            WHERE file_hash = ?
-        """, (file_hash,))
-        return [{"model": r[0], "review": json.loads(r[1])} for r in cursor]
+            SELECT model, review_json, model_id FROM (
+                SELECT model, review_json, model_id,
+                       ROW_NUMBER() OVER (PARTITION BY model ORDER BY created_at DESC) AS rn
+                FROM reviews
+                WHERE file_hash = ? AND power_mode = ? AND rubric_hash IS ?
+            ) WHERE rn = 1
+        """, (file_hash, int(power_mode), rubric_hash))
+        return [{"model": r[0], "review": json.loads(r[1]), "model_id": r[2]} for r in cursor]
 
     def queue_file(self, file_path: str, priority: str = "normal"):
         self.conn.execute("""
@@ -649,11 +716,11 @@ class ReviewDatabase:
         rounds = self.get_debate_rounds(session_id)
         return rounds[-1] if rounds else None
 
-    def get_cached_consolidation(self, session_id: str, debate_round_num: int) -> Optional[dict]:
+    def get_cached_consolidation(self, session_id: str, debate_round_num: int, consolidated_by: str) -> Optional[dict]:
         cursor = self.conn.execute("""
             SELECT consolidated_by, result_json FROM debate_consolidations
-            WHERE session_id = ? AND debate_round_num = ?
-        """, (session_id, debate_round_num))
+            WHERE session_id = ? AND debate_round_num = ? AND consolidated_by = ?
+        """, (session_id, debate_round_num, consolidated_by))
         row = cursor.fetchone()
         if not row:
             return None
@@ -984,6 +1051,10 @@ class OllamaReviewer:
         self.base_url = base_url.rstrip('/')
         self.model = model
         self.api_key = api_key  # Optional Bearer token
+        # TLS verification stays on by default; a self-hosted endpoint with a self-signed cert
+        # is an explicit opt-in, not the default, since disabling it lets a network attacker
+        # impersonate the endpoint and read both the submitted source code and the credential.
+        self.verify_tls = os.environ.get("AI_COUNCIL_OLLAMA_INSECURE", "").lower() not in ("1", "true", "yes")
 
     def _get_headers(self) -> dict:
         """Build request headers with appropriate auth"""
@@ -1011,7 +1082,7 @@ class OllamaReviewer:
                 "stream": False
             }
 
-            async with httpx.AsyncClient(verify=False) as client:
+            async with httpx.AsyncClient(verify=self.verify_tls) as client:
                 response = await client.post(
                     endpoint,
                     headers=headers,
@@ -1057,7 +1128,7 @@ class OllamaReviewer:
             print(f"  [DEBUG] Ollama model: {self.model}")
             print(f"  [DEBUG] Ollama headers: {list(headers.keys())}")
 
-            async with httpx.AsyncClient(verify=False) as client:  # verify=False for self-signed certs
+            async with httpx.AsyncClient(verify=self.verify_tls) as client:
                 response = await client.post(
                     endpoint,
                     headers=headers,
@@ -1237,13 +1308,12 @@ class ClaudeReviewer:
 class AICouncil:
     """Main orchestrator for multi-model reviews"""
 
-    def __init__(self, config: dict = None, enable_gemini: bool = False, enable_gpt: bool = True, enable_claude: bool = True, enable_grok: bool = True, enable_ollama: bool = False, enable_gpt_cli: bool = False, enable_claude_cli: bool = False, enable_grok_cli: bool = False, ollama_url: str = None, ollama_model: str = None, power_mode: bool = False, db_path: str = None, transports: dict = None):
+    def __init__(self, config: dict = None, enable_gemini: bool = False, enable_gpt: bool = True, enable_claude: bool = True, enable_grok: bool = True, enable_ollama: bool = False, enable_gpt_cli: bool = False, enable_claude_cli: bool = False, enable_grok_cli: bool = False, ollama_url: str = None, ollama_model: str = None, power_mode: bool = False, db_path: str = None):
         import copy
         self.config = config or copy.deepcopy(DEFAULT_CONFIG)
         self.power_mode = power_mode
         self.ollama_url = ollama_url
         self.ollama_model = ollama_model
-        self.transports = transports or {}
         self.enable_gpt_cli = enable_gpt_cli
         self.enable_claude_cli = enable_claude_cli
         self.enable_grok_cli = enable_grok_cli
@@ -1282,7 +1352,7 @@ class AICouncil:
             if not HAS_CLI_TRANSPORT:
                 print(f"[-] {label} CLI unavailable (cli_transport not loaded)")
                 return False
-            cli_name = PROVIDER_CLI[provider][0]
+            cli_name = PROVIDER_CLI[provider]
             binary = find_cli(cli_name)
             if not binary:
                 print(f"[-] {label} CLI not found on PATH ({cli_name})")
@@ -1361,8 +1431,7 @@ class AICouncil:
         # Ollama
         if models.get("ollama", {}).get("enabled"):
             ollama_url = self.ollama_url or os.environ.get(
-                models.get("ollama", {}).get("url_env", "OLLAMA_URL"),
-                "https://wowai-api.worldofworkflows.com:9443",
+                models.get("ollama", {}).get("url_env", "OLLAMA_URL"), ""
             )
             model_name = self.ollama_model or model_names.get("ollama", "qwen3.6:35b-mlx")
             api_key = os.environ.get(models.get("ollama", {}).get("api_key_env", "OLLAMA_API_KEY"))
@@ -1376,7 +1445,7 @@ class AICouncil:
             print("[!] No reviewers configured. Turn on API and/or CLI seats (claude / codex / grok).")
 
     def get_file_hash(self, content: str) -> str:
-        return hashlib.sha256(content.encode()).hexdigest()[:16]
+        return hashlib.sha256(content.encode()).hexdigest()
 
     async def review_file(self, file_path: str, force: bool = False, show_progress: bool = True) -> dict:
         """Review a single file with all enabled models"""
@@ -1384,8 +1453,19 @@ class AICouncil:
         if not path.exists():
             return {"error": f"File not found: {file_path}"}
 
+        # Every caller (VS Code extension, MCP server, raw CLI) can hand this a differently-
+        # shaped string for the same file - the extension always passes an absolute fsPath, a
+        # raw CLI invocation can pass whatever the user typed (often relative), and MCP's
+        # request_review already resolves its own input before calling here. Storing whatever
+        # shape happened to arrive means get_reviews' exact-string WHERE file_path = ? lookup
+        # can silently find nothing for a file that clearly has reviews, just stored under a
+        # different-looking path to the same file. Canonicalize once, here, so every entry
+        # point writes (and can look up) the same string for the same file.
+        file_path = str(path.resolve())
+
         content = path.read_text(encoding="utf-8", errors="ignore")
         file_hash = self.get_file_hash(content)
+        rubric_hash = hashlib.sha256(get_review_rubric().encode()).hexdigest()[:16]
 
         # Get currently enabled models
         enabled_models = set(self.reviewers.keys())
@@ -1395,14 +1475,19 @@ class AICouncil:
         models_to_run = set(enabled_models)
 
         if not force:
-            existing = self.db.get_latest_by_hash(file_hash)
+            existing = self.db.get_latest_by_hash(file_hash, power_mode=self.power_mode, rubric_hash=rubric_hash)
             if existing:
-                # Filter to only include successful reviews for currently enabled models
+                # Filter to only include successful reviews for currently enabled models AND
+                # the currently resolved model ID - a seat whose underlying model changed (a
+                # CLI subscription's model override, or an API model swap) must not silently
+                # reuse a review written by the old model.
                 for item in existing:
                     model = item["model"]
                     review = item["review"]
-                    # Skip cached errors - re-run those models
-                    if model in enabled_models and "error" not in review:
+                    current_model_id = getattr(self.reviewers.get(model), "model", None)
+                    same_model_id = item.get("model_id") == current_model_id
+                    # Skip cached errors, and skip a stale model_id - re-run those models
+                    if model in enabled_models and "error" not in review and same_model_id:
                         cached_reviews[model] = review
                         models_to_run.discard(model)
 
@@ -1428,11 +1513,9 @@ class AICouncil:
             completed = await asyncio.gather(*tasks)
             for model_name, review in completed:
                 results[model_name] = review
-                # Print error immediately for TypeScript parser
-                if "error" in review:
-                    print(f"  [!] {model_name.upper()} ERROR", flush=True)
-                    print(f"  [{model_name.upper()}] ERROR: {str(review['error'])[:200]}", flush=True)
-                self.db.add_review(str(file_path), file_hash, model_name, review)
+                resolved_model_id = getattr(self.reviewers.get(model_name), "model", None)
+                self.db.add_review(str(file_path), file_hash, model_name, review,
+                                    model_id=resolved_model_id, power_mode=self.power_mode, rubric_hash=rubric_hash)
 
         # Stop spinner and print summary
         if tracker:
@@ -2384,8 +2467,16 @@ Every cluster_id must have a ruling."""
         if not debate_round:
             return {"error": f"No debate round found for session {session_id} - run `debate` first"}
 
+        # Resolved before the cache check so the cache is keyed on the SEAT THAT WOULD ACTUALLY
+        # RUN, not the raw (possibly None/"auto") request - otherwise switching consolidators
+        # and re-running could either silently return the previous consolidator's cached
+        # answer, or (worse, pre-fix) overwrite it in the database via INSERT OR REPLACE.
+        consolidator_key, consolidator = self._pick_seat(consolidator_name)
+        if not consolidator:
+            return {"error": "No AI available for consolidation"}
+
         if not force:
-            cached = self.db.get_cached_consolidation(session_id, debate_round["debate_round_num"])
+            cached = self.db.get_cached_consolidation(session_id, debate_round["debate_round_num"], consolidator_key)
             if cached:
                 cached["cached"] = True
                 return cached
@@ -2407,10 +2498,6 @@ Every cluster_id must have a ruling."""
 
         scoped_rounds = self.db.get_scoped_session(session_id)
         file_path = scoped_rounds[0]["file_path"] if scoped_rounds else None
-
-        consolidator_key, consolidator = self._pick_seat(consolidator_name)
-        if not consolidator:
-            return {"error": "No AI available for consolidation"}
 
         print(f"[CONSOLIDATE] Building final review with {consolidator_key} ({len(resolved)} resolved, {len(open_items)} open)...", file=sys.stderr, flush=True)
 
@@ -2584,7 +2671,11 @@ Return the complete fixed file content:"""
 
     def show_reviews(self, file_path: str):
         """Display reviews for a file"""
-        reviews = self.db.get_reviews(file_path)
+        # review_file() stores under the resolved absolute path; get_reviews' exact-string
+        # WHERE file_path = ? lookup only matches that same shape, so a relative path here
+        # (the natural thing to type on the CLI) must be resolved the same way or this finds
+        # nothing for a file that plainly has reviews.
+        reviews = self.db.get_reviews(str(Path(file_path).resolve()))
         if not reviews:
             print(f"No reviews found for: {file_path}")
             return
@@ -2614,11 +2705,19 @@ Return the complete fixed file content:"""
             print()
 
 
+def esc(value) -> str:
+    """Escapes model-generated/reviewed-file-derived text before it lands in HTML markup - a
+    review target or a model's own output is not trusted content, and this report is opened in
+    a real browser (generate_html_report builds every section by string-interpolating review
+    results directly into HTML)."""
+    return html_module.escape(str(value), quote=True)
+
+
 def generate_html_report(file_path: str, reviews: dict, output_path: str = None, power_mode: bool = False, synthesis: dict = None) -> str:
     """Generate a beautiful HTML report for the review results"""
     from datetime import datetime
 
-    filename = Path(file_path).name
+    filename = esc(Path(file_path).name)
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     # Calculate consensus and collect token usage
@@ -2835,23 +2934,36 @@ def generate_html_report(file_path: str, reviews: dict, output_path: str = None,
         </div>
 '''
 
-    # Add token usage section if we have usage data
+    # Add token usage section if we have usage data. A seat that didn't report usage stores
+    # None (not a fabricated 0 - see CliReviewer._normalize_usage/OllamaReviewer), so it must
+    # be excluded from totals rather than summed/divided as though it were a real number.
     if usage_by_model:
-        total_input = sum(u.get("input_tokens", 0) for u in usage_by_model.values())
-        total_output = sum(u.get("output_tokens", 0) for u in usage_by_model.values())
-        total_cost = sum(calculate_cost(m, u.get("input_tokens", 0), u.get("output_tokens", 0), power_mode) for m, u in usage_by_model.items())
+        reported = [u for u in usage_by_model.values() if u.get("input_tokens") is not None and u.get("output_tokens") is not None]
+        has_partial = len(reported) < len(usage_by_model)
+        total_input = sum(u["input_tokens"] for u in reported)
+        total_output = sum(u["output_tokens"] for u in reported)
+        total_cost = sum(calculate_cost(m, u["input_tokens"], u["output_tokens"], power_mode) for m, u in usage_by_model.items() if u.get("input_tokens") is not None and u.get("output_tokens") is not None)
 
         mode_label = " (POWER MODE)" if power_mode else ""
+        partial_label = " - partial, some seats didn't report usage" if has_partial else ""
         html += f'''
         <div class="usage-card">
-            <h3>📊 Token Usage & Cost{mode_label}</h3>
+            <h3>📊 Token Usage & Cost{mode_label}{partial_label}</h3>
             <div class="usage-grid">
 '''
         for model, usage in usage_by_model.items():
-            input_tokens = usage.get("input_tokens", 0)
-            output_tokens = usage.get("output_tokens", 0)
-            cost = calculate_cost(model, input_tokens, output_tokens, power_mode)
+            input_tokens = usage.get("input_tokens")
+            output_tokens = usage.get("output_tokens")
             model_class = "gpt" if "gpt" in model.lower() else ("grok" if "grok" in model.lower() else ("claude" if "claude" in model.lower() else ("ollama" if "ollama" in model.lower() else "gemini")))
+            if input_tokens is None or output_tokens is None:
+                html += f'''
+                <div class="usage-item">
+                    <span class="usage-model {model_class}">{model.upper()}</span>
+                    <span class="usage-tokens">usage not reported</span>
+                </div>
+'''
+                continue
+            cost = calculate_cost(model, input_tokens, output_tokens, power_mode)
             html += f'''
                 <div class="usage-item">
                     <span class="usage-model {model_class}">{model.upper()}</span>
@@ -2860,9 +2972,10 @@ def generate_html_report(file_path: str, reviews: dict, output_path: str = None,
                 </div>
 '''
 
+        total_model_label = "TOTAL (partial)" if has_partial else "TOTAL"
         html += f'''
                 <div class="usage-item usage-total">
-                    <span class="usage-model">TOTAL</span>
+                    <span class="usage-model">{total_model_label}</span>
                     <span class="usage-tokens">{total_input:,} in / {total_output:,} out</span>
                     <span class="usage-cost">${total_cost:.4f}</span>
                 </div>
@@ -2904,19 +3017,19 @@ def generate_html_report(file_path: str, reviews: dict, output_path: str = None,
     if consensus_issues:
         html += '''
         <div class="section">
-            <h2>🎯 Consensus Issues (High Confidence)</h2>
+            <h2>🎯 Consensus Issues (flagged by multiple models)</h2>
 '''
         for issue in consensus_issues:
-            sev = issue.get("severity", "INFO").lower()
+            sev = esc(issue.get("severity", "INFO").lower())
             html += f'''
             <div class="issue {sev}">
                 <div class="issue-header">
-                    <span class="badge {sev}">{issue.get("severity", "INFO")}</span>
+                    <span class="badge {sev}">{esc(issue.get("severity", "INFO"))}</span>
                     <span class="issue-file">{filename}</span>
-                    <span class="issue-line">Line {issue.get("line", "?")}</span>
+                    <span class="issue-line">Line {esc(issue.get("line", "?"))}</span>
                 </div>
-                <div class="issue-desc">{issue.get("description", "")}</div>
-                {"<div class='issue-rec'>💡 " + issue.get("recommendation", "") + "</div>" if issue.get("recommendation") else ""}
+                <div class="issue-desc">{esc(issue.get("description", ""))}</div>
+                {"<div class='issue-rec'>💡 " + esc(issue.get("recommendation", "")) + "</div>" if issue.get("recommendation") else ""}
             </div>
 '''
         html += '        </div>\n'
@@ -2935,11 +3048,11 @@ def generate_html_report(file_path: str, reviews: dict, output_path: str = None,
             <h2>⚖️ Council Verdict</h2>
             <div class="verdict-score">
                 <div>
-                    <div class="verdict-score-number">{final_score}/10</div>
+                    <div class="verdict-score-number">{esc(final_score)}/10</div>
                     <div class="verdict-score-label">Final Score</div>
                 </div>
             </div>
-            <div class="verdict-summary">{verdict}</div>
+            <div class="verdict-summary">{esc(verdict)}</div>
 '''
 
         if priority_ranking:
@@ -2954,7 +3067,7 @@ def generate_html_report(file_path: str, reviews: dict, output_path: str = None,
                     issue_text = item.get("issue", str(item))
                 else:
                     issue_text = str(item)
-                html += f'                    <li class="priority">{issue_text}</li>\n'
+                html += f'                    <li class="priority">{esc(issue_text)}</li>\n'
             html += '''                </ol>
             </div>
 '''
@@ -2970,7 +3083,7 @@ def generate_html_report(file_path: str, reviews: dict, output_path: str = None,
                     item_text = item.get("description", item.get("issue", str(item)))
                 else:
                     item_text = str(item)
-                html += f'                    <li class="disputed">{item_text}</li>\n'
+                html += f'                    <li class="disputed">{esc(item_text)}</li>\n'
             html += '''                </ul>
             </div>
 '''
@@ -2986,13 +3099,13 @@ def generate_html_report(file_path: str, reviews: dict, output_path: str = None,
                     item_text = item.get("description", item.get("issue", str(item)))
                 else:
                     item_text = str(item)
-                html += f'                    <li class="false-positive">{item_text}</li>\n'
+                html += f'                    <li class="false-positive">{esc(item_text)}</li>\n'
             html += '''                </ul>
             </div>
 '''
 
         html += f'''
-            <div class="synthesizer">Synthesized by {synthesizer.upper()}</div>
+            <div class="synthesizer">Synthesized by {esc(synthesizer.upper())}</div>
         </div>
 '''
 
@@ -3012,7 +3125,7 @@ def generate_html_report(file_path: str, reviews: dict, output_path: str = None,
                 <div class="issue-header">
                     <span class="badge critical">ERROR</span>
                 </div>
-                <div class="issue-desc">{review["error"]}</div>
+                <div class="issue-desc">{esc(review["error"])}</div>
             </div>
         </div>
 '''
@@ -3024,19 +3137,19 @@ def generate_html_report(file_path: str, reviews: dict, output_path: str = None,
         html += f'''
         <div class="section">
             <h2>{emoji} {model.upper()} Review</h2>
-            <div class="summary">{summary}</div>
+            <div class="summary">{esc(summary)}</div>
 '''
         for issue in issues:
-            sev = issue.get("severity", "INFO").lower()
+            sev = esc(issue.get("severity", "INFO").lower())
             html += f'''
             <div class="issue {sev}">
                 <div class="issue-header">
-                    <span class="badge {sev}">{issue.get("severity", "INFO")}</span>
+                    <span class="badge {sev}">{esc(issue.get("severity", "INFO"))}</span>
                     <span class="issue-file">{filename}</span>
-                    <span class="issue-line">Line {issue.get("line", "?")}</span>
+                    <span class="issue-line">Line {esc(issue.get("line", "?"))}</span>
                 </div>
-                <div class="issue-desc">{issue.get("description", "")}</div>
-                {"<div class='issue-rec'>💡 " + issue.get("recommendation", "") + "</div>" if issue.get("recommendation") else ""}
+                <div class="issue-desc">{esc(issue.get("description", ""))}</div>
+                {"<div class='issue-rec'>💡 " + esc(issue.get("recommendation", "")) + "</div>" if issue.get("recommendation") else ""}
             </div>
 '''
         html += '        </div>\n'
@@ -3099,12 +3212,6 @@ def main():
     parser.add_argument("--ollama-url", help="Ollama server URL")
     parser.add_argument("--ollama-model", help="Ollama model to use")
     
-    parser.add_argument("--transport-claude", choices=["api", "cli", "auto"], default=None,
-                        help="Claude auth transport: api key, claude CLI, or auto")
-    parser.add_argument("--transport-gpt", choices=["api", "cli", "auto"], default=None,
-                        help="GPT auth transport: api key, codex CLI, or auto")
-    parser.add_argument("--transport-grok", choices=["api", "cli", "auto"], default=None,
-                        help="Grok auth transport: api key, grok CLI, or auto (legacy)")
     parser.add_argument("--claude-cli", action="store_true",
                         help="Add Claude CLI seat (subscription) alongside any Claude API seat")
     parser.add_argument("--gpt-cli", action="store_true",
@@ -3186,6 +3293,11 @@ def main():
     debate_parser.add_argument("--session", required=True, help="Session ID from scoped-review")
     debate_parser.add_argument("--mode", choices=["all_to_all", "arbiter"], help="Debate mode (default: auto from seat count - 3 seats = all_to_all, 4+ = arbiter)")
     debate_parser.add_argument("--arbiter", help="Seat that rules on disputes instead of debating (required for --mode arbiter or when auto-selecting arbiter mode with 4+ seats)")
+    debate_parser.add_argument("--power", "-p", action="store_true", help="Use premium models (higher cost, better results)")
+    debate_parser.add_argument("--gemini", "-g", action="store_true", help="Include Gemini in review")
+    debate_parser.add_argument("--no-gpt", action="store_true", help="Disable GPT-4 reviewer")
+    debate_parser.add_argument("--no-claude", action="store_true", help="Disable Claude reviewer")
+    debate_parser.add_argument("--no-grok", action="store_true", help="Disable Grok reviewer")
     debate_parser.add_argument("--json", action="store_true", help="Print a single JSON result object instead of human-readable output")
 
     # Consolidate command (pruned final review from the latest debate round)
@@ -3193,6 +3305,11 @@ def main():
     consolidate_parser.add_argument("--session", required=True, help="Session ID from scoped-review")
     consolidate_parser.add_argument("--consolidator", choices=['claude', 'claude-cli', 'gpt-4', 'gpt-cli', 'gemini', 'grok', 'grok-cli', 'ollama'], help="AI to write the consolidated review (default: auto/best available)")
     consolidate_parser.add_argument("--force", "-f", action="store_true", help="Re-run consolidation even if this debate round already has a cached result")
+    consolidate_parser.add_argument("--power", "-p", action="store_true", help="Use premium models (higher cost, better results)")
+    consolidate_parser.add_argument("--gemini", "-g", action="store_true", help="Include Gemini in review")
+    consolidate_parser.add_argument("--no-gpt", action="store_true", help="Disable GPT-4 reviewer")
+    consolidate_parser.add_argument("--no-claude", action="store_true", help="Disable Claude reviewer")
+    consolidate_parser.add_argument("--no-grok", action="store_true", help="Disable Grok reviewer")
     consolidate_parser.add_argument("--json", action="store_true", help="Print a single JSON result object instead of human-readable output")
 
     # Fix command
@@ -3215,7 +3332,7 @@ def main():
 
     # Watch command
     watch_parser = subparsers.add_parser("watch", help="Watch for file changes")
-    watch_parser.add_argument("--path", "-p", default="C:/RUBI/RUBI1", help="Path to watch")
+    watch_parser.add_argument("--path", "-p", default=".", help="Path to watch")
 
     args = parser.parse_args()
 
@@ -3229,13 +3346,6 @@ def main():
     db_path = getattr(args, 'db', None)
     ollama_url = getattr(args, 'ollama_url', None)
     ollama_model = getattr(args, 'ollama_model', None)
-    transports = {}
-    if getattr(args, "transport_claude", None):
-        transports["claude"] = args.transport_claude
-    if getattr(args, "transport_gpt", None):
-        transports["gpt-4"] = args.transport_gpt
-    if getattr(args, "transport_grok", None):
-        transports["grok"] = args.transport_grok
 
     # Optional CLI model overrides via flags -> env consumed by CliReviewer
     if getattr(args, "claude_cli_model", None):
@@ -3248,18 +3358,14 @@ def main():
     enable_claude_cli = bool(getattr(args, "claude_cli", False))
     enable_gpt_cli = bool(getattr(args, "gpt_cli", False))
     enable_grok_cli = bool(getattr(args, "grok_cli", False))
-    # Legacy: --transport-X cli enables that CLI seat
-    if transports.get("claude") == "cli":
-        enable_claude_cli = True
-    if transports.get("gpt-4") == "cli":
-        enable_gpt_cli = True
-    if transports.get("grok") == "cli":
-        enable_grok_cli = True
 
     # In --json mode (scoped-* commands, consumed programmatically by the VS Code extension),
     # setup's informational prints ("[+] Claude reviewer enabled...") must not land on stdout -
     # they'd corrupt the single JSON line the caller expects. Redirect to stderr for construction.
-    json_mode = bool(getattr(args, "json", False))
+    # `fix` has the same problem even without --json: the extension captures ALL of stdout as
+    # the fixed source (sidePanel.ts writes it straight into a diff-view temp file), so a setup
+    # banner ahead of the real fixed code would show up as bogus lines prepended to the diff.
+    json_mode = bool(getattr(args, "json", False)) or args.command == "fix"
     _stdout_for_setup = sys.stderr if json_mode else sys.stdout
     _real_stdout = sys.stdout
     sys.stdout = _stdout_for_setup
@@ -3277,7 +3383,6 @@ def main():
             ollama_model=ollama_model,
             power_mode=power_mode,
             db_path=db_path,
-            transports=transports or None,
         )
     finally:
         sys.stdout = _real_stdout
