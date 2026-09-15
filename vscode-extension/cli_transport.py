@@ -58,6 +58,46 @@ def build_review_prompt(scope: str = None) -> str:
         parts.append(f"Additionally, focus the review on this specific request:\n{scope}")
     return "\n\n".join(parts)
 
+_INCOMPLETE_REVIEW_SUMMARY = re.compile(
+    r"^\s*(reading|analyzing|i('ll| will)|let me|forming|looking (at|over)|before forming)",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_incomplete_cli_review(parsed: dict) -> Optional[str]:
+    """Grok CLI (and similar agent CLIs) can emit schema-shaped JSON whose summary is a
+    first-turn status line, not a review - live report had summary 'Reading the full prompt
+    and architecture document before forming an independent review.', issues=[], score 0,
+    ~191 output tokens. Treat that as a failed seat, not a clean 0-issue review.
+
+    A second live report showed the same status-line text had migrated INTO the issues array
+    instead of staying in summary alone - summary "Loading source materials.", one issue whose
+    description was "Reading the full architecture document and review request before
+    scoring." at severity INFO. The original `if issues: return None` treated any non-empty
+    issues list as proof of a real review and never inspected what the issue actually said,
+    so this specific shape slipped through as a genuine 5/10, 1-issue review and contributed to
+    consensus/averages alongside every other seat's real findings. A real review can
+    legitimately have exactly one genuine finding, so "exactly one issue" alone is not the
+    signal - the issue's own description must ALSO match the same status-line pattern used for
+    the summary check, not merely be short or low-severity."""
+    issues = parsed.get("issues") or []
+    summary = (parsed.get("summary") or "").strip()
+    if len(issues) == 1:
+        sole_issue_desc = (issues[0].get("description") or "").strip() if isinstance(issues[0], dict) else ""
+        if _INCOMPLETE_REVIEW_SUMMARY.match(sole_issue_desc):
+            return f"CLI returned a status line disguised as its only finding, not a real review: {sole_issue_desc[:160]}"
+    if issues:
+        return None
+    if _INCOMPLETE_REVIEW_SUMMARY.match(summary):
+        return f"CLI returned an incomplete review (status/plan summary, no findings): {summary[:160]}"
+    # Schema-default filler only - a real "this file is a disaster" review can score 0 with
+    # a genuine summary. Live Claude regression: json-schema emitted quality_score 0,
+    # issues=[], summary "placeholder" and this function rejected it as incomplete.
+    if summary.lower() in ("placeholder", "n/a", "none", "todo", "tbd", "string"):
+        return f"CLI returned a schema-default summary {summary!r} with no findings"
+    return None
+
+
 REVIEW_JSON_SCHEMA = {
     "type": "object",
     "properties": {
@@ -81,27 +121,23 @@ REVIEW_JSON_SCHEMA = {
     "required": ["issues", "summary", "quality_score"],
 }
 
-# Sensible subscription defaults / picker options
-CLI_MODEL_CHOICES = {
-    "anthropic": ["sonnet", "opus", "haiku", "claude-sonnet-4-5", "claude-opus-4-5"],
-    "xai": ["grok-4.6", "grok-4.5"],
-    "openai": ["gpt-5.2", "gpt-5", "o3", "o4-mini", "codex"],
-}
-
 CLI_MODEL_DEFAULTS = {
-    "anthropic": "sonnet",
-    "xai": "grok-4.6",
-    # No default: valid model names are gated by the ChatGPT account's entitlement,
-    # and a hardcoded guess (e.g. "gpt-5.2") errors as "not supported when using
-    # Codex with a ChatGPT account" for accounts that don't have it. Omitting -m
-    # lets codex exec pick a model the account can actually use.
+    # No forced defaults for any provider - the extension no longer offers a model picker or
+    # ships an opinionated guess (e.g. "sonnet"), since that silently overrode whatever the
+    # user's own CLI login/account actually resolves to by default. Omitting --model/-m lets
+    # each CLI pick whatever its own active session/account default actually is; the
+    # AI_COUNCIL_CLI_MODEL_* env vars remain a manual override for someone who wants one.
+    "anthropic": "",
+    "xai": "",
     "openai": "",
 }
 
+# Provider -> CLI binary name. Used to build the reviewer's display name (f"{PROVIDER_CLI[p]}-cli")
+# and to check/spawn the actual binary.
 PROVIDER_CLI = {
-    "openai": ("codex", "AI_COUNCIL_TRANSPORT_OPENAI", "gpt-4"),
-    "anthropic": ("claude", "AI_COUNCIL_TRANSPORT_ANTHROPIC", "claude"),
-    "xai": ("grok", "AI_COUNCIL_TRANSPORT_XAI", "grok"),
+    "openai": "codex",
+    "anthropic": "claude",
+    "xai": "grok",
 }
 
 API_KEY_ENV = {
@@ -243,25 +279,6 @@ def extract_json_object(text: str) -> Optional[dict]:
     return None
 
 
-def resolve_transport(provider: str, explicit: Optional[str] = None) -> str:
-    env_name = PROVIDER_CLI.get(provider, (None, None, None))[1]
-    raw = (explicit or (os.environ.get(env_name) if env_name else None) or "auto").strip().lower()
-    if raw not in ("api", "cli", "auto"):
-        raw = "auto"
-    cli_name = PROVIDER_CLI[provider][0]
-    has_cli = bool(find_cli(cli_name))
-    has_key = bool(os.environ.get(API_KEY_ENV[provider], "").strip())
-    if raw == "cli":
-        return "cli" if has_cli else "none"
-    if raw == "api":
-        return "api" if has_key else "none"
-    if has_cli:
-        return "cli"
-    if has_key:
-        return "api"
-    return "none"
-
-
 def resolve_cli_model(provider: str, explicit: Optional[str] = None) -> str:
     env_name = CLI_MODEL_ENV.get(provider)
     raw = (explicit or (os.environ.get(env_name) if env_name else None) or "").strip()
@@ -269,20 +286,23 @@ def resolve_cli_model(provider: str, explicit: Optional[str] = None) -> str:
 
 
 class CliReviewer:
-    def __init__(self, provider: str, binary: str, model: str = None, timeout: int = 240):
+    def __init__(self, provider: str, binary: str, model: str = None, timeout: int = 480):
         self.provider = provider
         self.binary = binary
         self.cli_model = model or resolve_cli_model(provider)
-        self.model = f"{PROVIDER_CLI[provider][0]}-cli:{self.cli_model}" if self.cli_model else f"{PROVIDER_CLI[provider][0]}-cli"
+        self.model = f"{PROVIDER_CLI[provider]}-cli:{self.cli_model}" if self.cli_model else f"{PROVIDER_CLI[provider]}-cli"
         self.timeout = timeout
 
     @staticmethod
     def _normalize_usage(raw_usage: dict) -> dict:
-        """Each CLI's usage envelope uses different key names - normalize to one shape."""
-        if not isinstance(raw_usage, dict):
-            return {"input_tokens": 0, "output_tokens": 0}
-        input_tokens = raw_usage.get("input_tokens", raw_usage.get("prompt_tokens", 0)) or 0
-        output_tokens = raw_usage.get("output_tokens", raw_usage.get("completion_tokens", 0)) or 0
+        """Each CLI's usage envelope uses different key names - normalize to one shape.
+        Missing/unparseable usage becomes None (not a fabricated 0): a real zero and "this CLI
+        didn't report usage for this call" must stay distinguishable, same pattern already used
+        by OllamaReviewer and the debate token-usage accumulator (ai_council.py's _add_usage)."""
+        if not isinstance(raw_usage, dict) or not raw_usage:
+            return {"input_tokens": None, "output_tokens": None}
+        input_tokens = raw_usage.get("input_tokens", raw_usage.get("prompt_tokens"))
+        output_tokens = raw_usage.get("output_tokens", raw_usage.get("completion_tokens"))
         return {"input_tokens": input_tokens, "output_tokens": output_tokens}
 
     async def _run(self, argv: list, cwd: Path, stdin_text: Optional[str] = None, plain_text: bool = False) -> tuple:
@@ -315,8 +335,12 @@ class CliReviewer:
         stdout = (stdout_b or b"").decode("utf-8", errors="replace")
         stderr = (stderr_b or b"").decode("utf-8", errors="replace")
 
-        # Detect auth errors in stderr
-        auth_keywords = ["refresh token", "sign in again", "unauthorized", "login", "authentication", "401"]
+        # Detect auth errors in stderr. Do NOT use the bare words "login"/"authentication" for
+        # Grok: its leader prints those while starting, which falsely AUTH_REQUIRED'd a live
+        # session. Grok's real expiry wording still includes "unauthorized" / "401" / "sign in".
+        auth_keywords = ["refresh token", "sign in again", "unauthorized", "401"]
+        if self.provider != "xai":
+            auth_keywords.extend(["login", "authentication"])
         stderr_lower = stderr.lower()
         if any(kw in stderr_lower for kw in auth_keywords):
             cli_name = self.binary.split("/")[-1].split("\\")[-1]
@@ -325,7 +349,7 @@ class CliReviewer:
         if proc.returncode not in (0, None) and not stdout.strip():
             raise RuntimeError(f"{self.model} CLI exited {proc.returncode}: {(stderr or stdout)[:500]}")
 
-        no_usage = {"input_tokens": 0, "output_tokens": 0}
+        no_usage = {"input_tokens": None, "output_tokens": None}
 
         # plain_text (fix mode): unwrap straight to the model's actual reply text,
         # rather than leaving JSON extraction (extract_json_object) to the caller.
@@ -389,8 +413,14 @@ class CliReviewer:
             envelope = json.loads(stdout.strip())
             if isinstance(envelope, dict):
                 usage = self._normalize_usage(envelope.get("usage", {}))
-                if isinstance(envelope.get("structured_output"), (dict, list)):
-                    return json.dumps(envelope["structured_output"]), usage
+                so = envelope.get("structured_output")
+                if isinstance(so, dict) and so.get("issues") is not None:
+                    if not _looks_like_incomplete_cli_review(so):
+                        return json.dumps(so), usage
+                    # Stub schema object - fall through so .text/.result can still hold a
+                    # real review that extract_json_object will find.
+                if isinstance(so, list):
+                    return json.dumps(so), usage
                 if isinstance(envelope.get("result"), str):
                     return envelope["result"], usage
                 # Keep full Grok envelope so extract_json_object can unwrap .text
@@ -413,11 +443,21 @@ class CliReviewer:
             plain_text = mode != "review"
 
             if self.provider == "anthropic":
+                # dontAsk (not bypassPermissions) + an explicit Read-only allowlist: reviewed
+                # source/scope text reaches this CLI, so a prompt-injected file must not be able
+                # to trigger a Write/Bash/etc. tool call - verified empirically that dontAsk
+                # still denies any tool outside --allowedTools. --restricted additionally
+                # confines Read itself to work_dir (+ --add-dir, unused here) - verified
+                # empirically that a prompt asking to read a file outside work_dir via a
+                # relative ../ path is denied (permission_denials shows the Read call itself
+                # blocked, not just the model declining), while a real in-work_dir read still
+                # succeeds normally.
                 argv = [
                     self.binary, "-p",
                     "--output-format", "json",
-                    "--permission-mode", "bypassPermissions",
+                    "--permission-mode", "dontAsk",
                     "--allowedTools", "Read",
+                    "--restricted",
                 ]
                 if plain_text:
                     user = (
@@ -439,11 +479,20 @@ class CliReviewer:
                 return await self._run(argv, work_dir, plain_text=plain_text)
 
             if self.provider == "xai":
+                # Live probe (tiny.py): grok --output-format json returns
+                #   {"text": "<stringified review JSON>", "thought": "...", "usage": {...}}
+                # `--prompt-file` is single-turn. A 40k-char architecture doc made that one
+                # turn a status sentence, so extract_json_object on the envelope found no
+                # `issues` and the seat died as "unparseable". Do not pass --tools / --json-schema
+                # (wander / stub-in-schema). --no-plan only. Unwrap is Grok-specific in
+                # _parse_grok_envelope; body is capped in review() so one turn can finish.
                 argv = [
                     self.binary,
                     "--prompt-file", str(prompt_path),
                     "--output-format", "json",
-                    "--always-approve",
+                    "--permission-mode", "dontAsk",
+                    "--no-plan",
+                    "--disable-web-search",
                     "--cwd", str(work_dir),
                 ]
                 if self.cli_model:
@@ -459,60 +508,250 @@ class CliReviewer:
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
 
-    async def check_auth(self) -> dict:
-        """Quick auth check - returns {"ok": True} or {"ok": False, "error": "..."}"""
-        import sys
-        print(f"[AUTH-CHECK-V3] {self.model} checking auth...", file=sys.stderr, flush=True)
+    def _review_prompt(self, file_name: str, body: str, scope: str = None, *, strict: bool = False) -> str:
+        # JSON instruction FIRST. Grok's first generation is often a status line; if that
+        # line is "I'm about to review" it used to get schema-stuffed into issues[0].
+        lead = (
+            "Reply with exactly one JSON object and nothing else. "
+            "Do not announce that you will read or review the file. "
+            "Do not emit a status or plan sentence. The JSON is the entire answer.\n\n"
+        )
+        if strict:
+            lead = (
+                "Your previous reply was a status/plan sentence, not a review. "
+                "This time output ONLY the JSON object. No preamble.\n\n"
+            )
+        return (
+            f"{lead}{build_review_prompt(scope)}\n\n"
+            f"File: {file_name}\n\n"
+            f"```\n{body}\n```\n"
+        )
+
+    def _parse_grok_envelope(self, raw: str) -> Optional[dict]:
+        """Grok --output-format json wraps the model reply as a STRING in .text, not as
+        an object. Walking the whole envelope with extract_json_object hits the outer
+        dict first (no `issues`) and, on a long review, never unwraps .text. Probe
+        confirmed: {"text": "{\"issues\":[...],...}", "thought": "..." }."""
+        if not raw or not raw.strip():
+            return None
+        blobs = []
         try:
-            raw, _ = await self._call_api("Reply with just: OK", mode="ping")
-            print(f"[AUTH-CHECK-V3] {self.model} got response: {raw[:100] if raw else 'EMPTY'}", file=sys.stderr, flush=True)
-            return {"ok": True}
-        except RuntimeError as e:
-            err = str(e)
-            print(f"[AUTH-CHECK-V3] {self.model} RuntimeError: {err[:100]}", file=sys.stderr, flush=True)
-            return {"ok": False, "error": err}
-        except Exception as e:
-            print(f"[AUTH-CHECK-V3] {self.model} Exception: {str(e)[:100]}", file=sys.stderr, flush=True)
-            return {"ok": False, "error": str(e)}
+            blobs.append(json.loads(raw.strip()))
+        except json.JSONDecodeError:
+            for line in raw.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    blobs.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        best_stub = None
+        for obj in blobs:
+            if not isinstance(obj, dict):
+                continue
+            for val in (obj.get("text"), obj.get("result"), obj.get("structured_output")):
+                parsed = None
+                if isinstance(val, str) and val.strip():
+                    parsed = extract_json_object(val)
+                elif isinstance(val, dict) and "issues" in val:
+                    parsed = val
+                if not parsed or "issues" not in parsed:
+                    continue
+                if not _looks_like_incomplete_cli_review(parsed):
+                    return parsed
+                best_stub = parsed
+        if best_stub:
+            return best_stub
+        return extract_json_object(raw)
+
+    def _parse_cli_review(self, raw: str, usage: dict) -> dict:
+        parsed = self._parse_grok_envelope(raw) if self.provider == "xai" else extract_json_object(raw)
+        if not parsed or "issues" not in parsed:
+            return {
+                "error": f"CLI returned unparseable review ({self.model})",
+                "issues": [],
+                "quality_score": 0,
+                "raw_preview": (raw or "")[:500],
+            }
+        parsed.setdefault("summary", "")
+        parsed.setdefault("quality_score", 5)
+        stub = _looks_like_incomplete_cli_review(parsed)
+        if stub:
+            return {
+                "error": stub,
+                "issues": [],
+                "quality_score": 0,
+                "raw_preview": (raw or "")[:500],
+                "_transport": "cli",
+            }
+        parsed["_transport"] = "cli"
+        parsed["_cli_model"] = self.cli_model
+        parsed["_usage"] = {"input_tokens": usage["input_tokens"], "output_tokens": usage["output_tokens"]}
+        return parsed
+
+    # Same excerpt and same chunking for every CLI seat. 40k is the council picture;
+    # 16k is one review call so a long file is covered in parts and merged, not
+    # truncated for one seat and full for another.
+    CLI_REVIEW_MAX_CHARS = 40000
+    CLI_CHUNK_CHARS = 16000
+
+    # A boundary-seeking split is allowed to overrun `limit` a bit while it waits for a real
+    # class/def/# line (keeps a chunk from cutting a function in half) - but that wait cannot be
+    # unbounded. This is the actual hard ceiling: once a chunk has grown past HARD_CAP_MULTIPLIER
+    # times the limit with still no boundary in sight, it force-splits at the current line
+    # regardless. A file with NO class/def/# markers anywhere (a config file, a long generated
+    # data file, a single giant expression) previously never split at all past this point -
+    # size + line_size > limit alone was gated on `boundary`, so no boundary ever meant no split,
+    # for any total file length. Reproduced: a file made entirely of non-boundary lines whose
+    # total length exceeded `limit` returned exactly one over-limit chunk.
+    _CHUNK_HARD_CAP_MULTIPLIER = 2
+
+    def _chunk_body(self, code: str, limit: int) -> list:
+        # Returns [(chunk_text, start_line_1based), ...] - callers need each chunk's starting
+        # line to translate a model's own "line N" (always relative to the chunk it was shown,
+        # never the whole file) back to an absolute file line.
+        #
+        # Two distinct over-limit cases, both now hard-capped (previously neither was):
+        #  1. A single line longer than `limit` (a 40k-character minified/generated line, or one
+        #     huge string literal) never matches a boundary marker - force-split mid-line by
+        #     character count (reproduced: a single 40,001-character line stayed one
+        #     40,001-character chunk against a 16,000-character limit).
+        #  2. Many lines, none of them a boundary, whose ACCUMULATED size keeps growing with no
+        #     boundary ever arriving to trigger a split - force-split at the hard cap
+        #     (_CHUNK_HARD_CAP_MULTIPLIER * limit) regardless of boundary status, rather than
+        #     waiting forever for a class/def/# line that may never come.
+        hard_cap = limit * self._CHUNK_HARD_CAP_MULTIPLIER
+        if len(code) <= limit:
+            return [(code, 1)]
+        chunks, current, size = [], [], 0
+        current_start_line = 1
+        line_num = 1
+        for line in code.split("\n"):
+            line_size = len(line) + 1
+            boundary = line.strip().startswith(("class ", "def ", "async def ", "# ", "## "))
+            # line_size > limit MUST be checked before the boundary branch, not after it as an
+            # elif - an oversized line that also happens to start with "def "/"class "/"# " (a
+            # very long single-line function signature, or a long comment) matched the boundary
+            # condition first, so it was accepted whole into `current` as a brand new chunk of
+            # just that one line - which then never got the oversized-single-line hard-split, and
+            # skipped this branch entirely as if it belonged in the OTHER `elif` chain below,
+            # bypassing both the plain limit and the accumulated-size hard cap. Reproduced (real
+            # sanity-review regression): "x\n" + "def " + "x"*40000 against limit=16000 produced
+            # one 40,004-character chunk - the exact "boundary line, but also oversized" case this
+            # reordering fixes. This branch now applies unconditionally to any line whose OWN
+            # size exceeds the limit, whether or not it looks like a boundary.
+            if line_size > limit:
+                # This single line alone is bigger than the whole limit - no boundary split can
+                # ever apply to it. Flush whatever was accumulated so far, then hard-split the
+                # oversized line itself into limit-sized character slices so no chunk this
+                # function returns can ever exceed `limit`, regardless of line structure.
+                if current:
+                    chunks.append(("\n".join(current), current_start_line))
+                    current, size = [], 0
+                for i in range(0, len(line), limit):
+                    piece = line[i:i + limit]
+                    chunks.append((piece, line_num))
+                current_start_line = line_num + 1
+            elif size + line_size > limit and boundary and current:
+                chunks.append(("\n".join(current), current_start_line))
+                current, size = [line], line_size
+                current_start_line = line_num
+            elif size + line_size > hard_cap:
+                # No boundary line has shown up for a long time - stop waiting and split here,
+                # even mid-function, rather than letting the chunk grow without bound.
+                chunks.append(("\n".join(current), current_start_line))
+                current, size = [line], line_size
+                current_start_line = line_num
+            else:
+                if not current:
+                    current_start_line = line_num
+                current.append(line)
+                size += line_size
+            line_num += 1
+        if current:
+            chunks.append(("\n".join(current), current_start_line))
+        return chunks or [(code, 1)]
+
+    async def _review_one_body(self, body: str, file_name: str, scope: str = None, chunk_note: str = "") -> dict:
+        if self.provider == "xai":
+            prompt = self._review_prompt(file_name + chunk_note, body, scope)
+        else:
+            prompt = (
+                f"{build_review_prompt(scope)}\n\n"
+                f"File: {file_name}{chunk_note}\n\n"
+                f"```\n{body}\n```\n\n"
+                "IMPORTANT: Respond with ONLY valid JSON matching the schema above. "
+                "No markdown fences, no preamble."
+            )
+        raw, usage = await self._call_api(prompt)
+        result = self._parse_cli_review(raw, usage)
+        if result.get("error") and self.provider == "xai":
+            raw2, usage2 = await self._call_api(self._review_prompt(file_name + chunk_note, body, scope, strict=True))
+            retry = self._parse_cli_review(raw2, usage2)
+            if not retry.get("error"):
+                return retry
+        return result
 
     async def review(self, code: str, file_path: str, scope: str = None) -> dict:
-        # Quick auth pre-check
-        auth = await self.check_auth()
-        if not auth.get("ok"):
-            import sys
-            err_msg = auth.get("error", "CLI auth check failed")
-            print(f"[AUTH-FAIL] {self.model} returning error: {err_msg[:80]}", file=sys.stderr, flush=True)
-            return {"error": err_msg, "issues": [], "quality_score": 0, "_transport": "cli"}
-
-        max_chars = 40000
-        body = code if len(code) <= max_chars else code[:max_chars] + "\n...(truncated for CLI review)..."
-        prompt = (
-            f"{build_review_prompt(scope)}\n\n"
-            f"File: {file_path}\n\n"
-            f"```\n{body}\n```\n\n"
-            "IMPORTANT: Respond with ONLY valid JSON matching the schema above. "
-            "No markdown fences, no preamble."
-        )
+        body = code if len(code) <= self.CLI_REVIEW_MAX_CHARS else code[:self.CLI_REVIEW_MAX_CHARS] + "\n...(truncated for CLI review)..."
+        file_name = Path(file_path).name
         try:
-            raw, usage = await self._call_api(prompt)
-            parsed = extract_json_object(raw)
-            if not parsed or "issues" not in parsed:
+            parts = self._chunk_body(body, self.CLI_CHUNK_CHARS)
+            if len(parts) == 1:
+                return await self._review_one_body(parts[0][0], file_name, scope)
+            issues, summaries, scores = [], [], []
+            in_tok = out_tok = 0
+            # Every failed part used to be silently dropped as long as ONE part succeeded, while
+            # the summary still said "Reviewed in N parts" - indistinguishable from a genuinely
+            # complete review even though real findings in the failed part(s) were missing
+            # entirely with no indication anything was wrong. failed_parts tracks which 1-based
+            # part indexes failed and why, surfaced in both the summary text and a dedicated
+            # field, so a partial result is explicit rather than presented as complete.
+            failed_parts = []
+            for i, (part_text, start_line) in enumerate(parts):
+                note = f" (part {i + 1}/{len(parts)} of the same file, starting at line {start_line}; report each issue's \"line\" relative to THIS excerpt, i.e. line 1 = line {start_line} of the real file - review this part fully)"
+                result = await self._review_one_body(part_text, file_name, scope, note)
+                usage = result.get("_usage") or {}
+                in_tok += usage.get("input_tokens") or 0
+                out_tok += usage.get("output_tokens") or 0
+                if result.get("error"):
+                    failed_parts.append({"part": i + 1, "error": result["error"]})
+                    continue
+                # The model is asked to report lines relative to the excerpt it was shown (a
+                # chunk boundary is not something it can see past), so translate back to an
+                # absolute file line here: chunk-relative line L becomes (start_line - 1) + L.
+                offset = start_line - 1
+                for issue in (result.get("issues") or []):
+                    issue = dict(issue)
+                    raw_line = issue.get("line")
+                    if isinstance(raw_line, (int, float)):
+                        issue["line"] = int(raw_line) + offset
+                    issues.append(issue)
+                if result.get("summary"):
+                    summaries.append(result["summary"])
+                scores.append(float(result.get("quality_score") or 0))
+            if not scores:
                 return {
-                    "error": f"CLI returned unparseable review ({self.model})",
+                    "error": failed_parts[0]["error"] if failed_parts else f"CLI returned unparseable review ({self.model})",
                     "issues": [],
                     "quality_score": 0,
-                    "raw_preview": (raw or "")[:500],
+                    "_transport": "cli",
                 }
-            parsed.setdefault("summary", "")
-            parsed.setdefault("quality_score", 5)
-            parsed["_transport"] = "cli"
-            parsed["_cli_model"] = self.cli_model
-            # Key names match every API-based reviewer's _usage shape (input_tokens/
-            # output_tokens) - this used to be {"input", "output", "cost"} instead, which
-            # generate_html_report's usage_by_model reader (input_tokens/output_tokens) never
-            # matched, so every CLI seat's real, captured usage silently rendered as 0 in the
-            # report despite being correctly recorded in the database the whole time.
-            parsed["_usage"] = {"input_tokens": usage["input_tokens"], "output_tokens": usage["output_tokens"]}
-            return parsed
+            succeeded = len(parts) - len(failed_parts)
+            partial_note = (
+                f" [INCOMPLETE - {len(failed_parts)}/{len(parts)} part(s) failed, findings from those parts are MISSING]"
+                if failed_parts else ""
+            )
+            return {
+                "issues": issues,
+                "summary": f"Reviewed in {succeeded}/{len(parts)} part(s).{partial_note} " + " ".join(summaries[:3]),
+                "quality_score": round(sum(scores) / len(scores), 1),
+                "_transport": "cli",
+                "_cli_model": self.cli_model,
+                "_usage": {"input_tokens": in_tok, "output_tokens": out_tok},
+                "_partial": bool(failed_parts),
+                "_failed_parts": failed_parts,
+            }
         except Exception as e:
             return {"error": str(e), "issues": [], "quality_score": 0, "_transport": "cli"}
