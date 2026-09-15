@@ -134,11 +134,12 @@ class MCPServer:
                     },
                     {
                         "name": "get_consensus",
-                        "description": "Get consensus summary from all AI reviewers for recent changes",
+                        "description": "Group a file's cached reviews (from every seat that reviewed its CURRENT revision) into consensus/unique findings, using one AI seat to do the grouping. Cached per (file revision, contributing reviewers) - a repeat call for an unchanged file with no new reviews returns the same cached result at no extra cost; pass force to re-run the grouping anyway.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
-                                "file_path": {"type": "string", "description": "Optional file path to get consensus for"}
+                                "file_path": {"type": "string", "description": "Optional file path to get consensus for"},
+                                "force": {"type": "boolean", "description": "Re-run the consensus grouping even if a cached result for this exact file revision and reviewer set already exists", "default": False}
                             }
                         }
                     },
@@ -162,7 +163,7 @@ class MCPServer:
                     tool_args.get("force", False)
                 )
             elif tool_name == "get_consensus":
-                result = await self._get_consensus(tool_args.get("file_path"))
+                result = await self._get_consensus(tool_args.get("file_path"), tool_args.get("force", False))
             elif tool_name == "council_status":
                 result = self._get_status()
             else:
@@ -224,19 +225,72 @@ class MCPServer:
             "reviews": reviews
         }
 
-    async def _get_consensus(self, file_path: str = None) -> dict:
+    async def _get_consensus(self, file_path: str = None, force: bool = False) -> dict:
         if file_path:
-            reviews = self.council.db.get_reviews(str(_canonicalize_path(file_path)), limit=10)
-            if not reviews:
-                return {"message": "No reviews found"}
+            # Read the file FIRST, both because aggregate_reviews' synthesis prompt needs its
+            # current content and because the current content's hash is what selects WHICH
+            # stored reviews are even eligible below - get_reviews has no file_hash column in
+            # its default query, so filtering only by file_path can combine one model's review
+            # of an old revision with another model's review of a newer one, then hand the
+            # synthesizer a THIRD (current) revision's code - a "consensus" that doesn't
+            # describe any single real revision. Passing file_hash restricts to reviews that
+            # were actually run against the exact code being synthesized now.
+            try:
+                resolved_path = _resolve_workspace_file(file_path)
+                code_content = resolved_path.read_text(encoding="utf-8", errors="ignore")
+            except (ValueError, OSError) as e:
+                return {"file": file_path, "error": f"Cannot read file for consensus grouping: {e}"}
 
-            # get_reviews returns newest-first; keep only the first (newest) row seen per
-            # model - a plain dict comprehension would let a later, OLDER row for the same
-            # model overwrite the newer one, since dict construction keeps the LAST key seen.
-            review_dict = {}
-            for r in reviews:
-                review_dict.setdefault(r["model"], r["review"])
-            consensus = self.council.aggregate_reviews(review_dict)
+            current_hash = self.council.get_file_hash(code_content)
+            # get_latest_reviews_by_hash (NOT the bounded-history get_reviews(limit=N)) - a
+            # global LIMIT is a history window, not "one row per model": after several
+            # force-reviews of some seats, ten rows can be "three seats x several retries" with
+            # a fourth seat's only review pushed past the window and silently absent from
+            # consensus - reproduced exactly that. This query guarantees one (the latest) row
+            # per model with no cap on how many distinct models can appear.
+            reviews = self.council.db.get_latest_reviews_by_hash(str(resolved_path), current_hash)
+            if not reviews:
+                return {"message": "No reviews found for the current revision of this file - it may have changed since it was last reviewed. Re-review it to get a current consensus."}
+
+            # Track each selected row's own id alongside its content - the cache fingerprint
+            # below needs the ACTUAL row identity, not just which model names are present, so a
+            # forced re-review (new row, new id, same model name, same file hash) correctly
+            # invalidates the old cache instead of silently reusing it.
+            review_dict = {r["model"]: r["review"] for r in reviews}
+            selected_rows = [{"model": r["model"], "id": r["id"]} for r in reviews]
+
+            # Grouping the SAME reviews for the SAME file revision is the same answer every
+            # time - re-running the synthesis seat call on every poll would be pure re-spend
+            # for an identical result, not a refresh. Resolve the seat ahead of the actual
+            # call (same priority order aggregate_reviews/synthesize_reviews would use) so the
+            # cache can be checked before spending anything, and pass that same seat through
+            # explicitly so a cache miss can't silently synthesize with a DIFFERENT seat than
+            # the one just checked.
+            synthesizer_key, _ = self.council._pick_seat(None)
+            if not synthesizer_key:
+                return {"file": file_path, "error": "No AI available for synthesis"}
+
+            cached = None
+            if not force:
+                cached = self.council.db.get_cached_file_consensus(
+                    str(resolved_path), current_hash, synthesizer_key, selected_rows
+                )
+            if cached is not None:
+                return {"file": file_path, "consensus": cached, "cached": True}
+
+            consensus = await self.council.aggregate_reviews(
+                str(resolved_path), code_content, review_dict, preferred_synthesizer=synthesizer_key
+            )
+            # Only a genuinely-completed synthesis is worth caching - aggregate_reviews sets
+            # synthesized_by ONLY on that success path (absent both when synthesis outright
+            # failed and when it never ran at all, e.g. <2 successful reviews to group). Caching
+            # the "nothing to synthesize yet" shape under this synthesizer_key would wrongly
+            # keep serving it later even after a second reviewer's review makes real synthesis
+            # possible - reproduced and confirmed this exact failure while testing the cache.
+            if consensus.get("synthesized_by"):
+                self.council.db.save_file_consensus(
+                    str(resolved_path), current_hash, synthesizer_key, selected_rows, consensus
+                )
             return {
                 "file": file_path,
                 "consensus": consensus

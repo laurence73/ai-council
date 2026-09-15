@@ -99,60 +99,102 @@
         "ai-council.pythonPath": {
           "type": "string",
           "default": "python",
-          "description": "Path to Python executable"
+          "scope": "machine",
+          "description": "Path to Python executable. Machine-scoped: a workspace's own .vscode/settings.json cannot override this, since it directly controls what executable this extension runs - see design-decisions.md for why."
         },
         "ai-council.scriptPath": {
           "type": "string",
           "default": "",
-          "description": "Path to ai_council.py script. Leave empty to use bundled script."
+          "scope": "machine",
+          "description": "Path to ai_council.py script. Leave empty to use bundled script. Machine-scoped: a workspace's own .vscode/settings.json cannot override this, since it directly controls what code this extension runs - see design-decisions.md for why."
         },
         "ai-council.apiKeys.openai": {
           "type": "string",
           "default": "",
-          "description": "OpenAI API Key (for GPT-4). Get yours at: https://platform.openai.com/api-keys"
+          "scope": "machine",
+          "description": "OpenAI API Key (for GPT-4). Get yours at: https://platform.openai.com/api-keys. Machine-scoped: a workspace's own .vscode/settings.json cannot read or redirect this - see design-decisions.md."
         },
         "ai-council.apiKeys.anthropic": {
           "type": "string",
           "default": "",
-          "description": "Anthropic API Key (for Claude). Get yours at: https://console.anthropic.com/"
+          "scope": "machine",
+          "description": "Anthropic API Key (for Claude). Get yours at: https://console.anthropic.com/. Machine-scoped: a workspace's own .vscode/settings.json cannot read or redirect this - see design-decisions.md."
         },
         "ai-council.apiKeys.xai": {
           "type": "string",
           "default": "",
-          "description": "xAI API Key (for Grok). Get yours at: https://console.x.ai/"
+          "scope": "machine",
+          "description": "xAI API Key (for Grok). Get yours at: https://console.x.ai/. Machine-scoped: a workspace's own .vscode/settings.json cannot read or redirect this - see design-decisions.md."
         },
         "ai-council.apiKeys.google": {
           "type": "string",
           "default": "",
-          "description": "Google API Key (for Gemini - FREE!). Get yours at: https://aistudio.google.com/app/apikey"
+          "scope": "machine",
+          "description": "Google API Key (for Gemini - FREE!). Get yours at: https://aistudio.google.com/app/apikey. Machine-scoped: a workspace's own .vscode/settings.json cannot read or redirect this - see design-decisions.md."
         },
         "ai-council.apiKeys.ollama": {
           "type": "string",
           "default": "",
-          "description": "WoW AI auth (user:pass for Basic auth, or Bearer token)"
+          "scope": "machine",
+          "description": "Auth for your Ollama/self-hosted endpoint, if it requires any (user:pass for Basic auth, or a Bearer token). Leave blank for an unauthenticated local Ollama server. Machine-scoped: a workspace's own .vscode/settings.json cannot read or redirect this - see design-decisions.md."
+        },
+        "ai-council.models.openai.standard": {
+          "type": "string",
+          "default": "gpt-4-turbo",
+          "description": "Model ID the GPT-4/OpenAI API seat uses in standard mode. Any model ID your OpenAI account can access - not validated against a fixed list, since new models ship faster than this extension would be updated to list them."
+        },
+        "ai-council.models.openai.power": {
+          "type": "string",
+          "default": "gpt-6-astra",
+          "description": "Model ID the GPT-4/OpenAI API seat uses when Power Mode is on. Cost estimates in reports are a rough per-provider guess and do not automatically adjust to whatever model you set here."
+        },
+        "ai-council.models.anthropic.standard": {
+          "type": "string",
+          "default": "claude-sonnet-4-5",
+          "description": "Model ID the Claude API seat uses in standard mode. Any model ID your Anthropic account can access - not validated against a fixed list."
+        },
+        "ai-council.models.anthropic.power": {
+          "type": "string",
+          "default": "claude-fable-5-1",
+          "description": "Model ID the Claude API seat uses when Power Mode is on. Cost estimates in reports are a rough per-provider guess and do not automatically adjust to whatever model you set here."
+        },
+        "ai-council.models.xai.standard": {
+          "type": "string",
+          "default": "grok-3-mini",
+          "description": "Model ID the Grok API seat uses in standard mode. Any model ID your xAI account can access - not validated against a fixed list."
+        },
+        "ai-council.models.xai.power": {
+          "type": "string",
+          "default": "grok-3",
+          "description": "Model ID the Grok API seat uses when Power Mode is on. Cost estimates in reports are a rough per-provider guess and do not automatically adjust to whatever model you set here."
+        },
+        "ai-council.models.google.standard": {
+          "type": "string",
+          "default": "gemini-3-flash-preview",
+          "description": "Model ID the Gemini API seat uses in standard mode. Any model ID your Google account can access - not validated against a fixed list."
+        },
+        "ai-council.models.google.power": {
+          "type": "string",
+          "default": "gemini-3.1-pro-preview",
+          "description": "Model ID the Gemini API seat uses when Power Mode is on. Cost estimates in reports are a rough per-provider guess and do not automatically adjust to whatever model you set here."
         },
         "ai-council.ollamaUrl": {
           "type": "string",
           "default": "",
-          "description": "WoW AI / Ollama server URL"
+          "scope": "machine",
+          "description": "Ollama / OpenAI-compatible self-hosted server URL. Machine-scoped: a workspace's own .vscode/settings.json cannot redirect this to an attacker-controlled endpoint - see design-decisions.md."
         },
         "ai-council.ollamaModel": {
           "type": "string",
           "default": "qwen3.6:35b-mlx",
-          "description": "Ollama model to use for code review",
-          "enum": [
-            "qwen3.6:35b-mlx",
-            "qwen3-coder-next:latest",
-            "qwen3-coder-next:q4_K_M",
-            "qwen2.5-coder:14b",
-            "gemma4:12b-mlx",
-            "llama3.2:latest"
-          ]
+          "scope": "machine",
+          "description": "Model name to request from your Ollama/self-hosted endpoint. Type any model your server actually has pulled/available - not validated against a fixed list, since that list would only ever reflect one specific setup's models, not yours. Machine-scoped: a workspace's own .vscode/settings.json cannot force your already-machine-scoped Ollama server to run a model you did not choose - see design-decisions.md."
         },
         "ai-council.autoReviewOnSave": {
           "type": "boolean",
           "default": false,
-          "description": "Run a full review immediately whenever a supported source file is saved. Requires the AI Council sidebar (or any AI Council command) to have run at least once this window session - saves before that won't trigger a review, since the extension only activates on first use, not at VS Code startup."
+          "scope": "machine",
+          "description": "Run a full review immediately whenever a supported source file is saved. Requires the AI Council sidebar (or any AI Council command) to have run at least once this window session - saves before that won't trigger a review, since the extension only activates on first use, not at VS Code startup. Machine-scoped: a workspace's own .vscode/settings.json cannot silently turn this on - see design-decisions.md."
         },
         "ai-council.reviewRubric": {
           "type": "string",
@@ -194,8 +236,8 @@
     "@types/vscode": "^1.85.0",
     "@typescript-eslint/eslint-plugin": "^6.13.0",
     "@typescript-eslint/parser": "^6.13.0",
+    "@vscode/vsce": "^2.22.0",
     "eslint": "^8.54.0",
-    "typescript": "^5.3.0",
-    "@vscode/vsce": "^2.22.0"
+    "typescript": "^5.3.0"
   }
 }

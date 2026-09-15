@@ -55,9 +55,15 @@ via API keys or CLI subscription logins (Claude Code, Codex, Grok CLI).
 ### Review with Scope
 
 Open the sidebar, click **Review with Scope**, and describe what the council should focus on.
-Once round 0 finishes, you can ask follow-ups, run a **debate** between the currently-enabled
-seats (the arbiter/writer pickers reflect enabled seats immediately when the panel opens), and
-**consolidate** the debate into a final pruned review or write it up as a review doc.
+The seats enabled and the Arbiter picker's value at that moment are fixed for the whole
+session - round 0 reviews with exactly those seats (minus a nominated arbiter, which never
+reviews at all), and every later follow-up or debate round is validated against that same
+roster before it runs. Changing a seat toggle or the Arbiter picker afterward does not affect
+this session - restore the original seats to continue, or start a new Review with Scope for a
+different roster/arbiter. Once round 0 finishes you can ask follow-ups, run a **debate**
+between the session's reviewing seats (arbiter-mediated if one was nominated, all-to-all
+otherwise), and **consolidate** the debate into a final pruned review or write it up as a
+review doc.
 
 ### Context Menu
 
@@ -85,7 +91,7 @@ You can bind a keyboard shortcut to `ai-council.reviewFile` in your keybindings.
 - Ollama/self-hosted output is parsed tolerantly (messier than the API-based providers) and its
   real failures (e.g. a slow/unresponsive endpoint) are shown honestly rather than swallowed -
   if it's picked as debate arbiter/clusterer and is slow, that stage can take up to its full
-  180s timeout before failing, which the UI now flags up front.
+  600s timeout before failing, which the UI now flags up front.
 ## License
 
 MIT

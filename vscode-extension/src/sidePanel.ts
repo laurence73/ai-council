@@ -29,6 +29,7 @@ interface ReviewOptions {
     enableOllama: boolean;
     powerMode: boolean;
     synthesizer: string;
+    arbiter: string;
 }
 
 interface ModelResult {
@@ -77,11 +78,12 @@ function parseModelProgressLine(text: string, modelResults: Record<string, Model
         return null;
     }
 
-    const errorMatch = text.match(/\[!\]\s+([\w-]+)\s+ERROR/i);
+    const errorMatch = text.match(/\[!\]\s+([\w-]+)\s+ERROR(?:\s+\([^)]+\))?(?:\s+\[[^\]]+\])?\s*(.*)/i);
     if (errorMatch) {
         const modelKey = normalizeModelKey(errorMatch[1]);
-        modelResults[modelKey] = { score: 0, issues: 0, error: true };
-        return { model: modelKey, data: { score: 0, issues: 0, error: true } };
+        const detail = (errorMatch[2] || '').trim();
+        modelResults[modelKey] = { score: 0, issues: 0, error: detail || true };
+        return { model: modelKey, data: { score: 0, issues: 0, error: detail || true } };
     }
 
     return null;
@@ -130,6 +132,8 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
     private _extensionUri: vscode.Uri;
     private _context: vscode.ExtensionContext;
     private _webviewReady = false;
+    private _grokModelsCache: { code: number | null; stdout: string; stderr: string } | null = null;
+    private _grokModelsAt = 0;
 
     constructor(extensionUri: vscode.Uri, context: vscode.ExtensionContext) {
         this._extensionUri = extensionUri;
@@ -166,6 +170,45 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         });
     }
 
+    // Council Verdict by / Fix Code with / Arbiter - unlike the checkbox seat toggles
+    // (toggleStates), these three selects were never persisted at all: populateSeatSelect's own
+    // "keep the current selection if still valid" logic only preserves a pick WITHIN one live
+    // webview instance (it reads the <select>'s current .value before rebuilding options) - on a
+    // fresh webview load (the sidebar disposes/recreates its webview on every hide/reshow, same
+    // root cause as every other "state reset on reopen" bug in this project) each <select> starts
+    // at its first/default option with nothing to preserve, so every pick silently reverted to
+    // Auto/blank on return. Separate Record<string, string> from toggleStates (Record<string,
+    // boolean>) rather than forcing a type mismatch into one shared dict for a different kind of
+    // value.
+    private _saveSeatSelections(selections: Record<string, string>) {
+        this._context.globalState.update('ai-council.seatSelections', selections);
+    }
+
+    private _getSeatSelections(): Record<string, string> {
+        return this._context.globalState.get('ai-council.seatSelections', {
+            synthesizerSelect: 'auto',
+            fixerSelect: '',
+            arbiterSelect: 'none'
+        });
+    }
+
+    // Separate from toggleStates (that's review CONFIG - what to run with; this is UI
+    // presentation state - what's visually expanded right now). User-driven collapse/expand
+    // persists across webview reloads (the sidebar disposes/recreates its webview on every
+    // hide/reshow, wiping any in-memory-only collapse state) the same way seat toggles already
+    // do; an auto-uncollapse triggered by an error is NOT saved here, so it doesn't silently
+    // become the new "collapsed" default the next time the panel opens with no error present.
+    private _saveSectionCollapsed(sections: Record<string, boolean>) {
+        this._context.globalState.update('ai-council.sectionCollapsed', sections);
+    }
+
+    private _getSectionCollapsed(): Record<string, boolean> {
+        return this._context.globalState.get('ai-council.sectionCollapsed', {
+            modelSelection: false,
+            reviewOptions: false
+        });
+    }
+
     private _getScriptPath(): string {
         const config = vscode.workspace.getConfiguration('ai-council');
         const customPath = config.get<string>('scriptPath');
@@ -177,6 +220,16 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
 
         // Otherwise use the bundled script in the extension folder
         return path.join(this._extensionUri.fsPath, 'ai_council.py');
+    }
+
+    // session_query.py is never overridable via ai-council.scriptPath (unlike _getScriptPath) -
+    // it's a fixed internal helper next to the bundled ai_council.py, not something a user
+    // should ever need to redirect. Deliberately kept separate from _getScriptPath rather than
+    // adding a parameter to it, since scriptPath's whole purpose is letting a user point at
+    // their OWN ai_council.py fork - session_query.py has no equivalent use case and no reason
+    // to inherit that override surface.
+    private _getSessionQueryScriptPath(): string {
+        return path.join(this._extensionUri.fsPath, 'session_query.py');
     }
 
     public resolveWebviewView(
@@ -228,19 +281,53 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                         enableGemini: message.enableGemini,
                         enableOllama: message.enableOllama,
                         powerMode: message.powerMode,
-                        synthesizer: message.synthesizer || 'auto'
+                        synthesizer: message.synthesizer || 'auto',
+                        arbiter: 'none'
                     });
                     break;
                 case 'checkApiKey':
-                    await this._checkApiKey(message.modelId, message.name, message.key, message.url, message.free, message.kind);
+                    await this._checkApiKey(message.modelId, message.name, message.key, message.url, message.free, message.kind, message.silent);
+                    // The persistent status label next to each toggle (e.g. "timed out",
+                    // "Logged in as...") is only ever refreshed by _sendApiKeyStatus, which
+                    // toggling a seat did not previously trigger - a stale label from whenever
+                    // the panel last loaded could sit there showing a state that no longer
+                    // matches what _checkApiKey's own just-completed fresh check found
+                    // (reproduced live: toggled a CLI seat on, the toggle turned on, but its
+                    // "timed out" label from an earlier check never updated either way).
+                    // Skipped for silent (restore-time bulk) checks - webviewReady already ran
+                    // this once for the whole panel, and re-running it per restored seat would
+                    // needlessly repeat every seat's CLI/URL/key check N times over.
+                    if (!message.silent) {
+                        await this._sendApiKeyStatus();
+                    }
                     break;
                 case 'clearCacheConfirmed':
                     await this._clearCacheConfirmed();
                     break;
-                case 'openTerminal':
-                    const terminal = vscode.window.createTerminal(message.cli + ' Login');
+                case 'openTerminal': {
+                    // Webview messages are untrusted input, even though pendingLoginCli's own
+                    // current call sites only ever set it from a fixed literal - message.cli
+                    // was being concatenated directly into shell text sent to a real terminal
+                    // (terminal.sendText), so a compromised/malicious webview could inject
+                    // shell syntax (&, |, command substitution) via this one message. Fixed
+                    // with a literal allowlist on the extension-host side - only these three
+                    // known CLI binary names are ever used to build the command text; anything
+                    // else is rejected outright rather than sanitized/escaped.
+                    const allowedCli: Record<string, string> = { codex: 'codex', claude: 'claude', grok: 'grok' };
+                    const cliName = allowedCli[message.cli];
+                    if (!cliName) { break; }
+                    const terminal = vscode.window.createTerminal(cliName + ' Login');
                     terminal.show();
-                    terminal.sendText(message.cli + ' logout && ' + message.cli + ' login');
+                    terminal.sendText(cliName + ' logout && ' + cliName + ' login');
+                    break;
+                }
+                case 'showActionableError':
+                    // Lets a webview-side card (which cannot call vscode.window/commands
+                    // itself - it runs in the webview sandbox) trigger the exact same
+                    // seat-identification + Log In/Open Settings action every other failure
+                    // surface in this file already gets, instead of only ever showing text
+                    // with no way to act on it.
+                    await this._showActionableError(message.message);
                     break;
                 case 'showStatus':
                     await this._showStatus(message.toggles);
@@ -256,10 +343,18 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                     // Send saved toggle states
                     const savedToggles = this._getToggleStates();
                     this._view?.webview.postMessage({ type: 'restoreToggles', toggles: savedToggles });
+                    this._view?.webview.postMessage({ type: 'restoreSectionCollapsed', sections: this._getSectionCollapsed() });
+                    this._view?.webview.postMessage({ type: 'restoreSeatSelections', selections: this._getSeatSelections() });
                     break;
                 case 'saveToggles':
                     // Save toggle states when user changes them
                     this._saveToggleStates(message.toggles);
+                    break;
+                case 'saveSectionCollapsed':
+                    this._saveSectionCollapsed(message.sections);
+                    break;
+                case 'saveSeatSelections':
+                    this._saveSeatSelections(message.selections);
                     break;
                 case 'reviewCommit':
                     await this._reviewCommit({
@@ -272,7 +367,8 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                         enableGemini: message.enableGemini,
                         enableOllama: message.enableOllama,
                         powerMode: message.powerMode,
-                        synthesizer: message.synthesizer || 'auto'
+                        synthesizer: message.synthesizer || 'auto',
+                        arbiter: 'none'
                     });
                     break;
                 case 'openReport':
@@ -288,20 +384,26 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                         await vscode.window.showTextDocument(doc);
                     }
                     break;
+                case 'listScopedSessions':
+                    this._listScopedSessions();
+                    break;
+                case 'resumeScopedSession':
+                    this._resumeScopedSession(message.sessionId);
+                    break;
                 case 'scopedReview':
                     this._scopedReview(message.scope, message.modelConfig);
                     break;
                 case 'scopedFollowup':
-                    this._scopedFollowup(message.sessionId, message.question, message.modelConfig);
+                    this._scopedFollowup(message.sessionId, message.question, message.modelConfig, message.sessionArbiter);
                     break;
                 case 'scopedFinalize':
                     this._scopedFinalize(message.sessionId, message.writer, message.modelConfig);
                     break;
                 case 'runDebate':
-                    this._runDebate(message.sessionId, message.arbiter, message.modelConfig);
+                    this._runDebate(message.sessionId, message.modelConfig);
                     break;
                 case 'runConsolidate':
-                    this._runConsolidate(message.sessionId, message.modelConfig);
+                    this._runConsolidate(message.sessionId, message.modelConfig, message.force);
                     break;
                 case 'cancelOperation':
                     this._cancelActiveOperation();
@@ -377,7 +479,8 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             enableGemini: !!toggles.enableGemini,
             enableOllama: !!toggles.enableOllama,
             powerMode: !!toggles.powerMode,
-            synthesizer: 'auto'
+            synthesizer: 'auto',
+            arbiter: 'none'
         };
     }
 
@@ -525,6 +628,15 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             this._view?.webview.postMessage({ type: 'fixComplete', success: false });
             return;
         }
+        // Every other spawn path (review, commit-review, scoped review/followup/finalize,
+        // debate, consolidate) checks this before spawning - Fix with AI was missed, so a
+        // stale/restored Ollama toggle with no configured URL still passed --ollama through to
+        // the Python process here, silently pointed at nothing (no error at all), instead of
+        // the actionable "configure ai-council.ollamaUrl" prompt every other flow gives.
+        if (!(await this._guardOllamaConfigured(modelConfig))) {
+            this._view?.webview.postMessage({ type: 'fixComplete', success: false });
+            return;
+        }
 
         const editor = vscode.window.activeTextEditor;
         if (!editor) {
@@ -643,6 +755,7 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         // running (and billing) with no way to Cancel it, since Cancel only ever kills whatever
         // _currentProcess currently points at.
         if (this._operationAlreadyRunning()) { return; }
+        if (!(await this._guardOllamaConfigured(options))) { return; }
 
         const fileName = path.basename(filePath);
         const fileBaseName = path.basename(filePath, path.extname(filePath));
@@ -784,6 +897,7 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
 
     private async _reviewCommit(options: ReviewOptions) {
         if (this._operationAlreadyRunning()) { return; }
+        if (!(await this._guardOllamaConfigured(options))) { return; }
 
         // Get workspace folder
         const workspaceFolders = vscode.workspace.workspaceFolders;
@@ -986,6 +1100,18 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             OLLAMA_API_KEY: config.get<string>('apiKeys.ollama') || '',
             AI_COUNCIL_REVIEW_RUBRIC: config.get<string>('reviewRubric') || '',
             OLLAMA_URL: config.get<string>('ollamaUrl') || '',
+            // API seat model IDs - settings, not a hardcoded default baked into ai_council.py.
+            // Empty here means "let ai_council.py's own MODEL_CONFIGS fallback apply" (the
+            // current known-good default), not "no model" - these are optional overrides, same
+            // reasoning as AI_COUNCIL_CLI_MODEL_* for CLI seats.
+            AI_COUNCIL_API_MODEL_OPENAI_STANDARD: config.get<string>('models.openai.standard') || '',
+            AI_COUNCIL_API_MODEL_OPENAI_POWER: config.get<string>('models.openai.power') || '',
+            AI_COUNCIL_API_MODEL_ANTHROPIC_STANDARD: config.get<string>('models.anthropic.standard') || '',
+            AI_COUNCIL_API_MODEL_ANTHROPIC_POWER: config.get<string>('models.anthropic.power') || '',
+            AI_COUNCIL_API_MODEL_XAI_STANDARD: config.get<string>('models.xai.standard') || '',
+            AI_COUNCIL_API_MODEL_XAI_POWER: config.get<string>('models.xai.power') || '',
+            AI_COUNCIL_API_MODEL_GOOGLE_STANDARD: config.get<string>('models.google.standard') || '',
+            AI_COUNCIL_API_MODEL_GOOGLE_POWER: config.get<string>('models.google.power') || '',
         };
     }
 
@@ -1008,7 +1134,14 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                 try {
                     const parsed = JSON.parse(line);
                     if (parsed.error) {
-                        resolve({ error: parsed.error });
+                        // ai_council.py's clustering/synthesis/debate error paths attach the
+                        // model's actual raw response as `raw` (e.g. cluster_findings on a
+                        // parse failure) - dropping it here left "Failed to parse clustering
+                        // response" as the ENTIRE error shown to the user, with zero indication
+                        // of what the model actually said or why parsing failed (reproduced
+                        // live: an Ollama clustering call failed with no way to see its output).
+                        const detail = typeof parsed.raw === 'string' && parsed.raw ? ` - model returned: ${parsed.raw.substring(0, 300)}` : '';
+                        resolve({ error: `${parsed.error}${detail}` });
                     } else {
                         resolve({ result: parsed });
                     }
@@ -1054,8 +1187,21 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                 try {
                     const parsed = JSON.parse(line);
                     if (parsed.error) {
-                        resolve({ error: parsed.error });
+                        // ai_council.py's clustering/synthesis/debate error paths attach the
+                        // model's actual raw response as `raw` (e.g. cluster_findings on a
+                        // parse failure) - dropping it here left "Failed to parse clustering
+                        // response" as the ENTIRE error shown to the user, with zero indication
+                        // of what the model actually said or why parsing failed (reproduced
+                        // live: an Ollama clustering call failed with no way to see its output).
+                        const detail = typeof parsed.raw === 'string' && parsed.raw ? ` - model returned: ${parsed.raw.substring(0, 300)}` : '';
+                        resolve({ error: `${parsed.error}${detail}` });
                     } else {
+                        // debate/consolidate now regenerate the session's one evolving report
+                        // (report_path) on every call - _runScopedCommandWithProgress (round 0/
+                        // followup) already tracks this same field, this call path was the one
+                        // missing it, leaving "Show Last Review" pointed at a stale round-0
+                        // report even after debate/consolidate updated a newer one.
+                        if (parsed?.report_path) { this._setLastReportPath(parsed.report_path); }
                         resolve({ result: parsed });
                     }
                 } catch (e) {
@@ -1070,6 +1216,26 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
     // Ollama. Mirrors _runReview's args-building exactly - this was previously duplicated as
     // a CLI-seats-only helper, which silently dropped Gemini/Ollama and gave no way to turn
     // OFF an API seat that has a key configured, for every scoped-review command.
+    // Blocks a launch outright when Ollama is enabled with no server URL configured, rather
+    // than silently spawning a reviewer pointed at nothing (confirmed live: the engine logs
+    // "Ollama reviewer enabled (model @ )" with a blank URL, no error, no popup). _checkApiKey
+    // only fires at the moment the toggle is actively clicked - a toggle state restored from a
+    // previous session (persisted via saveToggleStates/restoreToggles) never re-triggers it, so
+    // every actual review launch needs its own check too, not just the toggle-click path.
+    private async _guardOllamaConfigured(modelConfig?: Partial<ReviewOptions>): Promise<boolean> {
+        if (!modelConfig?.enableOllama) { return true; }
+        const ollamaUrl = vscode.workspace.getConfiguration('ai-council').get<string>('ollamaUrl') || '';
+        if (ollamaUrl.trim()) { return true; }
+        const result = await vscode.window.showWarningMessage(
+            'Ollama is enabled but ai-council.ollamaUrl is not set - this review would silently run without that seat. Configure it or turn Ollama off.',
+            'Open Settings'
+        );
+        if (result === 'Open Settings') {
+            vscode.commands.executeCommand('workbench.action.openSettings', 'ai-council.ollamaUrl');
+        }
+        return false;
+    }
+
     private _modelSeatGlobalArgs(modelConfig?: Partial<ReviewOptions>): string[] {
         const args: string[] = [];
         const config = vscode.workspace.getConfiguration('ai-council');
@@ -1161,9 +1327,102 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         this._view?.webview.postMessage({ type: resultMessageType, result, error, liveModelResults: modelResults });
     }
 
+    // The Scope panel's webview state is lost every time the sidebar is hidden and recreated
+    // (see resolveWebviewView's retainContextWhenHidden note) - listSessions/resumeSession let
+    // the panel rebuild itself from SQLite instead of a session only ever being reachable while
+    // its original webview instance happened to stay alive.
+    //
+    // Listing/resuming a session is a pure SQLite read with no reviewer/AI call involved at all,
+    // so it must be both fast and never contend with a real operation. Two approaches were tried
+    // before this one, both rejected (see design-decisions.md):
+    //  1. Spawning ai_council.py itself - correct data, but importing that module alone costs
+    //     ~2.5s (openai/anthropic SDK imports at module top-level, paid regardless of which
+    //     class is actually touched), which is the "too much background processing" this was
+    //     meant to fix, not fixed.
+    //  2. better-sqlite3, reading reviews.db directly from the extension host - fast, but a
+    //     native module requiring Node >=22 while the extension's declared VS Code floor
+    //     (^1.85.0) embeds a much older Node/Electron; a failed native load at module-import
+    //     time would have broken the WHOLE extension's activation, not just this feature
+    //     (flagged independently by two ground-up security reviews, both confirmed by direct
+    //     inspection - real, not theoretical).
+    // Current approach: spawn session_query.py, a small standalone script with the same
+    // queries/assembly logic but zero ai_council.py import (no SDK cost) - fast AND no native
+    // dependency. Deliberately does NOT set this._currentProcess / use _runJsonCommand's overlap
+    // guard - a session-list lookup must never be blocked by, or block, a real in-flight
+    // operation, which spawning through the same guarded helper every review/debate/consolidate
+    // uses would reintroduce.
+    private _runSessionQuery(args: string[]): Promise<{ result?: any; error?: string }> {
+        const config = vscode.workspace.getConfiguration('ai-council');
+        const pythonPath = config.get<string>('pythonPath') || 'python';
+        const scriptPath = this._getSessionQueryScriptPath();
+        return new Promise((resolve) => {
+            const proc = spawn(pythonPath, [scriptPath, ...args]);
+            let stdout = '';
+            let stderr = '';
+            // Deliberately does not use the shared overlap guard (see the comment above
+            // _runSessionQuery's callers), but a pure local SQLite read with no watchdog at all
+            // could still hang forever with nothing telling the user (a locked db file, an
+            // antivirus scan holding the file, a stuck interpreter) - same watchdog shape
+            // _runCliCommand already uses (CLI_STATUS_TIMEOUT_MS, settled guard against a double
+            // resolve, kill + resolve on timeout) rather than a new one-off pattern.
+            let settled = false;
+            const finish = (result: { result?: any; error?: string }) => {
+                if (settled) { return; }
+                settled = true;
+                clearTimeout(watchdog);
+                resolve(result);
+            };
+            proc.stdout?.on('data', (d) => { stdout += d.toString(); });
+            proc.stderr?.on('data', (d) => { stderr += d.toString(); });
+            proc.on('close', () => {
+                try {
+                    finish({ result: JSON.parse(stdout.trim()) });
+                } catch {
+                    finish({ error: (stderr || stdout || 'No output').substring(0, 300) });
+                }
+            });
+            proc.on('error', (err) => finish({ error: err.message }));
+            const watchdog = setTimeout(() => {
+                try { proc.kill(); } catch { /* already exited */ }
+                finish({ error: 'Session query timed out' });
+            }, AiCouncilSidebarProvider.CLI_STATUS_TIMEOUT_MS);
+        });
+    }
+
+    private async _listScopedSessions() {
+        const dbPath = this._getWorkspaceDbPath();
+        if (!dbPath) {
+            this._view?.webview.postMessage({ type: 'scopedSessionsList', sessions: [] });
+            return;
+        }
+        // Scoped to the file open in the active editor when the panel was opened, same as
+        // _scopedReview's own file resolution - a session outlives the tab it started from, but
+        // "sessions for the file I'm looking at right now" is the useful default here.
+        const filePath = vscode.window.activeTextEditor?.document.uri.fsPath;
+        const args = ['--db', dbPath, 'scoped-sessions', '--limit', '50'];
+        if (filePath) { args.push('--file', filePath); }
+        const { result, error } = await this._runSessionQuery(args);
+        this._view?.webview.postMessage({ type: 'scopedSessionsList', sessions: result?.sessions || [], error });
+    }
+
+    private async _resumeScopedSession(sessionId: string) {
+        const dbPath = this._getWorkspaceDbPath();
+        if (!dbPath) {
+            this._view?.webview.postMessage({ type: 'scopedResumeResult', error: 'No workspace folder open' });
+            return;
+        }
+        const { result, error } = await this._runSessionQuery(['--db', dbPath, 'scoped-resume', '--session', sessionId]);
+        if (result?.report_path) { this._setLastReportPath(result.report_path); }
+        this._view?.webview.postMessage({ type: 'scopedResumeResult', result, error });
+    }
+
     private async _scopedReview(scope: string, modelConfig?: Partial<ReviewOptions>) {
         if (this._operationAlreadyRunning()) {
             this._view?.webview.postMessage({ type: 'scopedReviewResult', error: 'Another operation is already running - wait for it to finish' });
+            return;
+        }
+        if (!(await this._guardOllamaConfigured(modelConfig))) {
+            this._view?.webview.postMessage({ type: 'scopedReviewResult', error: 'Ollama is enabled but not configured' });
             return;
         }
         const editor = vscode.window.activeTextEditor;
@@ -1197,18 +1456,32 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         if (modelConfig?.enableGrokCli) { models.push('grok-cli'); }
         if (modelConfig?.enableGemini) { models.push('gemini'); }
         if (modelConfig?.enableOllama) { models.push('ollama'); }
-        this._view?.webview.postMessage({ type: 'scopedRoundStart', roundNum: 0, models });
+        // The nominated arbiter (if any) is excluded from reviewing entirely - it must not get
+        // a progress card here, since it will never report one: this round never calls it.
+        const arbiterSeat = modelConfig?.arbiter && modelConfig.arbiter !== 'none' ? modelConfig.arbiter : null;
+        const reviewingModels = arbiterSeat ? models.filter(m => m !== arbiterSeat) : models;
+        this._view?.webview.postMessage({ type: 'scopedRoundStart', roundNum: 0, models: reviewingModels });
 
         const args = [scriptPath, '--db', dbPath, ...this._modelSeatGlobalArgs(modelConfig),
             'scoped-review', filePath, '--scope', flattenArgLine(scope),
             ...this._modelSeatSubcommandArgs(modelConfig), '--html', '--output', reportPath];
+        if (modelConfig?.synthesizer && modelConfig.synthesizer !== 'auto') {
+            args.push('--synthesizer', modelConfig.synthesizer);
+        }
+        if (arbiterSeat) {
+            args.push('--arbiter', arbiterSeat);
+        }
 
         await this._runScopedCommandWithProgress(args, 'scopedReviewResult', 'scopedRoundProgress');
     }
 
-    private async _scopedFollowup(sessionId: string, question: string, modelConfig?: Partial<ReviewOptions>) {
+    private async _scopedFollowup(sessionId: string, question: string, modelConfig?: Partial<ReviewOptions>, sessionArbiter?: string | null) {
         if (this._operationAlreadyRunning()) {
             this._view?.webview.postMessage({ type: 'scopedFollowupResult', error: 'Another operation is already running - wait for it to finish' });
+            return;
+        }
+        if (!(await this._guardOllamaConfigured(modelConfig))) {
+            this._view?.webview.postMessage({ type: 'scopedFollowupResult', error: 'Ollama is enabled but not configured' });
             return;
         }
         const dbPath = this._getWorkspaceDbPath();
@@ -1238,11 +1511,24 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         if (modelConfig?.enableGrokCli) { models.push('grok-cli'); }
         if (modelConfig?.enableGemini) { models.push('gemini'); }
         if (modelConfig?.enableOllama) { models.push('ollama'); }
-        this._view?.webview.postMessage({ type: 'scopedRoundStart', models });
+        // Same reasoning as _scopedReview: the nominated arbiter (persisted from round 0, not
+        // re-specified here - scoped-followup has no --arbiter flag) never reviews, so it must
+        // not get a progress card in a follow-up round either. Uses sessionArbiter (the
+        // webview's persisted round-0 value), NOT modelConfig.arbiter - that's the live picker,
+        // which the user can change after round 0 without the backend ever honoring it. Cards
+        // built from the live picker can show a seat that will never report (the backend still
+        // excludes the PERSISTED arbiter regardless of what the picker now says) or omit a
+        // card for a seat the backend does call.
+        const arbiterSeat = sessionArbiter && sessionArbiter !== 'none' ? sessionArbiter : null;
+        const reviewingModels = arbiterSeat ? models.filter(m => m !== arbiterSeat) : models;
+        this._view?.webview.postMessage({ type: 'scopedRoundStart', models: reviewingModels });
 
         const args = [scriptPath, '--db', dbPath, ...this._modelSeatGlobalArgs(modelConfig),
             'scoped-followup', '--session', sessionId, '--question', flattenArgLine(question),
             ...this._modelSeatSubcommandArgs(modelConfig), ...reportArgs];
+        if (modelConfig?.synthesizer && modelConfig.synthesizer !== 'auto') {
+            args.push('--synthesizer', modelConfig.synthesizer);
+        }
 
         await this._runScopedCommandWithProgress(args, 'scopedFollowupResult', 'scopedRoundProgress');
     }
@@ -1250,6 +1536,10 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
     private async _scopedFinalize(sessionId: string, writer: string, modelConfig?: Partial<ReviewOptions>) {
         if (this._operationAlreadyRunning()) {
             this._view?.webview.postMessage({ type: 'scopedFinalizeResult', error: 'Another operation is already running - wait for it to finish' });
+            return;
+        }
+        if (!(await this._guardOllamaConfigured(modelConfig))) {
+            this._view?.webview.postMessage({ type: 'scopedFinalizeResult', error: 'Ollama is enabled but not configured' });
             return;
         }
         const dbPath = this._getWorkspaceDbPath();
@@ -1271,9 +1561,19 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         this._view?.webview.postMessage({ type: 'scopedFinalizeResult', result, error });
     }
 
-    private async _runDebate(sessionId: string, arbiter: string | null, modelConfig?: Partial<ReviewOptions>) {
+    // The arbiter (if any) is NOT passed here - ai_council.py's `debate` subcommand no longer
+    // accepts one. It was nominated once via --arbiter on scoped-review, before that round's
+    // reviews ran, specifically so the arbiter seat could never have findings of its own to be
+    // judging; run_debate_round reads that persisted nomination back itself. Accepting a fresh
+    // arbiter argument here would let a seat that already reviewed the code become arbiter
+    // after the fact, exactly the conflict of interest the up-front nomination exists to close.
+    private async _runDebate(sessionId: string, modelConfig?: Partial<ReviewOptions>) {
         if (this._operationAlreadyRunning()) {
             this._view?.webview.postMessage({ type: 'debateResult', error: 'Another operation is already running - wait for it to finish' });
+            return;
+        }
+        if (!(await this._guardOllamaConfigured(modelConfig))) {
+            this._view?.webview.postMessage({ type: 'debateResult', error: 'Ollama is enabled but not configured' });
             return;
         }
         const dbPath = this._getWorkspaceDbPath();
@@ -1285,18 +1585,19 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
 
         const args = [scriptPath, '--db', dbPath, ...this._modelSeatGlobalArgs(modelConfig),
             'debate', '--session', sessionId, ...this._modelSeatSubcommandArgs(modelConfig), '--json'];
-        if (arbiter) {
-            args.push('--mode', 'arbiter', '--arbiter', arbiter);
-        }
 
         const { result, error } = await this._runJsonCommandWithProgress(args, 'debateProgress');
         if (error) { this._showActionableError(`AI Council: ${error}`); }
         this._view?.webview.postMessage({ type: 'debateResult', result, error });
     }
 
-    private async _runConsolidate(sessionId: string, modelConfig?: Partial<ReviewOptions>) {
+    private async _runConsolidate(sessionId: string, modelConfig?: Partial<ReviewOptions>, force?: boolean) {
         if (this._operationAlreadyRunning()) {
             this._view?.webview.postMessage({ type: 'consolidateResult', error: 'Another operation is already running - wait for it to finish' });
+            return;
+        }
+        if (!(await this._guardOllamaConfigured(modelConfig))) {
+            this._view?.webview.postMessage({ type: 'consolidateResult', error: 'Ollama is enabled but not configured' });
             return;
         }
         const dbPath = this._getWorkspaceDbPath();
@@ -1307,7 +1608,8 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         const scriptPath = this._getScriptPath();
 
         const args = [scriptPath, '--db', dbPath, ...this._modelSeatGlobalArgs(modelConfig),
-            'consolidate', '--session', sessionId, ...this._modelSeatSubcommandArgs(modelConfig), '--json'];
+            'consolidate', '--session', sessionId, ...this._modelSeatSubcommandArgs(modelConfig),
+            ...(force ? ['--force'] : []), '--json'];
 
         const { result, error } = await this._runJsonCommandWithProgress(args, 'debateProgress');
         if (error) { this._showActionableError(`AI Council: ${error}`); }
@@ -1495,37 +1797,158 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         });
     }
 
+    // Shared spawn for the three CLI binaries - shell:true is used here with one manually-quoted
+    // command string (never a raw args array, which Node does NOT escape even under shell:true -
+    // that reintroduces exactly the injection risk shell:false was removed elsewhere in this
+    // file to close), since claude/codex/grok are .cmd shims on Windows that spawn can't run
+    // directly without a shell. The only caller-supplied pieces are fixed subcommand literals
+    // (e.g. 'auth', 'status', 'models'), never user/file-derived text.
+    //
+    // 30s not 5s: Grok CLI starts a leader process on a cold sidebar-open; 5s killed that
+    // before stdout and the UI treated it as "not logged in" / Log In. Claude/Codex auth
+    // status is fast; a longer fuse does not hurt them. Cleared on close/error so it never
+    // fires against an already-settled promise.
+    private static readonly CLI_STATUS_TIMEOUT_MS = 30000;
+
+    private _runCliCommand(bin: string, args: string[]): Promise<{ code: number | null; stdout: string; stderr: string }> {
+        return new Promise((resolve) => {
+            const command = [bin, ...args.map(AiCouncilSidebarProvider.quoteArg)].join(' ');
+            const proc = spawn(command, [], { shell: true });
+            let stdout = '';
+            let stderr = '';
+            let settled = false;
+            const finish = (result: { code: number | null; stdout: string; stderr: string }) => {
+                if (settled) { return; }
+                settled = true;
+                clearTimeout(watchdog);
+                resolve(result);
+            };
+            proc.stdout?.on('data', (d) => { stdout += d.toString(); });
+            proc.stderr?.on('data', (d) => { stderr += d.toString(); });
+            proc.on('close', (code) => finish({ code, stdout, stderr }));
+            proc.on('error', (err) => finish({ code: -1, stdout: '', stderr: err.message }));
+            const watchdog = setTimeout(() => {
+                try { proc.kill(); } catch { /* already exited */ }
+                finish({ code: -1, stdout, stderr: stderr || 'timed out' });
+            }, AiCouncilSidebarProvider.CLI_STATUS_TIMEOUT_MS);
+        });
+    }
+
+    // Read-only status display, not a picker (this extension has no CLI model setting - it
+    // always uses whatever model each CLI's own login/config already resolves to). Codex has no
+    // status/model-listing command, so its active model is read straight from its own config
+    // file; Grok's is parsed from `grok models`' own "Default model:" line, same source
+    // _checkCliStatus already trusts for Grok's login state.
+    private async _getCliDefaultModels(): Promise<Record<string, string>> {
+        const models: Record<string, string> = {};
+        const os = await import('os');
+        const fs = await import('fs');
+        const path = await import('path');
+
+        const [claudeOnPath, codexOnPath, grokOnPath] = await Promise.all([
+            this._cliOnPath('claude'),
+            this._cliOnPath('codex'),
+            this._cliOnPath('grok'),
+        ]);
+
+        if (claudeOnPath) {
+            models.claude = 'default';
+        }
+
+        if (codexOnPath) {
+            try {
+                const configPath = path.join(os.homedir(), '.codex', 'config.toml');
+                const configContent = fs.readFileSync(configPath, 'utf-8');
+                const modelMatch = configContent.match(/^model\s*=\s*"([^"]+)"/m);
+                models.codex = modelMatch ? modelMatch[1] : 'default';
+            } catch {
+                models.codex = 'default';
+            }
+        }
+
+        if (grokOnPath) {
+            try {
+                const { stdout } = await this._grokModels();
+                const defaultMatch = stdout.match(/Default model:\s*(\S+)/i) || stdout.match(/^\s*[*-]\s*([\w.-]+)\s*\(default\)/m);
+                models.grok = defaultMatch ? defaultMatch[1] : 'default';
+            } catch {
+                models.grok = 'default';
+            }
+        }
+
+        return models;
+    }
+
     private static readonly CLI_BIN: Record<string, string> = { openai: 'codex', anthropic: 'claude', xai: 'grok' };
 
-    // A CLI seat's own raw stderr (surfaced verbatim by cli_transport.py's RuntimeError, up to
-    // 500 chars) reaches this far as plain text - recognizes the common shapes of "you're not
-    // logged in" across claude/codex/grok's actual wording so that failure can offer a Log In
-    // action instead of just a dismissible error dialog.
-    private static detectCliAuthFailure(text: string): 'openai' | 'anthropic' | 'xai' | null {
-        const lower = text.toLowerCase();
-        const looksLikeAuthFailure = /not logged in|not authenticated|please (log|sign) in|run .*login|authentication (required|failed|error)|unauthorized|401/.test(lower);
-        if (!looksLikeAuthFailure) { return null; }
-        if (lower.includes('codex') || lower.includes('chatgpt')) { return 'openai'; }
-        if (lower.includes('claude')) { return 'anthropic'; }
-        if (lower.includes('grok') || lower.includes('xai') || lower.includes('x.ai')) { return 'xai'; }
+    // Maps a review-result model key (the same normalizeModelKey() output the stdout parser
+    // already produces - "gpt-4", "gpt-cli", "claude", "claude-cli", "grok", "grok-cli",
+    // "ollama") to which settings key/kind actually needs fixing. This is a structural lookup
+    // from an identifier the engine already prints (ai_council.py's "[!] MODEL ERROR" line
+    // always names the real seat), not a guess from the wording of an error message - the
+    // previous approach (detectCliAuthFailure) tried to recognize auth failures by matching
+    // English phrases like "not logged in" against arbitrary process stderr, which silently
+    // did nothing for any wording it didn't anticipate, any non-CLI seat, or any non-auth
+    // failure (a missing API key, a bad Ollama URL) at all.
+    private static readonly MODEL_KEY_TO_SEAT: Record<string, { key: string; kind: 'cli' | 'api' }> = {
+        'gpt-4': { key: 'openai', kind: 'api' },
+        'gpt-cli': { key: 'openai', kind: 'cli' },
+        'claude': { key: 'anthropic', kind: 'api' },
+        'claude-cli': { key: 'anthropic', kind: 'cli' },
+        'grok': { key: 'xai', kind: 'api' },
+        'grok-cli': { key: 'xai', kind: 'cli' },
+        'gemini': { key: 'google', kind: 'api' },
+        'ollama': { key: 'ollama', kind: 'api' },
+    };
+
+    // Identifies which seat a process failure actually belongs to using structural markers the
+    // engine itself emits - never by guessing from the wording of an error message. Two real
+    // signals: cli_transport.py's own "AUTH_REQUIRED:<cli>:<model>" tag (an explicit
+    // machine-readable marker, not English text to pattern-match), and ai_council.py's
+    // "[!] <MODEL> ERROR" line (the same structural marker parseModelProgressLine already
+    // relies on for live progress). Either one names the real seat directly, so there's nothing
+    // to infer.
+    private static identifyFailedSeat(message: string): { key: string; kind: 'cli' | 'api' } | null {
+        const authMatch = message.match(/AUTH_REQUIRED:([^:]+):/);
+        if (authMatch) {
+            const cliName = authMatch[1].replace(/\.cmd$/, '').replace(/\.exe$/, '').toLowerCase();
+            const provider = (Object.keys(AiCouncilSidebarProvider.CLI_BIN) as (keyof typeof AiCouncilSidebarProvider.CLI_BIN)[])
+                .find(p => AiCouncilSidebarProvider.CLI_BIN[p] === cliName);
+            return provider ? { key: provider, kind: 'cli' } : null;
+        }
+        const modelErrorMatch = message.match(/\[!\]\s+([\w-]+)\s+ERROR/i);
+        if (modelErrorMatch) {
+            return AiCouncilSidebarProvider.MODEL_KEY_TO_SEAT[normalizeModelKey(modelErrorMatch[1])] || null;
+        }
         return null;
     }
 
-    // Shared error surface: a plain dismissible dialog, or - when the text looks like a CLI
-    // auth failure - one with a "Log In" action that opens a terminal running that CLI's own
-    // login command, same mechanism as the seat-toggle check.
+    // Shared error surface for every process failure in this file: identify the real seat via
+    // identifyFailedSeat() when the message carries one of the structural markers above, and
+    // give the exact right action for it (Log In for a CLI seat, Open Settings scoped to the
+    // exact broken setting for an API/Ollama seat) - never a bare dismiss-only dialog, since an
+    // error with no path forward is easy to miss and leaves the user to self-diagnose. When no
+    // specific seat can be identified (a whole-process crash unrelated to any one seat, e.g.
+    // "no workspace open"), "Open Settings" still opens the AI Council settings section as a
+    // generic, always-correct fallback action rather than offering nothing.
     private async _showActionableError(message: string) {
-        const provider = AiCouncilSidebarProvider.detectCliAuthFailure(message);
-        const bin = provider ? AiCouncilSidebarProvider.CLI_BIN[provider] : null;
-        if (bin) {
+        const seat = AiCouncilSidebarProvider.identifyFailedSeat(message);
+        if (seat?.kind === 'cli') {
+            const bin = AiCouncilSidebarProvider.CLI_BIN[seat.key];
             const result = await vscode.window.showErrorMessage(message, 'Log In');
-            if (result === 'Log In') {
+            if (result === 'Log In' && bin) {
                 const terminal = vscode.window.createTerminal(`${bin} Login`);
                 terminal.show();
                 terminal.sendText(`${bin} login`);
             }
-        } else {
-            await vscode.window.showErrorMessage(message);
+            return;
+        }
+        const settingsTarget = seat?.kind === 'api'
+            ? (seat.key === 'ollama' ? 'ai-council.ollamaUrl' : `ai-council.apiKeys.${seat.key}`)
+            : 'ai-council';
+        const result = await vscode.window.showErrorMessage(message, 'Open Settings');
+        if (result === 'Open Settings') {
+            vscode.commands.executeCommand('workbench.action.openSettings', settingsTarget);
         }
     }
 
@@ -1535,6 +1958,18 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
     // of inputs safely rather than handle arbitrary content.
     private static quoteArg(value: string): string {
         return '"' + value.replace(/"/g, '\\"') + '"';
+    }
+
+    // One `grok models` per sidebar refresh - status check and default-model display used to
+    // fire two cold-starts against the same leader socket and 5s-kill both.
+    private async _grokModels(): Promise<{ code: number | null; stdout: string; stderr: string }> {
+        if (this._grokModelsCache && Date.now() - this._grokModelsAt < 15000) {
+            return this._grokModelsCache;
+        }
+        const result = await this._runCliCommand('grok', ['models']);
+        this._grokModelsCache = result;
+        this._grokModelsAt = Date.now();
+        return result;
     }
 
     // Real login-state + active-model check per CLI, using each CLI's own status reporting -
@@ -1547,25 +1982,15 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             return { loggedIn: false, error: `${bin} is not on PATH` };
         }
 
-        // These three CLIs are .cmd shims on Windows, which Node's spawn cannot execute
-        // directly without shell:true (unlike a real .exe such as python) - shell:true is used
-        // here with one manually-quoted command string (never a raw args array, which Node
-        // does NOT escape even under shell:true - that reintroduces exactly the injection risk
-        // shell:false was removed elsewhere in this file to close).
-        const run = (args: string[]): Promise<{ code: number | null; stdout: string; stderr: string }> =>
-            new Promise((resolve) => {
-                const command = [bin, ...args.map(AiCouncilSidebarProvider.quoteArg)].join(' ');
-                const proc = spawn(command, [], { shell: true });
-                let stdout = '';
-                let stderr = '';
-                proc.stdout?.on('data', (d) => { stdout += d.toString(); });
-                proc.stderr?.on('data', (d) => { stderr += d.toString(); });
-                proc.on('close', (code) => resolve({ code, stdout, stderr }));
-                proc.on('error', (err) => resolve({ code: -1, stdout: '', stderr: err.message }));
-            });
+        const run = (args: string[]) => this._runCliCommand(bin, args);
+        const timedOut = (code: number | null, stderr: string) =>
+            code === -1 && /timed out/i.test(stderr || '');
 
         if (key === 'anthropic') {
             const { code, stdout, stderr } = await run(['auth', 'status', '--json']);
+            if (timedOut(code, stderr)) {
+                return { loggedIn: true, detail: 'status check timed out - leaving seat enabled' };
+            }
             try {
                 const parsed = JSON.parse(stdout);
                 if (parsed.loggedIn) {
@@ -1580,6 +2005,9 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         if (key === 'openai') {
             // codex writes its status line to stderr, not stdout - verified directly.
             const { code, stdout, stderr } = await run(['login', 'status']);
+            if (timedOut(code, stderr)) {
+                return { loggedIn: true, detail: 'status check timed out - leaving seat enabled' };
+            }
             const combined = `${stdout}${stderr}`;
             if (code === 0 && /logged in/i.test(combined)) {
                 return { loggedIn: true, detail: combined.trim() };
@@ -1589,7 +2017,11 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
 
         // xai (grok): "grok models" itself states login status on its first line and lists the
         // account's actual default model - the same real signal used elsewhere, not guessed.
-        const { code, stdout, stderr } = await run(['models']);
+        const { code, stdout, stderr } = await this._grokModels();
+        if (timedOut(code, stderr)) {
+            // Cold-start leader missed the window - that is not a logout. Leave the seat on.
+            return { loggedIn: true, detail: 'status check timed out - leaving seat enabled' };
+        }
         if (code !== 0 || !stdout.trim()) {
             return { loggedIn: false, error: (stderr || 'grok models returned no output').substring(0, 200) };
         }
@@ -1601,7 +2033,14 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         return { loggedIn: true, model: defaultMatch ? defaultMatch[1] : undefined };
     }
 
-    private async _checkApiKey(modelId: string, name: string, key: string, url: string, free?: boolean, kind?: string) {
+    // silent=true skips the interruptive popup (used for restoreToggles' bulk re-validation of
+    // every seat that was enabled last session - a dialog per restored seat on every panel
+    // open/reload would be far more intrusive than the single deliberate click this popup was
+    // designed for). The toggle is still unchecked either way, and _sendApiKeyStatus's own
+    // status labels (already refreshed right after this in the restoreToggles flow) explain
+    // why - so a silently-invalid restored seat still becomes visibly unchecked with a reason
+    // next to it, never a seat that's actually enabled but non-functional with no signal at all.
+    private async _checkApiKey(modelId: string, name: string, key: string, url: string, free?: boolean, kind?: string, silent?: boolean) {
         const config = vscode.workspace.getConfiguration('ai-council');
         const seatKind = kind || 'api';
 
@@ -1609,35 +2048,62 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             const status = await this._checkCliStatus(key);
             if (!status.loggedIn) {
                 const bin = AiCouncilSidebarProvider.CLI_BIN[key];
-                const result = await vscode.window.showWarningMessage(
-                    `${name}: ${status.error || 'not logged in'}`,
-                    'Log In'
-                );
-                if (result === 'Log In' && bin) {
-                    const terminal = vscode.window.createTerminal(`${name} Login`);
-                    terminal.show();
-                    terminal.sendText(`${bin} login`);
+                if (!silent) {
+                    const result = await vscode.window.showWarningMessage(
+                        `${name}: ${status.error || 'not logged in'}`,
+                        'Log In'
+                    );
+                    if (result === 'Log In' && bin) {
+                        const terminal = vscode.window.createTerminal(`${name} Login`);
+                        terminal.show();
+                        terminal.sendText(`${bin} login`);
+                    }
                 }
                 this._view?.webview.postMessage({ type: 'uncheckModel', modelId });
             }
             return;
         }
 
+        // Ollama's "key" (apiKeys.ollama) is the auth credential, not the endpoint - a toggle
+        // can pass the credential check below while ai-council.ollamaUrl is still empty, which
+        // silently launches the Ollama reviewer pointed at nothing (confirmed live: the engine
+        // logs "Ollama reviewer enabled (model @ )" with a blank URL and no error at all, no
+        // popup, nothing telling the user to configure it). Check the URL explicitly here so
+        // this toggle gets the same actionable treatment every other seat's precondition does.
+        if (key === 'ollama') {
+            const ollamaUrl = config.get<string>('ollamaUrl') || '';
+            if (!ollamaUrl.trim()) {
+                if (!silent) {
+                    const result = await vscode.window.showWarningMessage(
+                        `${name} needs a server URL (ai-council.ollamaUrl) - reviews using this seat will silently do nothing without it`,
+                        'Open Settings'
+                    );
+                    if (result === 'Open Settings') {
+                        vscode.commands.executeCommand('workbench.action.openSettings', 'ai-council.ollamaUrl');
+                    }
+                }
+                this._view?.webview.postMessage({ type: 'uncheckModel', modelId });
+                return;
+            }
+        }
+
         const settingsKey = config.get<string>(`apiKeys.${key}`) || '';
         const hasKey = Boolean(settingsKey.trim());
 
         if (!hasKey) {
-            const freeNote = free ? ' (FREE tier available!)' : '';
-            const result = await vscode.window.showWarningMessage(
-                `${name} needs an API key${freeNote}`,
-                'Open Settings',
-                'Get API Key'
-            );
+            if (!silent) {
+                const freeNote = free ? ' (FREE tier available!)' : '';
+                const result = await vscode.window.showWarningMessage(
+                    `${name} needs an API key${freeNote}`,
+                    'Open Settings',
+                    'Get API Key'
+                );
 
-            if (result === 'Open Settings') {
-                vscode.commands.executeCommand('workbench.action.openSettings', `ai-council.apiKeys.${key}`);
-            } else if (result === 'Get API Key') {
-                vscode.env.openExternal(vscode.Uri.parse(url));
+                if (result === 'Open Settings') {
+                    vscode.commands.executeCommand('workbench.action.openSettings', `ai-council.apiKeys.${key}`);
+                } else if (result === 'Get API Key') {
+                    vscode.env.openExternal(vscode.Uri.parse(url));
+                }
             }
 
             this._view?.webview.postMessage({
@@ -1657,7 +2123,7 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                     'Authorization': `Bearer ${apiKey}`,
                     'Content-Type': 'application/json'
                 },
-                timeout: 5000
+                timeout: 15000
             };
 
             console.log('AI Council: Fetching OpenAI account info...');
@@ -1867,6 +2333,22 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         .collapsible-content.collapsed {
             max-height: 0;
             opacity: 0;
+        }
+
+        .collapse-all-row {
+            text-align: right;
+            margin-bottom: 4px;
+        }
+
+        .collapse-all-link {
+            font-size: 10px;
+            color: var(--vscode-textLink-foreground);
+            cursor: pointer;
+            user-select: none;
+        }
+
+        .collapse-all-link:hover {
+            text-decoration: underline;
         }
 
         .btn {
@@ -2600,6 +3082,36 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             margin-top: 10px;
         }
 
+        .scoped-session-item {
+            padding: 8px;
+            margin-bottom: 6px;
+            border: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.3));
+            border-radius: 4px;
+            cursor: pointer;
+        }
+
+        .scoped-session-item:hover {
+            background: var(--vscode-list-hoverBackground);
+        }
+
+        .scoped-session-scope {
+            font-size: 12px;
+        }
+
+        .scoped-session-meta {
+            font-size: 10px;
+            opacity: 0.7;
+            margin-top: 2px;
+        }
+
+        #scopedResumedBanner {
+            font-size: 11px;
+            opacity: 0.85;
+            margin: 6px 0;
+            display: flex;
+            align-items: center;
+        }
+
         .scoped-round-title {
             font-size: 11px;
             font-weight: 600;
@@ -2937,7 +3449,6 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             box-shadow: 0 0 0 1px var(--vscode-focusBorder);
         }
 
-        #debateArbiterSelect,
         #scopedWriterSelect {
             width: 100%;
         }
@@ -3114,6 +3625,10 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         <div class="subtitle">Multi-Model Code Review</div>
     </div>
 
+    <div class="collapse-all-row">
+        <span class="collapse-all-link" id="collapseAllLink" onclick="collapseBothSections()">Collapse both</span>
+    </div>
+
     <div class="section">
         <div class="collapsible-header" id="modelSelectionHeader" onclick="toggleModelSelection()">
             <span class="collapsible-title">&#9881; MODEL SELECTION</span>
@@ -3221,28 +3736,39 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
     </div>
 
     <div class="section options-section">
-        <div class="section-title">&#9881; REVIEW OPTIONS</div>
-        <div class="toggle-group">
-            <div class="power-mode-item" id="powerModeItem">
-                <div class="toggle-item">
-                    <span class="toggle-label">&#9889; Power Mode</span>
-                    <label class="toggle-switch power">
-                        <input type="checkbox" id="powerMode">
-                        <span class="toggle-slider"></span>
-                    </label>
+        <div class="collapsible-header" id="reviewOptionsHeader" onclick="toggleReviewOptions()">
+            <span class="collapsible-title">&#9881; REVIEW OPTIONS</span>
+            <span class="collapsible-arrow">&#9660;</span>
+        </div>
+        <div class="collapsible-content" id="reviewOptionsContent">
+            <div class="toggle-group">
+                <div class="power-mode-item" id="powerModeItem">
+                    <div class="toggle-item">
+                        <span class="toggle-label">&#9889; Power Mode</span>
+                        <label class="toggle-switch power">
+                            <input type="checkbox" id="powerMode">
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                    <div class="power-mode-hint">Use premium models (higher cost, better results) for API seats - GPT-4, Claude, Grok, Gemini - including in Debate and Consolidate. CLI and Ollama seats always use whatever model they're already configured with.</div>
                 </div>
-                <div class="power-mode-hint">Use premium models (higher cost, better results) for API seats - GPT-4, Claude, Grok, Gemini - including in Debate and Consolidate. CLI and Ollama seats always use whatever model they're already configured with.</div>
-            </div>
-            <div class="toggle-item synthesizer-item">
-                <span class="toggle-label">&#9878; Council Verdict by</span>
-                <select id="synthesizerSelect" class="synthesizer-select">
-                    <option value="auto">Auto (Best Available)</option>
-                </select>
-            </div>
-            <div class="toggle-item synthesizer-item">
-                <span class="toggle-label">&#128295; Fix Code with</span>
-                <select id="fixerSelect" class="synthesizer-select">
-                </select>
+                <div class="toggle-item synthesizer-item">
+                    <span class="toggle-label">&#9878; Council Verdict by</span>
+                    <select id="synthesizerSelect" class="synthesizer-select">
+                        <option value="auto">Auto (Best Available)</option>
+                    </select>
+                </div>
+                <div class="toggle-item synthesizer-item">
+                    <span class="toggle-label">&#128295; Fix Code with</span>
+                    <select id="fixerSelect" class="synthesizer-select">
+                    </select>
+                </div>
+                <div class="toggle-item synthesizer-item" id="arbiterSelectRow" style="display:none;">
+                    <span class="toggle-label">&#9878; Arbiter</span>
+                    <select id="arbiterSelect" class="synthesizer-select">
+                        <option value="none">None</option>
+                    </select>
+                </div>
             </div>
         </div>
     </div>
@@ -3261,19 +3787,23 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
     </div>
 
     <div class="scoped-review-panel" id="scopedReviewPanel">
+        <div id="scopedSessionsPanel" style="display:none;">
+            <div style="font-size:11px;opacity:0.85;margin-bottom:6px;">Recent sessions for this file - pick one to continue, or start a new review below.</div>
+            <div id="scopedSessionsList"></div>
+        </div>
         <div id="scopedScopeInput">
             <div style="font-size:11px;opacity:0.85;margin-bottom:6px;">What should the council focus on?</div>
             <textarea id="scopedScopeText" placeholder="e.g. Review this based on how it handles concurrent access to the shared cache"></textarea>
             <button class="btn btn-primary" onclick="startScopedReview()">Start Scoped Review</button>
         </div>
+        <div id="scopedResumedBanner" style="display:none;">
+            <span id="scopedResumedText"></span>
+            <button class="btn btn-secondary" onclick="startNewScopedReview()" style="margin-left:8px;">Start New Review</button>
+        </div>
         <div id="scopedRounds"></div>
 
-        <!-- Pickers show on panel open (enabled seats); action buttons start disabled until setScopedSessionReady() confirms round 0 finished. -->
+        <!-- Action buttons start disabled until setScopedSessionReady() confirms round 0 finished. Arbiter (if any) was already nominated before this round ran, via the always-visible Arbiter picker - nothing to choose here. -->
         <div id="debateStartRow" style="display:none;">
-            <div id="debateArbiterRow" style="display:none;margin-top:8px;">
-                <div style="font-size:11px;opacity:0.85;margin-bottom:4px;">Arbiter (rules on disputes instead of debating):</div>
-                <select id="debateArbiterSelect"></select>
-            </div>
             <button class="btn btn-scoped" onclick="startDebate()" id="startDebateBtn" disabled title="Run the initial scoped review first">&#9878; Debate Findings</button>
         </div>
 
@@ -3287,7 +3817,7 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             <div id="debateRoundsContainer"></div>
             <!-- Hidden until a debate round finishes - revealed in renderDebateRound(). -->
             <button class="btn btn-scoped" onclick="reconveneDebate()" id="reconveneBtn" style="display:none;">&#128260; Re-convene</button>
-            <button class="btn btn-primary" onclick="runConsolidate()" id="consolidateBtn" style="display:none;">&#10003; Consolidate Final Review</button>
+            <button class="btn btn-primary" onclick="runConsolidate()" id="consolidateBtn" style="display:none;" title="Debate already auto-consolidates - use this to discard that result and try again">&#8635; Re-consolidate</button>
             <div id="consolidatedSection"></div>
         </div>
 
@@ -3454,6 +3984,11 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                         if (scopedPanel && scopedPanel.style.display === 'block') {
                             refreshScopedPickers();
                         }
+                        // A manual click is not itself an "error" signal (the user is
+                        // deliberately choosing, not discovering a break) - only the
+                        // nothing-enabled case applies here; a genuinely broken seat is caught
+                        // by the apiKeyStatus handler instead, which runs independently of clicks.
+                        checkModelSelectionAutoOpen(getEnabledSeats());
                     });
                 }
             });
@@ -3467,9 +4002,34 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                 });
             }
 
+            // Council Verdict by / Fix Code with / Arbiter - these were never persisted at all
+            // (reproduced: collapse the Review Options section, reopen it, every pick had
+            // reverted to Auto/blank/None). Every actual user selection saves immediately; a
+            // rebuild triggered by refreshSeatSelects (a seat toggle changing) does NOT go
+            // through this listener at all since it sets .innerHTML/.value directly rather than
+            // simulating a click, so a picker being repopulated never re-saves a value the user
+            // didn't just choose.
+            for (const id of ['synthesizerSelect', 'fixerSelect', 'arbiterSelect']) {
+                const sel = document.getElementById(id);
+                if (sel) {
+                    sel.addEventListener('change', saveSeatSelections);
+                }
+            }
+
             // Tell extension we're ready to receive messages
             vscode.postMessage({ command: 'webviewReady' });
         })();
+
+        function saveSeatSelections() {
+            vscode.postMessage({
+                command: 'saveSeatSelections',
+                selections: {
+                    synthesizerSelect: document.getElementById('synthesizerSelect')?.value || 'auto',
+                    fixerSelect: document.getElementById('fixerSelect')?.value || '',
+                    arbiterSelect: document.getElementById('arbiterSelect')?.value || 'none',
+                }
+            });
+        }
 
         function getModelConfig() {
             return {
@@ -3482,16 +4042,79 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                 enableGemini: document.getElementById('enableGemini').checked,
                 enableOllama: document.getElementById('enableOllama').checked,
                 powerMode: document.getElementById('powerMode').checked,
-                synthesizer: document.getElementById('synthesizerSelect').value
+                synthesizer: document.getElementById('synthesizerSelect').value,
+                arbiter: document.getElementById('arbiterSelect')?.value || 'none'
             };
         }
 
+        // Persisted, user-driven collapse for the two top sections. sectionCollapsed mirrors
+        // what's currently shown (kept in sync by setSectionCollapsed, the only place that
+        // touches both the DOM and this object) and is saved to globalState on every manual
+        // toggle - but NOT on an auto-uncollapse (see setSectionCollapsed), so an error surfacing
+        // the panel doesn't silently become the new default next time nothing is wrong.
+        let sectionCollapsed = { modelSelection: false, reviewOptions: false };
+
+        function setSectionCollapsed(key, headerId, contentId, collapsed, persist) {
+            const header = document.getElementById(headerId);
+            const content = document.getElementById(contentId);
+            if (!header || !content) { return; }
+            header.classList.toggle('collapsed', collapsed);
+            content.classList.toggle('collapsed', collapsed);
+            sectionCollapsed[key] = collapsed;
+            if (persist) {
+                vscode.postMessage({ command: 'saveSectionCollapsed', sections: sectionCollapsed });
+            }
+        }
+
         function toggleModelSelection() {
-            const header = document.getElementById('modelSelectionHeader');
-            const content = document.getElementById('modelSelectionContent');
-            if (header && content) {
-                header.classList.toggle('collapsed');
-                content.classList.toggle('collapsed');
+            setSectionCollapsed('modelSelection', 'modelSelectionHeader', 'modelSelectionContent', !sectionCollapsed.modelSelection, true);
+        }
+
+        function toggleReviewOptions() {
+            setSectionCollapsed('reviewOptions', 'reviewOptionsHeader', 'reviewOptionsContent', !sectionCollapsed.reviewOptions, true);
+        }
+
+        function collapseBothSections() {
+            setSectionCollapsed('modelSelection', 'modelSelectionHeader', 'modelSelectionContent', true, true);
+            setSectionCollapsed('reviewOptions', 'reviewOptionsHeader', 'reviewOptionsContent', true, true);
+        }
+
+        // Model Selection auto-uncollapses whenever a seat the user had ON just showed broken
+        // (no key / CLI not ready) or nothing at all is enabled - both are "the user needs to
+        // look at this panel right now" states that a persisted collapse must not hide. This is
+        // a forced un-collapse (persist=false): it does not overwrite the user's own saved
+        // preference, so the section goes back to collapsed on its own once the error clears and
+        // the panel is reopened, rather than the error permanently pinning it open.
+        //
+        // Takes previouslyEnabledSeats, a snapshot of getEnabledSeats() captured BEFORE
+        // updateKeyStatus/updateCliActiveModels ran (see the apiKeyStatus handler) - by the time
+        // this function runs, updateKeyStatus has already unchecked any seat it just found
+        // broken, so re-reading getEnabledSeats() here would never see the very seat that broke
+        // (it's no longer "enabled"). Checking every seat regardless of the user's intent would
+        // be wrong too - a key the user simply never configured is not an error, it's normal, and
+        // would falsely auto-open this panel forever. The snapshot is the one correct baseline:
+        // "of the seats you had turned on a moment ago, is any of them now broken."
+        function checkModelSelectionAutoOpen(previouslyEnabledSeats) {
+            const anyEnabled = previouslyEnabledSeats.length > 0;
+            const anyBroken = previouslyEnabledSeats.some(seatIsBroken);
+            if ((!anyEnabled || anyBroken) && sectionCollapsed.modelSelection) {
+                setSectionCollapsed('modelSelection', 'modelSelectionHeader', 'modelSelectionContent', false, false);
+            }
+        }
+
+        // Review Options auto-uncollapses only when an error actually reaches one of ITS OWN
+        // selections - i.e. the currently-picked synthesizer/fixer/arbiter seat (not "auto"/
+        // "none") has gone broken - not for an unrelated seat error elsewhere that this section
+        // has no stake in.
+        function checkReviewOptionsAutoOpen() {
+            const picks = [
+                document.getElementById('synthesizerSelect')?.value,
+                document.getElementById('fixerSelect')?.value,
+                document.getElementById('arbiterSelect')?.value,
+            ].filter(v => v && v !== 'auto' && v !== 'none');
+            const affected = picks.some(seatIsBroken);
+            if (affected && sectionCollapsed.reviewOptions) {
+                setSectionCollapsed('reviewOptions', 'reviewOptionsHeader', 'reviewOptionsContent', false, false);
             }
         }
 
@@ -3537,7 +4160,112 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             panel.style.display = isOpen ? 'none' : 'block';
             if (!isOpen) {
                 refreshScopedPickers();
+                // Only offer to resume when nothing is already loaded in this panel instance -
+                // a webview reload (hidden/recreated sidebar) always starts with
+                // currentScopedSessionId unset, which is exactly the case that needs recovery;
+                // re-toggling the panel open/closed within the SAME still-alive webview must not
+                // stomp on a session already on screen.
+                if (!currentScopedSessionId) {
+                    vscode.postMessage({ command: 'listScopedSessions' });
+                }
             }
+        }
+
+        function renderScopedSessionsList(sessions) {
+            const panel = document.getElementById('scopedSessionsPanel');
+            const list = document.getElementById('scopedSessionsList');
+            if (!sessions || sessions.length === 0) {
+                panel.style.display = 'none';
+                return;
+            }
+            list.innerHTML = sessions.map(s => {
+                const when = s.created_at ? escapeHtml(s.created_at) : '';
+                const roundsLabel = (s.max_round || 0) > 0 ? ('round ' + s.max_round) : 'round 0';
+                // JSON.stringify wraps in double quotes, which would collide with this
+                // attribute's own double-quote delimiter and truncate the onclick right at the
+                // opening quote (reproduced live: clicking a session did nothing at all, because
+                // the resulting markup was broken HTML, not a JS error). data-session-id (read
+                // back in the delegated click handler below) sidesteps quoting entirely - no
+                // string ever gets embedded inside an inline event-handler attribute.
+                return '<div class="scoped-session-item" data-session-id="' + escapeHtml(s.session_id) + '">' +
+                    '<div class="scoped-session-scope">' + escapeHtml(s.scope || '(no scope text)') + '</div>' +
+                    '<div class="scoped-session-meta">' + when + ' - ' + roundsLabel + '</div>' +
+                    '</div>';
+            }).join('');
+            panel.style.display = 'block';
+        }
+
+        // Delegated once on the (static) list container rather than re-bound per item on every
+        // render - the container itself never gets replaced, only its innerHTML, which would
+        // silently drop any listener attached directly to a .scoped-session-item element.
+        document.getElementById('scopedSessionsList').addEventListener('click', (e) => {
+            const item = e.target.closest('.scoped-session-item');
+            if (item) { resumeScopedSession(item.dataset.sessionId); }
+        });
+
+        function resumeScopedSession(sessionId) {
+            setScopedStatus('Loading session...');
+            vscode.postMessage({ command: 'resumeScopedSession', sessionId: sessionId });
+        }
+
+        function startNewScopedReview() {
+            currentScopedSessionId = null;
+            currentScopedRoster = null;
+            currentScopedArbiter = null;
+            document.getElementById('scopedSessionsPanel').style.display = 'none';
+            document.getElementById('scopedResumedBanner').style.display = 'none';
+            document.getElementById('scopedScopeInput').style.display = 'block';
+            document.getElementById('scopedScopeText').value = '';
+            document.getElementById('scopedRounds').innerHTML = '';
+            document.getElementById('debateSection').style.display = 'none';
+            document.getElementById('debateRoundsContainer').innerHTML = '';
+            document.getElementById('consolidatedSection').innerHTML = '';
+            document.getElementById('scopedFollowup').style.display = 'none';
+            setScopedSessionReady(false);
+            setScopedStatus('');
+        }
+
+        // Rebuilds the panel from scoped-resume's snapshot using the SAME rendering functions a
+        // live run uses (startScopedRound/updateScopedRoundProgress/finishScopedRound,
+        // renderDebateRound, renderConsolidated) fed completed data instead of streamed progress
+        // - one rendering path for both "just finished" and "reopened later," so they can't drift.
+        function applyScopedResume(result) {
+            document.getElementById('scopedSessionsPanel').style.display = 'none';
+            document.getElementById('scopedScopeInput').style.display = 'none';
+            document.getElementById('scopedRounds').innerHTML = '';
+            document.getElementById('debateRoundsContainer').innerHTML = '';
+            document.getElementById('consolidatedSection').innerHTML = '';
+
+            document.getElementById('scopedResumedBanner').style.display = 'block';
+            document.getElementById('scopedResumedText').textContent = 'Resumed: ' + (result.scope || '(no scope text)');
+
+            currentScopedSessionId = result.session_id;
+            currentScopedArbiter = result.arbiter || null;
+            currentScopedRoster = Object.keys(result.latest_reviews || {});
+            setScopedSessionReady(!!result.latest_reviews);
+            document.getElementById('scopedFollowup').style.display = result.latest_reviews ? 'block' : 'none';
+
+            const models = Object.keys(result.latest_reviews || {});
+            if (models.length > 0) {
+                const roundId = startScopedRound('Round ' + (result.rounds.filter(r => r.role === 'council').slice(-1)[0]?.round_num ?? 0) + ' (resumed)', models);
+                for (const [model, review] of Object.entries(result.latest_reviews)) {
+                    if (review && review.error) {
+                        updateScopedRoundProgress(roundId, model, { error: review.error });
+                    } else {
+                        updateScopedRoundProgress(roundId, model, { score: review.quality_score || 0, issues: (review.issues || []).length });
+                    }
+                }
+                finishScopedRound(roundId, result.latest_consensus || {}, result.report_path, result.latest_reviews);
+            }
+
+            if (result.debate_round) {
+                document.getElementById('debateSection').style.display = 'block';
+                renderDebateRound(result.debate_round);
+            }
+            if (result.consolidation && !result.consolidation.error) {
+                renderConsolidated(result.consolidation);
+            }
+            setScopedStatus('');
         }
 
         function scoreClass(score) {
@@ -3615,6 +4343,23 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             return roundId;
         }
 
+        // Called when the backend rejects a round outright (e.g. the roster-mismatch preflight)
+        // after scopedRoundStart already created cards and started the timer - without this,
+        // an error result left the timer running forever and every card stuck on
+        // "Analyzing... (Ns)", since scopedReviewResult/scopedFollowupResult's error branches
+        // only set a status message and returned (reproduced: a rejected follow-up left its
+        // round's cards ticking indefinitely with no visible failure).
+        function failScopedRound(roundId, reason) {
+            if (!roundId) { return; }
+            stopScopedRoundTimer(roundId);
+            const cardsContainer = document.getElementById(roundId + '-cards');
+            if (!cardsContainer) { return; }
+            cardsContainer.querySelectorAll('.model-card.reviewing').forEach(card => {
+                const model = card.id.replace(roundId + '-card-', '');
+                updateScopedRoundProgress(roundId, model, { error: reason });
+            });
+        }
+
         function stopScopedRoundTimer(roundId) {
             if (scopedRoundTimers[roundId]) {
                 clearInterval(scopedRoundTimers[roundId]);
@@ -3634,7 +4379,20 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             card.classList.remove('reviewing');
             if (data.error) {
                 card.classList.add('error');
-                if (status) status.textContent = 'Error';
+                // The live stdout parser only ever knows a plain "[!] MODEL ERROR" happened
+                // (data.error === true, no detail text exists on that stdout line by design) -
+                // reconcileScopedRoundCards calls back in with the REAL message once the round's
+                // full JSON result is available, so a card that only ever showed the bare word
+                // "Error" (with no way to find out what actually failed short of digging through
+                // raw process output) now shows the real reason once it's known.
+                if (status) {
+                    if (typeof data.error === 'string' && data.error) {
+                        status.textContent = data.error;
+                        status.title = data.error;
+                    } else {
+                        status.textContent = 'Error';
+                    }
+                }
                 if (spinner) spinner.outerHTML = '<div class="error-x">!</div>';
             } else {
                 card.classList.add('complete');
@@ -3656,10 +4414,17 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         function reconcileScopedRoundCards(roundId, reviews) {
             for (const [model, review] of Object.entries(reviews || {})) {
                 const card = document.getElementById(roundId + '-card-' + model);
-                if (!card || !card.classList.contains('reviewing')) { continue; }
+                if (!card) { continue; }
+                // Also refresh cards already flipped to .error from a live "[!] MODEL ERROR"
+                // line - that line used to carry no detail, so the card said only "Error"
+                // and this skip left it that way even after JSON arrived with the real
+                // timeout/auth message (reproduced: Grok CLI 240s timeout).
+                const stillReviewing = card.classList.contains('reviewing');
+                const needsErrorDetail = card.classList.contains('error') && review.error && typeof review.error === 'string';
+                if (!stillReviewing && !needsErrorDetail) { continue; }
                 if (review.error) {
-                    updateScopedRoundProgress(roundId, model, { error: true });
-                } else {
+                    updateScopedRoundProgress(roundId, model, { error: review.error });
+                } else if (stillReviewing) {
                     updateScopedRoundProgress(roundId, model, { score: review.quality_score || 0, issues: (review.issues || []).length });
                 }
             }
@@ -3675,11 +4440,21 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                 '<div class="summary-header">' +
                     '<span class="summary-title">Round Consensus</span>' +
                     '<span class="consensus-score score-badge ' + scoreClass(consensus.average_score ?? 0) + '">' + avgScore + '/10</span>' +
-                '</div>' +
-                '<div class="summary-stats">' +
+                '</div>';
+            if (consensus.synthesis_error) {
+                // The seat reviews above are real and unaffected - only the extra grouping
+                // call failed - so "Agreed: 0 / Unique: N" here would misleadingly read as a
+                // real finding (no consensus) rather than what actually happened (grouping
+                // itself couldn't run). Show that distinction instead of the normal counts.
+                html += '<div class="summary-stats"><span class="stat-item" style="color:#ef4444;">' +
+                    '&#9888; Consensus grouping failed: ' + escapeHtml(consensus.synthesis_error) +
+                    '</span></div>';
+            } else {
+                html += '<div class="summary-stats">' +
                     '<span class="stat-item">Agreed: <span class="stat-value">' + (consensus.consensus_issues || []).length + '</span></span>' +
                     '<span class="stat-item">Unique: <span class="stat-value">' + (consensus.unique_insights || []).length + '</span></span>' +
-                '</div>';
+                    '</div>';
+            }
             if (reportPath) {
                 // No inline onclick with embedded data here - a Windows path routinely
                 // contains characters (quotes if ever present, and JSON.stringify's own
@@ -3726,60 +4501,46 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             return seats;
         }
 
-        // Shared by the Scope writer picker, Council Verdict, and Fix Code with selects - all
-        // three need "whichever seats are actually enabled right now," including CLI/Ollama
-        // seats, not a hardcoded API-only list that can't reflect what a CLI-only user can
-        // actually pick.
-        function populateSeatSelect(selectId, includeAuto) {
+        // Shared by the Scope writer picker, Council Verdict, Fix Code with, and Arbiter
+        // selects - all need "whichever seats are actually enabled right now," including
+        // CLI/Ollama seats, not a hardcoded API-only list that can't reflect what a CLI-only
+        // user can actually pick. placeholder (optional) is {value, label} for a leading
+        // non-seat option - "auto" (best available) for Council Verdict/Fix Code, "none" (no
+        // seat nominated) for Arbiter; they are NOT interchangeable values, only the same
+        // dropdown mechanics, so this takes the exact option instead of a boolean that would
+        // force every caller into the same one meaning.
+        function populateSeatSelect(selectId, placeholder) {
             const sel = document.getElementById(selectId);
             if (!sel) return;
             const enabledSeats = getEnabledSeats();
             const previousValue = sel.value;
 
-            let html = includeAuto ? '<option value="auto">Auto (Best Available)</option>' : '';
+            let html = placeholder ? '<option value="' + placeholder.value + '">' + escapeHtml(placeholder.label) + '</option>' : '';
             html += enabledSeats.map(m => {
                 const cfg = MODEL_DISPLAY[m] || { name: m };
                 return '<option value="' + m + '">' + escapeHtml(cfg.name) + '</option>';
             }).join('');
             sel.innerHTML = html;
 
-            const stillValid = previousValue === 'auto' ? includeAuto : enabledSeats.includes(previousValue);
+            const stillValid = placeholder && previousValue === placeholder.value ? true : enabledSeats.includes(previousValue);
             if (stillValid) {
                 sel.value = previousValue;
             }
         }
 
         function populateScopedWriterOptions() {
-            populateSeatSelect('scopedWriterSelect', false);
+            populateSeatSelect('scopedWriterSelect', null);
         }
 
-        // Debate requires 3+ enabled seats (see run_debate_round in ai_council.py). 4+ seats
-        // unlocks arbiter mode (one seat rules on disputes instead of debating); with exactly
-        // 3, all_to_all is the only option since there's no spare seat for an arbiter.
+        // Debate requires 3+ enabled seats (see run_debate_round in ai_council.py) to debate
+        // with. Arbiter mode is no longer chosen here - the arbiter (if any) was nominated
+        // back when Review with Scope started (Arbiter picker, always-visible section) and
+        // is fixed for the session; debate just reads that back automatically.
         function setupDebateSection() {
             const enabledSeats = getEnabledSeats();
             const startRow = document.getElementById('debateStartRow');
-            const arbiterRow = document.getElementById('debateArbiterRow');
-            if (!startRow || !arbiterRow) return;
-
-            if (enabledSeats.length < 3) {
-                startRow.style.display = 'none';
-                return;
-            }
-            startRow.style.display = 'block';
-
-            if (enabledSeats.length >= 4) {
-                arbiterRow.style.display = 'block';
-                const sel = document.getElementById('debateArbiterSelect');
-                const previousValue = sel.value;
-                sel.innerHTML = enabledSeats.map(m => {
-                    const cfg = MODEL_DISPLAY[m] || { name: m };
-                    return '<option value="' + m + '">' + escapeHtml(cfg.name) + '</option>';
-                }).join('');
-                if (enabledSeats.includes(previousValue)) { sel.value = previousValue; }
-            } else {
-                arbiterRow.style.display = 'none';
-            }
+            if (!startRow) return;
+            startRow.style.display = enabledSeats.length < 3 ? 'none' : 'block';
         }
 
         // Refreshes both pickers - called when the Review with Scope panel opens and on
@@ -3789,11 +4550,33 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             setupDebateSection();
         }
 
-        // Council Verdict / Fix Code with - unlike the Scope pickers these are always visible
-        // (not gated on a panel being open), so they refresh on every toggle change regardless.
+        // Arbiter picker only makes sense with 4+ enabled seats: nominating one leaves it out
+        // of reviewing, and Debate itself needs at least 3 seats left to actually debate with -
+        // with exactly 3 enabled, nominating any of them as arbiter would leave only 2 to
+        // debate, below run_debate_round's own minimum. Below 4, force it back to "none" rather
+        // than leave a stale nomination the backend would reject as soon as Review with Scope
+        // ran with too few reviewers.
+        function refreshArbiterSelect() {
+            const sel = document.getElementById('arbiterSelect');
+            const row = document.getElementById('arbiterSelectRow');
+            if (!sel || !row) return;
+            const enabledSeats = getEnabledSeats();
+            if (enabledSeats.length < 4) {
+                sel.value = 'none';
+                row.style.display = 'none';
+                return;
+            }
+            row.style.display = '';
+            populateSeatSelect('arbiterSelect', { value: 'none', label: 'None' });
+        }
+
+        // Council Verdict / Fix Code with / Arbiter - unlike the Scope-panel-only pickers
+        // these are always visible (not gated on a panel being open), so they refresh on
+        // every toggle change regardless.
         function refreshSeatSelects() {
-            populateSeatSelect('synthesizerSelect', true);
-            populateSeatSelect('fixerSelect', false);
+            populateSeatSelect('synthesizerSelect', { value: 'auto', label: 'Auto (Best Available)' });
+            populateSeatSelect('fixerSelect', null);
+            refreshArbiterSelect();
         }
 
         // Disabled for the duration of the async call so a second click can't race the same session/cache row.
@@ -3818,7 +4601,7 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             }
         }
 
-        // Ticks elapsed seconds onto the status text so a long single call (e.g. Ollama's 180s timeout) doesn't read as a hang.
+        // Ticks elapsed seconds onto the status text so a long single call (e.g. Ollama's 600s timeout) doesn't read as a hang.
         let debateProgressTimer = null;
         let debateProgressBaseLabel = '';
         let debateProgressStartMs = 0;
@@ -3856,11 +4639,23 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             }
         }
 
-        // Ollama can take up to its 180s timeout to fail - warn up front so a long wait reads as known, not hung.
+        // Ollama can take up to its 600s timeout to fail (OllamaReviewer.REQUEST_TIMEOUT_SECONDS
+        // in ai_council.py) - warn up front so a long wait reads as known, not hung.
         function debateStartLabel(arbiter) {
             return arbiter === 'ollama'
-                ? 'Debate round starting... (Ollama is arbiter - can take up to 3 min if slow)'
+                ? 'Debate round starting... (Ollama is arbiter - can take up to 10 min if slow)'
                 : 'Debate round starting...';
+        }
+
+        // The arbiter (if any) was already nominated and excluded from reviewing back when
+        // Review with Scope started (see the always-visible Arbiter picker) - run_debate_round
+        // reads that persisted nomination itself, so nothing is sent from here. Uses
+        // currentScopedArbiter (captured from round 0's REAL result), not the live picker
+        // value - the user can change the picker after round 0 without it meaning anything for
+        // this session, and the hint must name the arbiter debate will actually use, not
+        // whatever the dropdown currently shows.
+        function currentArbiterHint() {
+            return currentScopedArbiter || null;
         }
 
         function startDebate() {
@@ -3868,15 +4663,18 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                 setScopedStatus('Run the initial scoped review first.');
                 return;
             }
-            const enabledSeats = getEnabledSeats();
-            const arbiter = enabledSeats.length >= 4 ? document.getElementById('debateArbiterSelect').value : null;
+            const mismatch = scopedRosterMismatchError();
+            if (mismatch) {
+                setScopedStatus(mismatch);
+                return;
+            }
             const config = getModelConfig();
             resetScopedTokenUsage();
-            startDebateProgress(debateStartLabel(arbiter));
+            startDebateProgress(debateStartLabel(currentArbiterHint()));
             document.getElementById('debateSection').style.display = 'block';
             document.getElementById('debateRoundsContainer').innerHTML = '';
             document.getElementById('consolidatedSection').innerHTML = '';
-            vscode.postMessage({ command: 'runDebate', sessionId: currentScopedSessionId, arbiter: arbiter, modelConfig: config });
+            vscode.postMessage({ command: 'runDebate', sessionId: currentScopedSessionId, modelConfig: config });
         }
 
         function reconveneDebate() {
@@ -3884,11 +4682,14 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                 setScopedStatus('Run the initial scoped review first.');
                 return;
             }
-            const enabledSeats = getEnabledSeats();
-            const arbiter = enabledSeats.length >= 4 ? document.getElementById('debateArbiterSelect').value : null;
+            const mismatch = scopedRosterMismatchError();
+            if (mismatch) {
+                setScopedStatus(mismatch);
+                return;
+            }
             const config = getModelConfig();
-            startDebateProgress(debateStartLabel(arbiter));
-            vscode.postMessage({ command: 'runDebate', sessionId: currentScopedSessionId, arbiter: arbiter, modelConfig: config });
+            startDebateProgress(debateStartLabel(currentArbiterHint()));
+            vscode.postMessage({ command: 'runDebate', sessionId: currentScopedSessionId, modelConfig: config });
         }
 
         function runConsolidate() {
@@ -3897,8 +4698,11 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                 return;
             }
             const config = getModelConfig();
-            startDebateProgress('Consolidating...');
-            vscode.postMessage({ command: 'runConsolidate', sessionId: currentScopedSessionId, modelConfig: config });
+            startDebateProgress('Re-consolidating...');
+            // Debate already auto-consolidates every round - this button exists only to discard
+            // that cached result and roll a fresh one, so it must force, not just re-fetch the
+            // same cached consolidation the round already produced.
+            vscode.postMessage({ command: 'runConsolidate', sessionId: currentScopedSessionId, modelConfig: config, force: true });
         }
 
         // Running total across debate+consolidate; only startDebate() (round 1) resets it, so consolidation can't erase it.
@@ -3910,71 +4714,89 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             if (el) { el.innerHTML = ''; }
         }
 
+        // Shared by renderTokenUsage (debate/consolidate's per-seat panel) and any one-off usage
+        // display (finalize's single-writer status line) so "N in / M out (Xs)" can't drift into
+        // two differently-worded formats for what is the same underlying usage shape everywhere
+        // it appears (cluster/debate-position/arbiter/consolidate/finalize all attach it the
+        // same way - see design-decisions.md).
+        function formatUsage(u) {
+            if (!u) { return ''; }
+            // Accepts both shapes seen in practice: the raw per-call usage ai_council.py
+            // attaches ({input_tokens, output_tokens, elapsed_seconds}, unknown expressed as
+            // null fields) and renderTokenUsage's own running-total accumulator
+            // ({unknown: true, elapsed_seconds}, once a null has made the total's token count
+            // permanently unreliable).
+            const text = (u.unknown || u.input_tokens == null || u.output_tokens == null || u.partial)
+                ? 'usage not reported'
+                : u.input_tokens + ' in / ' + u.output_tokens + ' out';
+            const timeText = u.elapsed_seconds ? ' (' + u.elapsed_seconds.toFixed(1) + 's)' : '';
+            return text + timeText;
+        }
+
         function renderTokenUsage(tokenUsage) {
             const el = document.getElementById('debateTokenUsage');
             if (!el || !tokenUsage) { return; }
             for (const [model, u] of Object.entries(tokenUsage)) {
                 const existing = scopedTokenUsageTotals[model];
                 const unknown = u.input_tokens == null || u.output_tokens == null || u.partial;
+                // elapsed_seconds is tracked separately from the token-known/unknown state - a
+                // seat that never reports token usage (self-hosted Ollama) still made a real
+                // call that took real time, and that's worth showing even when the token count
+                // half of this line has to say "not reported."
+                const priorElapsed = existing?.elapsed_seconds || 0;
+                const elapsed_seconds = u.elapsed_seconds != null ? priorElapsed + u.elapsed_seconds : priorElapsed;
                 if (unknown) {
                     // Sticky: once "not reported," a later real number doesn't erase that gap.
-                    scopedTokenUsageTotals[model] = { unknown: true };
+                    scopedTokenUsageTotals[model] = { unknown: true, elapsed_seconds };
                 } else if (existing && !existing.unknown) {
                     scopedTokenUsageTotals[model] = {
                         input_tokens: existing.input_tokens + u.input_tokens,
                         output_tokens: existing.output_tokens + u.output_tokens,
+                        elapsed_seconds,
                     };
                 } else if (!existing) {
-                    scopedTokenUsageTotals[model] = { input_tokens: u.input_tokens, output_tokens: u.output_tokens };
+                    scopedTokenUsageTotals[model] = { input_tokens: u.input_tokens, output_tokens: u.output_tokens, elapsed_seconds };
+                } else {
+                    // existing is already marked unknown - token counts stay unknown per the
+                    // stickiness above, but elapsed_seconds still accumulates.
+                    scopedTokenUsageTotals[model] = { unknown: true, elapsed_seconds };
                 }
-                // else: existing is already marked unknown - leave it, per the stickiness above.
             }
             el.innerHTML = Object.entries(scopedTokenUsageTotals).map(([model, u]) => {
                 const cfg = MODEL_DISPLAY[model] || { name: model };
-                // Some seats (self-hosted Ollama in particular) don't report usage at all -
-                // show that honestly instead of a fabricated "0 in / 0 out" that reads as a
-                // real, confirmed measurement rather than an absence.
-                const text = u.unknown
-                    ? 'usage not reported'
-                    : u.input_tokens + ' in / ' + u.output_tokens + ' out';
-                return '<span>' + escapeHtml(cfg.name) + ': ' + text + '</span>';
+                return '<span>' + escapeHtml(cfg.name) + ': ' + formatUsage(u) + '</span>';
             }).join('');
         }
 
+        // The sidebar is a status surface, not a reading surface - full per-model positions,
+        // arbiter reasoning, and consolidated fix text belong in the HTML report (which
+        // debate/consolidate always regenerate in full - design-decisions.md §12/§16), not
+        // reproduced inline here. This renders only what's needed to see debate progressed and
+        // to reach that report - counts and a consensus %, nothing anyone would call "reading."
         function renderDebateRound(result) {
             const container = document.getElementById('debateRoundsContainer');
             const div = document.createElement('div');
             div.className = 'debate-round';
 
             const modeLabel = result.mode === 'arbiter' ? 'Arbiter (' + escapeHtml(result.arbiter || '') + ')' : 'All-to-all';
+            const clusterCount = (result.clusters || []).length;
             let html = '<div class="debate-round-header">Round ' + result.debate_round_num + ' - ' + modeLabel + '</div>';
+            html += '<div class="scoped-session-meta">' + clusterCount + ' finding' + (clusterCount === 1 ? '' : 's') + ' debated - ' + result.consensus_pct + '% consensus</div>';
 
-            const arbiterRulings = (result.positions || {})._arbiter_ruling || {};
-
-            for (const c of result.clusters || []) {
-                html += '<div class="debate-cluster">';
-                html += '<div class="debate-cluster-summary">' + escapeHtml(c.summary) + '</div>';
-                html += '<div class="debate-cluster-members">Raised by: ' + c.members.map(m => escapeHtml(m.model)).join(', ') + '</div>';
-
-                for (const [model, positions] of Object.entries(result.positions || {})) {
-                    if (model === '_arbiter_ruling' || positions.error) { continue; }
-                    const pos = positions[c.cluster_id];
-                    if (!pos) { continue; }
-                    html += '<div class="debate-position ' + escapeHtml(pos.stance || '') + '">' +
-                        '<span class="debate-position-model">' + escapeHtml(model) + '</span>' +
-                        escapeHtml(pos.stance || '') + ' - ' + escapeHtml(pos.reasoning || '') +
-                        '</div>';
-                }
-
-                const ruling = arbiterRulings[c.cluster_id];
-                if (ruling) {
-                    html += '<div class="debate-ruling">ARBITER: ' + escapeHtml(ruling.verdict || '') + ' (' + escapeHtml(ruling.final_severity || '') + ') - ' + escapeHtml(ruling.reasoning || '') + '</div>';
-                }
-                html += '</div>';
+            // Click-safe: no inline onclick="..." with the path embedded - a Windows path can
+            // contain characters that terminate that attribute early and break the button
+            // (finishScopedRound hit exactly this; fixed there the same way).
+            if (result.report_path) {
+                html += '<button class="open-report-btn" id="debate-round-' + result.debate_round_num + '-open-report">&#128196; Open Full Report</button>';
             }
 
             div.innerHTML = html;
             container.appendChild(div);
+
+            if (result.report_path) {
+                const btn = document.getElementById('debate-round-' + result.debate_round_num + '-open-report');
+                if (btn) { btn.addEventListener('click', () => openScopedReport(result.report_path)); }
+            }
 
             const fill = document.getElementById('debateConsensusFill');
             const pctLabel = document.getElementById('debateConsensusPct');
@@ -3992,31 +4814,25 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
 
         function renderConsolidated(result) {
             const el = document.getElementById('consolidatedSection');
+            const findingCount = (result.findings || []).length;
+            const openCount = (result.open_questions || []).length;
             let html = '<div class="review-summary" style="display:block;margin-top:10px;">' +
-                '<div class="summary-header"><span class="summary-title">Final Consolidated Review</span></div>' +
-                '<div style="font-size:12px;margin:8px 0;">' + escapeHtml(result.summary || '') + '</div>';
+                '<div class="summary-header"><span class="summary-title">Consolidated Review</span></div>' +
+                '<div class="scoped-session-meta">' + findingCount + ' finding' + (findingCount === 1 ? '' : 's') +
+                (openCount > 0 ? ', ' + openCount + ' open question' + (openCount === 1 ? '' : 's') : '') + '</div>';
+            if (result.report_path) {
+                html += '<button class="open-report-btn" id="consolidated-open-report">&#128196; Open Full Report</button>';
+            }
             html += '</div>';
 
-            for (const f of result.findings || []) {
-                html += '<div class="consolidated-finding">' +
-                    '<span class="consolidated-finding-severity">[' + escapeHtml(f.severity || '?') + ']</span>' +
-                    escapeHtml(f.description || '') +
-                    '<div style="margin-top:4px;opacity:0.85;">&#128161; ' + escapeHtml(f.fix || '') + '</div>' +
-                    '</div>';
-            }
+            el.innerHTML = html;
 
-            if ((result.open_questions || []).length > 0) {
-                html += '<div style="font-size:11px;font-weight:600;margin:10px 0 4px 0;opacity:0.8;">OPEN QUESTIONS</div>';
-                for (const q of result.open_questions) {
-                    html += '<div class="consolidated-open-question">' +
-                        '<div>' + escapeHtml(q.question || '') + '</div>' +
-                        '<div style="margin-top:4px;opacity:0.8;font-size:10px;">' + escapeHtml(q.why_unresolved || '') + '</div>' +
-                        '</div>';
-                }
+            if (result.report_path) {
+                const btn = document.getElementById('consolidated-open-report');
+                if (btn) { btn.addEventListener('click', () => openScopedReport(result.report_path)); }
             }
 
             renderTokenUsage(result.usage);
-            el.innerHTML = html;
         }
 
         function startScopedReview() {
@@ -4027,12 +4843,37 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             }
             const config = getModelConfig();
             document.getElementById('scopedScopeInput').style.display = 'none';
+            document.getElementById('scopedSessionsPanel').style.display = 'none';
+            document.getElementById('scopedResumedBanner').style.display = 'none';
             document.getElementById('scopedRounds').innerHTML = '';
             setScopedStatus('');
             currentScopedSessionId = null;
+            currentScopedRoster = null;
+            currentScopedArbiter = null;
             setScopedSessionReady(false);
             setScopedCancelVisible(true);
             vscode.postMessage({ command: 'scopedReview', scope: scope, modelConfig: config });
+        }
+
+        // The backend still enables/disables reviewers strictly from live toggle state (an API
+        // key can genuinely be removed, a CLI can genuinely log out, between rounds) - this
+        // does not override that with the persisted roster, it CATCHES the case where the two
+        // have silently diverged and tells the user, instead of letting a follow-up/debate spend
+        // real calls on a roster the session was never actually run with, or silently lose a
+        // seat round 0 had. Toggling the SAME set back on/off in the same session is fine and
+        // passes; only a genuine mismatch blocks.
+        function scopedRosterMismatchError() {
+            if (!currentScopedRoster) { return null; }
+            const enabledSeats = getEnabledSeats();
+            const currentReviewing = currentScopedArbiter ? enabledSeats.filter(s => s !== currentScopedArbiter) : enabledSeats;
+            const missing = currentScopedRoster.filter(s => !currentReviewing.includes(s));
+            const added = currentReviewing.filter(s => !currentScopedRoster.includes(s));
+            if (missing.length === 0 && added.length === 0) { return null; }
+            let msg = 'The enabled seats have changed since this session started (round 0 ran with: ' + currentScopedRoster.join(', ') + ').';
+            if (missing.length) { msg += ' Missing now: ' + missing.join(', ') + '.'; }
+            if (added.length) { msg += ' Newly added: ' + added.join(', ') + ' (would not have participated in round 0).'; }
+            msg += ' Restore the original seats, or start a new Review with Scope session.';
+            return msg;
         }
 
         function submitScopedFollowup() {
@@ -4045,13 +4886,23 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                 setScopedStatus('Enter a follow-up question first.');
                 return;
             }
+            const mismatch = scopedRosterMismatchError();
+            if (mismatch) {
+                setScopedStatus(mismatch);
+                return;
+            }
             const btn = document.querySelector('#scopedFollowup button.btn-primary');
             if (btn && btn.disabled) { return; } // already in flight - no double-submit
             if (btn) { btn.disabled = true; }
             const config = getModelConfig();
             setScopedStatus('Asking follow-up...');
             setScopedCancelVisible(true);
-            vscode.postMessage({ command: 'scopedFollowup', sessionId: currentScopedSessionId, question: question, modelConfig: config });
+            // sessionArbiter is the round-0 PERSISTED arbiter (captured from its real result),
+            // sent separately from modelConfig - modelConfig.arbiter is the live picker value,
+            // which the user can change after round 0 without it meaning anything for this
+            // session. Progress cards must be built from what the backend will ACTUALLY
+            // exclude (the persisted arbiter), not from whatever the picker currently shows.
+            vscode.postMessage({ command: 'scopedFollowup', sessionId: currentScopedSessionId, question: question, modelConfig: config, sessionArbiter: currentScopedArbiter });
         }
 
         function finalizeScopedReview() {
@@ -4153,6 +5004,15 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         let currentReportPath = '';
         let reviewStartTime = 0;
         let currentScopedSessionId = null;
+        // The ACTUAL roster (reviewing seats) and arbiter round 0 ran with, captured from its
+        // real result the moment it completes - not from live toggle/picker state, which the
+        // user is free to change between rounds. A follow-up/debate must use what the SESSION
+        // actually has, not what the UI currently shows, or a changed toggle/arbiter between
+        // rounds creates a progress card for a seat that will never report (backend still
+        // excludes/includes based on the ORIGINAL roster) and a debate hint naming the wrong
+        // arbiter. Reset to null only when a genuinely NEW session starts (startScopedReview).
+        let currentScopedRoster = null;
+        let currentScopedArbiter = null;
         let currentScopedRoundId = null;
         // Live per-model elapsed seconds while cards are still "reviewing" - same pattern as
         // startScopedRound's per-round timer, so a still-"Analyzing..." card here shows how
@@ -4236,6 +5096,37 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             'gemini': { name: 'Gemini', icon: 'G', class: 'gemini' },
             'ollama': { name: 'Ollama', icon: 'O', class: 'ollama' }
         };
+
+        // getEnabledSeats()/the Review Options dropdowns use these short seat names (gpt-4,
+        // gpt-cli, ...); the toggle checkbox ids modelToKey/toggle-<id>/.no-key are keyed on
+        // (enableGpt, ...) are a DIFFERENT naming scheme for the same seats. This is the one
+        // missing link between the two - everything else a "is this seat broken" check needs
+        // (the no-key class, cliErrors) is already reachable from the checkbox id.
+        const SEAT_TO_TOGGLE_ID = {
+            'gpt-4': 'enableGpt', 'claude': 'enableClaude', 'grok': 'enableGrok',
+            'gpt-cli': 'enableGptCli', 'claude-cli': 'enableClaudeCli', 'grok-cli': 'enableGrokCli',
+            'gemini': 'enableGemini', 'ollama': 'enableOllama',
+        };
+
+        // True if "seat" (a short seat name, e.g. "claude-cli") currently shows as broken: no
+        // API key/URL configured (toggle-item.no-key, set by updateKeyStatus) or a CLI seat
+        // reporting an error (cli-active-model.cli-error, set by updateCliActiveModels). Both
+        // classes are applied directly to elements already in the DOM, so this reads live state
+        // rather than needing its own parallel tracking of what updateKeyStatus/
+        // updateCliActiveModels last received.
+        function seatIsBroken(seat) {
+            const toggleId = SEAT_TO_TOGGLE_ID[seat];
+            if (!toggleId) { return false; }
+            const toggleItem = document.getElementById('toggle-' + toggleId);
+            if (toggleItem && toggleItem.classList.contains('no-key')) { return true; }
+            const providerToId = { 'gpt-cli': 'cli-model-openai', 'claude-cli': 'cli-model-anthropic', 'grok-cli': 'cli-model-xai' };
+            const cliElId = providerToId[seat];
+            if (cliElId) {
+                const cliEl = document.getElementById(cliElId);
+                if (cliEl && cliEl.classList.contains('cli-error')) { return true; }
+            }
+            return false;
+        }
 
         function startReviewPanel(fileName, models) {
             console.log('AI Council: startReviewPanel called', fileName, models);
@@ -4381,6 +5272,34 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                             link.onclick = function(e) { e.preventDefault(); showLoginPrompt(cliName); };
                             status.textContent = '';
                             status.appendChild(link);
+                        } else if (errStr) {
+                            // Same real text updateScopedRoundProgress/the HTML report already
+                            // show (a CLI timeout, an incomplete-stub rejection, a parse
+                            // failure) - this was the one remaining surface still collapsing it
+                            // to the bare word "Error", the exact gap that hid the Grok 240s
+                            // timeout behind a generic red card on the DEFAULT review button.
+                            // Clickable, same as the AUTH_REQUIRED case above - routes through
+                            // the extension host's _showActionableError (this webview script
+                            // cannot call vscode.window/commands itself), which identifies the
+                            // real seat from structural markers and offers Log In / Open
+                            // Settings, never leaving the click as a dead end.
+                            var errLink = document.createElement('a');
+                            errLink.href = '#';
+                            errLink.textContent = errStr;
+                            errLink.title = errStr;
+                            errLink.style.color = '#ef4444';
+                            errLink.style.textDecoration = 'underline';
+                            errLink.style.cursor = 'pointer';
+                            errLink.onclick = function(e) {
+                                e.preventDefault();
+                                // Must match identifyFailedSeat's "[!] MODEL ERROR" structural
+                                // marker exactly (the same shape ai_council.py prints to
+                                // stdout) so the extension host can actually identify which
+                                // seat this is, not just show the text again.
+                                vscode.postMessage({ command: 'showActionableError', message: 'AI Council: [!] ' + model.toUpperCase() + ' ERROR - ' + errStr });
+                            };
+                            status.textContent = '';
+                            status.appendChild(errLink);
                         } else {
                             status.textContent = 'Error';
                             status.style.color = '#ef4444';
@@ -4560,9 +5479,48 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                 case 'statusUpdate':
                     updateStatus(message.status, message.isLoading);
                     break;
-                case 'apiKeyStatus':
+                case 'apiKeyStatus': {
+                    // Both auto-open checks need to know what was true BEFORE this status update
+                    // mutates the DOM (updateKeyStatus unchecks a broken seat's checkbox;
+                    // refreshSeatSelects then reads that to repopulate the dropdowns, silently
+                    // resetting any selection that pointed at the seat that just broke) - so the
+                    // snapshot is taken first, and both checks run against it/before the reset.
+                    const previouslyEnabledSeats = getEnabledSeats();
+                    checkReviewOptionsAutoOpen();
                     updateKeyStatus(message.status, message.orgInfo);
                     updateCliActiveModels(message.cliActiveModels, message.cliErrors);
+                    checkModelSelectionAutoOpen(previouslyEnabledSeats);
+                    // updateKeyStatus can programmatically uncheck a now-broken seat's checkbox
+                    // (checkbox.checked = false) - that does NOT fire a 'change' event, so the
+                    // toggle listener that would normally call refreshSeatSelects() never runs,
+                    // leaving Council Verdict/Fix Code/Arbiter possibly still showing a seat
+                    // that's no longer enabled at all (reproduced: a key removed while a seat
+                    // was selected as fixer left the stale seat in the dropdown indefinitely).
+                    // Re-running it here, after both status functions have updated the DOM,
+                    // covers that gap the same way a real toggle click already does.
+                    refreshSeatSelects();
+                    break;
+                }
+                case 'scopedSessionsList':
+                    // A missing reviews.db / missing scoped_reviews table is NOT an error -
+                    // session_query.py returns {"sessions": []} for both, since "no sessions
+                    // exist yet" is the normal state for a workspace that's never run a scoped
+                    // review. A genuine failure (corrupt db, permissions) still sets
+                    // message.error - surface that rather than silently rendering as if there
+                    // were simply no sessions, which is what happened before session_query.py's
+                    // read-only/missing-file fix (an uncaught crash resolved as an error the
+                    // sidebar then discarded entirely).
+                    if (message.error) {
+                        setScopedStatus('Could not load session list: ' + message.error);
+                    }
+                    renderScopedSessionsList(message.sessions);
+                    break;
+                case 'scopedResumeResult':
+                    if (message.error) {
+                        setScopedStatus('Error loading session: ' + message.error);
+                        break;
+                    }
+                    applyScopedResume(message.result);
                     break;
                 case 'scopedRoundStart':
                     currentScopedRoundId = startScopedRound(
@@ -4580,9 +5538,19 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                     if (message.error) {
                         setScopedStatus('Error: ' + message.error);
                         document.getElementById('scopedScopeInput').style.display = 'block';
+                        failScopedRound(currentScopedRoundId, message.error);
+                        currentScopedRoundId = null;
                         break;
                     }
                     currentScopedSessionId = message.result.session_id;
+                    // Capture the roster/arbiter round 0 ACTUALLY ran with, only on round 0's
+                    // real completion (not overwritten by a later follow-up's result, which
+                    // reviews the SAME fixed roster again, not a new one) - see the declaration
+                    // comment above for why this must not be re-derived from live UI state later.
+                    if (!currentScopedRoster) {
+                        currentScopedRoster = Object.keys(message.result.reviews || {});
+                        currentScopedArbiter = message.result.arbiter || null;
+                    }
                     setScopedSessionReady(true);
                     if (currentScopedRoundId) {
                         finishScopedRound(currentScopedRoundId, message.result.consensus || {}, message.result.report_path, message.result.reviews);
@@ -4596,6 +5564,8 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                     setScopedCancelVisible(false);
                     if (message.error) {
                         setScopedStatus('Error: ' + message.error);
+                        failScopedRound(currentScopedRoundId, message.error);
+                        currentScopedRoundId = null;
                         break;
                     }
                     if (currentScopedRoundId) {
@@ -4618,7 +5588,9 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                     const substitutionNote = actualWriter !== requestedWriter
                         ? ' (requested ' + requestedWriter.toUpperCase() + ', but that seat was unavailable)'
                         : '';
-                    setScopedStatus('Review doc written by ' + actualWriter.toUpperCase() + substitutionNote + ': ' + message.result.output_path);
+                    const finalizeUsage = message.result.usage && message.result.usage[actualWriter];
+                    const finalizeUsageNote = finalizeUsage ? ' [' + formatUsage(finalizeUsage) + ']' : '';
+                    setScopedStatus('Review doc written by ' + actualWriter.toUpperCase() + substitutionNote + finalizeUsageNote + ': ' + message.result.output_path);
                     vscode.postMessage({ command: 'openReviewDoc', path: message.result.output_path });
                     break;
                 }
@@ -4634,6 +5606,14 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                         break;
                     }
                     renderDebateRound(message.result);
+                    // ai_council.py's debate command now auto-runs consolidate_debate right
+                    // after the round and includes it as message.result.consolidation - render
+                    // it the same way a standalone Consolidate click would, so the one Debate
+                    // button drives the same visible outcome as debate-then-consolidate used to
+                    // take two clicks to reach.
+                    if (message.result.consolidation && !message.result.consolidation.error) {
+                        renderConsolidated(message.result.consolidation);
+                    }
                     setScopedStatus('');
                     break;
                 case 'consolidateResult':
@@ -4648,9 +5628,24 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                     setScopedStatus(message.result.cached ? 'Showing cached consolidation.' : '');
                     break;
                 case 'uncheckModel':
+                    // Setting .checked programmatically does NOT fire a 'change' event, so the
+                    // toggle listener's saveToggleStates()/refreshSeatSelects()/
+                    // refreshScopedPickers() never ran for this - the checkbox visually
+                    // unchecked, but globalState (saved eagerly the moment the toggle was first
+                    // switched on, before validation could fail) still had the rejected seat as
+                    // enabled. Reopening the sidebar then restored it as checked, silently, with
+                    // no re-validation (reproduced: an invalid seat was live in the same
+                    // globalState the checkbox visually disagreed with). Do explicitly what a
+                    // real 'change' to unchecked would have done.
                     const checkbox = document.getElementById(message.modelId);
                     if (checkbox) {
                         checkbox.checked = false;
+                    }
+                    saveToggleStates();
+                    refreshSeatSelects();
+                    const uncheckScopedPanel = document.getElementById('scopedReviewPanel');
+                    if (uncheckScopedPanel && uncheckScopedPanel.style.display === 'block') {
+                        refreshScopedPickers();
                     }
                     break;
                 case 'cacheSize':
@@ -4706,6 +5701,55 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                             });
                         }
                         refreshSeatSelects();
+                        // A toggle restored as checked was never re-validated - .checked
+                        // assignment above doesn't fire 'change', so _checkApiKey (the check
+                        // that runs on an actual click) never ran for it. A key deleted or a
+                        // CLI logged out since last session would otherwise sit enabled with
+                        // nothing telling the user - the seat gets silently omitted from the
+                        // council instead of running. Re-check every restored-enabled seat now,
+                        // quietly (no popup per seat on every panel load - that would be its
+                        // own kind of annoying); an invalid one still gets unchecked, and
+                        // _sendApiKeyStatus's own status labels (already sent for this same
+                        // refresh) explain why.
+                        for (const [toggleId, cfg] of Object.entries(modelApiKeys)) {
+                            const toggleEl = document.getElementById(toggleId);
+                            if (toggleEl && toggleEl.checked) {
+                                vscode.postMessage({ command: 'checkApiKey', modelId: toggleId, silent: true, ...cfg });
+                            }
+                        }
+                    }
+                    break;
+                case 'restoreSeatSelections':
+                    // Runs after 'restoreToggles' (webviewReady sends both, in order, and each
+                    // message is handled synchronously before the next arrives) - restoreToggles
+                    // already called refreshSeatSelects(), so all three <select>s are already
+                    // populated from the restored roster by the time this applies the saved
+                    // VALUE on top of that populated list. Only applies a saved value that is
+                    // still a real option (the seat may have been removed/disabled since it was
+                    // last saved) - falling through to whatever populateSeatSelect already
+                    // defaulted to (Auto / blank / None) otherwise, same as a live session
+                    // would if that seat simply isn't available.
+                    if (message.selections) {
+                        for (const id of ['synthesizerSelect', 'fixerSelect', 'arbiterSelect']) {
+                            const sel = document.getElementById(id);
+                            const saved = message.selections[id];
+                            if (sel && saved && Array.from(sel.options).some(o => o.value === saved)) {
+                                sel.value = saved;
+                            }
+                        }
+                    }
+                    break;
+                case 'restoreSectionCollapsed':
+                    // Applied WITHOUT persist (persist=false) - this is restoring what was
+                    // already saved, not a new user action to save again. The per-seat re-checks
+                    // just queued above (checkApiKey silent:true) will each eventually produce an
+                    // apiKeyStatus message, which is what actually runs
+                    // checkModelSelectionAutoOpen/checkReviewOptionsAutoOpen - so a section
+                    // restored as collapsed can still immediately pop back open if something is
+                    // genuinely wrong, rather than requiring the user to notice and expand it.
+                    if (message.sections) {
+                        setSectionCollapsed('modelSelection', 'modelSelectionHeader', 'modelSelectionContent', !!message.sections.modelSelection, false);
+                        setSectionCollapsed('reviewOptions', 'reviewOptionsHeader', 'reviewOptionsContent', !!message.sections.reviewOptions, false);
                     }
                     break;
                 case 'statusPanel':
@@ -4719,31 +5763,34 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                         if (message.orgInfo) {
                             const orgEntries = [];
                             if (message.orgInfo.openai) {
-                                orgEntries.push('<div class="status-row"><span class="status-label" style="color:#10a37f;">OpenAI:</span><span class="status-value">' + message.orgInfo.openai + '</span></div>');
+                                orgEntries.push('<div class="status-row"><span class="status-label" style="color:#10a37f;">OpenAI:</span><span class="status-value">' + escapeHtml(message.orgInfo.openai) + '</span></div>');
                             }
                             if (message.orgInfo.anthropic) {
-                                orgEntries.push('<div class="status-row"><span class="status-label" style="color:#d97706;">Anthropic:</span><span class="status-value">' + message.orgInfo.anthropic + '</span></div>');
+                                orgEntries.push('<div class="status-row"><span class="status-label" style="color:#d97706;">Anthropic:</span><span class="status-value">' + escapeHtml(message.orgInfo.anthropic) + '</span></div>');
                             }
                             if (message.orgInfo.xai) {
-                                orgEntries.push('<div class="status-row"><span class="status-label" style="color:#1da1f2;">xAI:</span><span class="status-value">' + message.orgInfo.xai + '</span></div>');
+                                orgEntries.push('<div class="status-row"><span class="status-label" style="color:#1da1f2;">xAI:</span><span class="status-value">' + escapeHtml(message.orgInfo.xai) + '</span></div>');
                             }
                             if (orgEntries.length > 0) {
                                 orgHtml = '<div class="status-section-title">Accounts</div>' + orgEntries.join('');
                             }
                         }
 
-                        // Build CLI models HTML if available
+                        // Build CLI models HTML if available. These values come from a local CLI's
+                        // own config file / stdout (not remote input), but are escaped like every
+                        // other dynamic value written into this panel - a local config/CLI-output
+                        // source is still an untrusted string as far as innerHTML is concerned.
                         var cliHtml = '';
                         if (message.cliModels) {
                             var cliEntries = [];
                             if (message.cliModels.claude) {
-                                cliEntries.push('<div class="status-row"><span class="status-label" style="color:#d97706;">Claude CLI:</span><span class="status-value">' + message.cliModels.claude + '</span></div>');
+                                cliEntries.push('<div class="status-row"><span class="status-label" style="color:#d97706;">Claude CLI:</span><span class="status-value">' + escapeHtml(message.cliModels.claude) + '</span></div>');
                             }
                             if (message.cliModels.codex) {
-                                cliEntries.push('<div class="status-row"><span class="status-label" style="color:#10a37f;">Codex CLI:</span><span class="status-value">' + message.cliModels.codex + '</span></div>');
+                                cliEntries.push('<div class="status-row"><span class="status-label" style="color:#10a37f;">Codex CLI:</span><span class="status-value">' + escapeHtml(message.cliModels.codex) + '</span></div>');
                             }
                             if (message.cliModels.grok) {
-                                cliEntries.push('<div class="status-row"><span class="status-label" style="color:#1da1f2;">Grok CLI:</span><span class="status-value">' + message.cliModels.grok + '</span></div>');
+                                cliEntries.push('<div class="status-row"><span class="status-label" style="color:#1da1f2;">Grok CLI:</span><span class="status-value">' + escapeHtml(message.cliModels.grok) + '</span></div>');
                             }
                             if (cliEntries.length > 0) {
                                 cliHtml = '<div class="status-section-title">CLI Models</div>' + cliEntries.join('');

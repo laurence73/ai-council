@@ -7,15 +7,18 @@ AI Council can fill a provider's seat with an API key, a CLI subscription login,
 
 Both produce the same review JSON (`issues`, `summary`, `quality_score`), so consensus, Council Verdict, and fix behaviour stay the same. Enabling both an API seat and a CLI seat for the same provider runs them as two distinct reviewers in the same council.
 
-A CLI seat always uses whatever model that CLI is actually logged into - there is no in-extension model override. The sidebar shows the resolved model (or a login/setup error) next to each CLI toggle.
+By default a CLI seat uses whatever model that CLI is actually logged into. The raw CLI accepts
+an explicit per-seat override (`--claude-cli-model` / `--gpt-cli-model` / `--grok-cli-model`);
+there is no in-extension equivalent - the sidebar always uses the CLI's own default and shows
+the resolved model (or a login/setup error) next to each CLI toggle.
 
 ## Flags
 
-| Seat | API flag | CLI flag | CLI binary |
-|------|----------|----------|------------|
-| GPT | `--no-gpt` (disable; on by default) | `--gpt-cli` | `codex` |
-| Claude | `--no-claude` (disable; on by default) | `--claude-cli` | `claude` |
-| Grok | `--no-grok` (disable; on by default) | `--grok-cli` | `grok` |
+| Seat | API flag | CLI flag | CLI binary | Model override |
+|------|----------|----------|------------|-----------------|
+| GPT | `--no-gpt` (disable; on by default) | `--gpt-cli` | `codex` | `--gpt-cli-model` |
+| Claude | `--no-claude` (disable; on by default) | `--claude-cli` | `claude` | `--claude-cli-model` |
+| Grok | `--no-grok` (disable; on by default) | `--grok-cli` | `grok` | `--grok-cli-model` |
 
 CLI seat flags are global (must precede the subcommand).
 

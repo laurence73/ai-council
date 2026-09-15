@@ -91,9 +91,14 @@ seats - not an either/or choice. GPT API and Codex CLI can both be on in the sam
   sidebar's own fresh-install toggle defaults are the other way around (CLI seats on, API seats
   off), since a developer's CLI subscription login is more often already set up than an API key
 - **CLI seats** (Codex, Claude CLI, Grok CLI) - opt-in from the raw CLI (`--gpt-cli` /
-  `--claude-cli` / `--grok-cli`), on by default in the sidebar; a CLI seat always uses whatever
-  model that CLI is actually logged into, with no model override
+  `--claude-cli` / `--grok-cli`), on by default in the sidebar; by default a CLI seat uses
+  whatever model that CLI is actually logged into, but the raw CLI accepts an explicit
+  `--claude-cli-model` / `--gpt-cli-model` / `--grok-cli-model` override per seat (the sidebar
+  has no equivalent setting - it always uses the CLI's own default)
 - **Ollama seat** - point at any OpenAI-compatible endpoint
+
+If you already pay for a Claude, ChatGPT, or X subscription that includes CLI access, its
+CLI seat costs nothing extra to run alongside (or instead of) that provider's API seat.
 
 See [`docs/independent-seats.md`](docs/independent-seats.md) for the CLI flags.
 
@@ -102,7 +107,8 @@ See [`docs/independent-seats.md`](docs/independent-seats.md) for the CLI flags.
 ## Power Mode
 
 Switches API seats (GPT-4, Claude, Grok, Gemini) to premium model variants for deeper analysis.
-CLI seats are unaffected - they always use whatever model that CLI login already resolves to.
+CLI seats are unaffected - by default they use whatever model that CLI login resolves to, unless
+overridden with `--claude-cli-model` / `--gpt-cli-model` / `--grok-cli-model`.
 
 ```bash
 cd vscode-extension
@@ -183,6 +189,7 @@ python ai_council.py fix <file> --fixer gpt-4
 | `--ollama-url` | | Ollama server URL (global flag) |
 | `--ollama-model` | | Ollama model name (global flag) |
 | `--gpt-cli` / `--claude-cli` / `--grok-cli` | | Add that provider's CLI seat (global flags) |
+| `--gpt-cli-model` / `--claude-cli-model` / `--grok-cli-model` | | Override the model a CLI seat uses instead of its login's default (global flags) |
 | `--no-gpt` / `--no-claude` / `--no-grok` | | Disable that provider's API seat |
 | `--power` | `-p` | Premium API models (higher cost) |
 | `--html` | | Generate HTML report |
@@ -207,70 +214,10 @@ Global flags (`--ollama*`, `--*-cli`) must precede the subcommand.
 | Provider | Get Key | Env Variable |
 |----------|---------|--------------|
 | Google Gemini | [aistudio.google.com](https://aistudio.google.com/app/apikey) | `GOOGLE_API_KEY` |
-| Groq (Llama) | [console.groq.com](https://console.groq.com/) | `GROQ_API_KEY` |
 | Ollama | No key needed (local) | N/A |
 
----
-
-## CLI Subscriptions (No API Key Required)
-
-If you have a **Claude Code**, **Codex**, or **Grok CLI** subscription, you can use AI Council **without API keys** - reviews are included in your subscription.
-
-### How It Works
-
-AI Council detects installed CLI tools and uses them instead of API calls:
-
-| CLI Tool | Subscription | Install |
-|----------|--------------|---------|
-| `claude` | Claude Code / Claude Pro | [claude.ai/download](https://claude.ai/download) |
-| `codex` | ChatGPT Plus / Pro | [openai.com/chatgpt/download](https://openai.com/chatgpt/download) |
-| `grok` | X Premium | [x.ai/grok](https://x.ai/grok) |
-
-### VS Code Extension
-
-In the extension sidebar, expand **MODEL SELECTION** to see:
-
-- **API KEYS** - Traditional pay-per-use API access
-- **CLI SEATS (subscriptions)** - Use your existing subscriptions
-
-Toggle on the CLI seats you want to use. The extension auto-detects which CLIs are installed and logged in.
-
-### Transport Settings
-
-Control how each provider authenticates:
-
-| Setting | Options | Default |
-|---------|---------|---------|
-| `ai-council.transport.openai` | `api`, `cli`, `auto` | `auto` |
-| `ai-council.transport.anthropic` | `api`, `cli`, `auto` | `auto` |
-| `ai-council.transport.xai` | `api`, `cli`, `auto` | `auto` |
-
-- **auto** - Prefer CLI if installed, fall back to API key
-- **cli** - Only use CLI subscription (fails if not installed)
-- **api** - Only use API key (ignores CLI even if installed)
-
-### CLI Commands
-
-```bash
-# Use Claude CLI subscription instead of API
-python ai_council.py review myfile.cs --claude-cli --no-claude
-
-# Use all three CLI subscriptions
-python ai_council.py review myfile.cs --gpt-cli --claude-cli --grok-cli --no-gpt --no-claude --no-grok
-
-# Mix CLI and API (Claude CLI + GPT API + Gemini API)
-python ai_council.py review myfile.cs --claude-cli --no-claude --gemini
-```
-
-### Cost Savings
-
-| Seat | API Cost | CLI Subscription |
-|------|----------|------------------|
-| Claude | ~$0.03/review | **$0** (included) |
-| GPT-4 | ~$0.03/review | **$0** (included) |
-| Grok | ~$0.02/review | **$0** (included) |
-
-If you already pay for Claude Pro ($20/mo), ChatGPT Plus ($20/mo), or X Premium - your AI Council reviews are essentially free.
+Groq/Llama is tracked as issue #33 but not yet implemented - there's no
+`ai-council.apiKeys.groq` setting or reviewer, and the sidebar shows it as a disabled item.
 
 ---
 
@@ -288,7 +235,7 @@ If you already pay for Claude Pro ($20/mo), ChatGPT Plus ($20/mo), or X Premium 
 - [x] Ollama/Self-hosted Model Support
 - [x] Status Panel with Account Info
 - [x] Power Mode Toggle
-- [x] CLI Subscriptions - Use Claude/Codex/Grok CLIs instead of API keys
+- [x] CLI Subscription Seats - Claude/Codex/Grok CLIs as independent seats alongside API keys
 
 ### Coming Soon
 

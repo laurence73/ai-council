@@ -99,7 +99,10 @@ DEFAULT_CONFIG = {
     }
 }
 
-# Model configurations: standard (fast/cheap) vs power (best/expensive)
+# Fallback model IDs: standard (fast/cheap) vs power (best/expensive), used only when the
+# corresponding ai-council.models.<provider>.standard/.power setting is unset. These are NOT the
+# only place a model can be chosen from any more - see resolve_api_model() below - they exist so
+# a user who never touches the new settings keeps exactly today's known-good behavior.
 MODEL_CONFIGS = {
     "standard": {
         "gpt-4": "gpt-4-turbo",
@@ -116,6 +119,31 @@ MODEL_CONFIGS = {
         "ollama": "qwen3.6:35b-mlx",
     }
 }
+
+# Internal short-name (used throughout this file: self.reviewers keys, MODEL_CONFIGS, pricing
+# tables) -> the settings/env-var provider identity (matches ai-council.apiKeys.* and
+# AI_COUNCIL_API_MODEL_*_STANDARD/_POWER, and cli_transport.py's own PROVIDER_CLI/API_KEY_ENV
+# naming) - kept as one explicit table rather than derived from api_key_env string manipulation,
+# since a typo here silently breaks model resolution for one provider with no error at all.
+API_MODEL_SETTINGS_PROVIDER = {
+    "gpt-4": "OPENAI",
+    "claude": "ANTHROPIC",
+    "grok": "XAI",
+    "gemini": "GOOGLE",
+}
+
+
+def resolve_api_model(short_name: str, power_mode: bool) -> str:
+    """The model ID an API seat actually uses: ai-council.models.<provider>.standard/.power
+    (passed through as AI_COUNCIL_API_MODEL_<PROVIDER>_STANDARD/_POWER env vars by the
+    extension), falling back to MODEL_CONFIGS' known-good default when that setting is blank -
+    same override-with-fallback shape cli_transport.py's resolve_cli_model() already uses for
+    CLI seats, so a user who never touches the new settings sees no behavior change at all."""
+    provider = API_MODEL_SETTINGS_PROVIDER.get(short_name)
+    mode = "POWER" if power_mode else "STANDARD"
+    env_name = f"AI_COUNCIL_API_MODEL_{provider}_{mode}" if provider else None
+    raw = (os.environ.get(env_name, "") if env_name else "").strip()
+    return raw or MODEL_CONFIGS["power" if power_mode else "standard"].get(short_name, "")
 
 # API pricing per 1M tokens (as of 2024)
 API_PRICING = {
@@ -383,9 +411,12 @@ class ProgressTracker:
         total = len(self.models)
 
         if error:
-            print(f"  [!] {model.upper()} ERROR ({elapsed}) [{completed}/{total}]")
-            # Print error detail for TypeScript parser to capture
-            print(f"  [{model.upper()}] ERROR: {str(error)[:200]}")
+            # Keep the reason on the same line as ERROR so the VS Code live parser can put
+            # "timed out after 240s" on the card immediately - a bare ERROR line left the
+            # sidebar showing only "Error" until JSON arrived (and scoped reconcile used to
+            # skip cards already marked error, so the detail never landed).
+            detail = str(error).replace("\n", " ").strip()[:160]
+            print(f"  [!] {model.upper()} ERROR ({elapsed}) [{completed}/{total}] {detail}")
         else:
             print(f"  [+] {model.upper()} Score: {score}/10 ({elapsed}) [{completed}/{total}]")
 
@@ -525,6 +556,17 @@ class ReviewDatabase:
                 UNIQUE(session_id, debate_round_num)
             );
 
+            CREATE TABLE IF NOT EXISTS file_consensus (
+                id INTEGER PRIMARY KEY,
+                file_path TEXT NOT NULL,
+                file_hash TEXT NOT NULL,
+                synthesized_by TEXT NOT NULL,
+                input_models TEXT NOT NULL DEFAULT '',
+                result_json TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(file_path, file_hash, synthesized_by)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_reviews_file ON reviews(file_path);
             CREATE INDEX IF NOT EXISTS idx_reviews_hash ON reviews(file_hash);
             CREATE INDEX IF NOT EXISTS idx_queue_status ON queue(status);
@@ -579,6 +621,22 @@ class ReviewDatabase:
             DROP TABLE debate_consolidations_old;
         """)
         self.conn.commit()
+        self._migrate_file_consensus_input_models()
+
+    def _migrate_file_consensus_input_models(self):
+        # CREATE TABLE IF NOT EXISTS is a no-op against an existing table, so a file_consensus
+        # table created by an earlier build of this same feature (this table's schema changed
+        # more than once across this session's own iterative development) can already exist
+        # locally without input_models - save_file_consensus's INSERT OR REPLACE would then
+        # fail with "no such column" instead of caching, on every call, with no recovery path
+        # short of manually dropping the table. ALTER TABLE ADD COLUMN (not a rebuild - no
+        # UNIQUE-constraint change needed here, unlike the consolidation migration above) is
+        # a no-op if the table doesn't exist yet at all, since PRAGMA table_info on a
+        # nonexistent table simply returns no rows.
+        existing_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(file_consensus)")}
+        if existing_columns and "input_models" not in existing_columns:
+            self.conn.execute("ALTER TABLE file_consensus ADD COLUMN input_models TEXT NOT NULL DEFAULT ''")
+            self.conn.commit()
 
     def add_review(self, file_path: str, file_hash: str, model: str, review: dict,
                     model_id: str = None, power_mode: bool = False, rubric_hash: str = None):
@@ -599,30 +657,77 @@ class ReviewDatabase:
         ))
         self.conn.commit()
 
-    def get_reviews(self, file_path: str, limit: int = 10) -> list:
-        cursor = self.conn.execute("""
-            SELECT model, review_json, created_at
-            FROM reviews
-            WHERE file_path = ?
-            ORDER BY created_at DESC
-            LIMIT ?
-        """, (file_path, limit))
-        return [{"model": r[0], "review": json.loads(r[1]), "created_at": r[2]} for r in cursor]
+    def get_reviews(self, file_path: str, limit: int = 10, file_hash: str = None) -> list:
+        # file_hash is optional and None by default: show_reviews (raw CLI `show`) and MCP's
+        # get_reviews tool are deliberately full-history views across whatever revisions were
+        # reviewed over time, unfiltered. Only a caller that's about to combine multiple
+        # models' reviews into ONE answer (MCP get_consensus) needs every row to be the SAME
+        # revision - passing file_hash there prevents silently mixing e.g. gpt's review of an
+        # old revision with claude's review of a newer one into a single "consensus".
+        #
+        # ORDER BY created_at DESC alone has no defined tiebreak: SQLite's CURRENT_TIMESTAMP
+        # default has only second resolution, so two reviews of the same model/hash inserted
+        # within the same second (a forced re-review, a retry) can come back in either order -
+        # reproduced this directly returning the OLDER row first despite the newer one being
+        # inserted second. `id` is an auto-incrementing INTEGER PRIMARY KEY, always strictly
+        # insertion-ordered regardless of timestamp collisions - `id DESC` as a second sort key
+        # makes "newest" actually mean newest.
+        if file_hash is not None:
+            cursor = self.conn.execute("""
+                SELECT id, model, review_json, created_at
+                FROM reviews
+                WHERE file_path = ? AND file_hash = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+            """, (file_path, file_hash, limit))
+        else:
+            cursor = self.conn.execute("""
+                SELECT id, model, review_json, created_at
+                FROM reviews
+                WHERE file_path = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+            """, (file_path, limit))
+        return [{"id": r[0], "model": r[1], "review": json.loads(r[2]), "created_at": r[3]} for r in cursor]
 
     def get_latest_by_hash(self, file_hash: str, power_mode: bool = False, rubric_hash: str = None) -> list:
         # Must match power_mode and rubric_hash exactly (not just file_hash + model) - otherwise
         # a row cached under a different power mode or rubric could be served as though it came
         # from the current request. ORDER BY + a per-model row_number so callers see each
         # model's single MOST RECENT matching review, not an arbitrary one from unordered rows.
+        # id DESC as a tiebreaker for the same reason get_reviews needs it - created_at alone
+        # has only second resolution and can't order two same-second rows deterministically.
         cursor = self.conn.execute("""
             SELECT model, review_json, model_id FROM (
                 SELECT model, review_json, model_id,
-                       ROW_NUMBER() OVER (PARTITION BY model ORDER BY created_at DESC) AS rn
+                       ROW_NUMBER() OVER (PARTITION BY model ORDER BY created_at DESC, id DESC) AS rn
                 FROM reviews
                 WHERE file_hash = ? AND power_mode = ? AND rubric_hash IS ?
             ) WHERE rn = 1
         """, (file_hash, int(power_mode), rubric_hash))
         return [{"model": r[0], "review": json.loads(r[1]), "model_id": r[2]} for r in cursor]
+
+    def get_latest_reviews_by_hash(self, file_path: str, file_hash: str) -> list:
+        # For consensus grouping (MCP get_consensus): get_reviews(..., limit=N) is a bounded
+        # history window, not "one row per model" - after several force-reviews of some seats,
+        # ten rows can be "three seats x several retries" with a fourth seat's only review
+        # pushed past the window and silently absent, so the synthesizer never sees it and the
+        # resulting "consensus" quietly excludes a real contributing seat. Reproduced this
+        # directly. Same per-model ROW_NUMBER() pattern as get_latest_by_hash, but without its
+        # power_mode/rubric_hash filter - that filter exists to stop a *cache* lookup serving a
+        # row from the wrong config, but here the caller wants "the latest review from every
+        # seat for this exact file revision" regardless of what power mode or rubric produced
+        # it, not a strict cache-precision match that could itself return nothing.
+        cursor = self.conn.execute("""
+            SELECT id, model, review_json, created_at FROM (
+                SELECT id, model, review_json, created_at,
+                       ROW_NUMBER() OVER (PARTITION BY model ORDER BY created_at DESC, id DESC) AS rn
+                FROM reviews
+                WHERE file_path = ? AND file_hash = ?
+            ) WHERE rn = 1
+            ORDER BY created_at DESC, id DESC
+        """, (file_path, file_hash))
+        return [{"id": r[0], "model": r[1], "review": json.loads(r[2]), "created_at": r[3]} for r in cursor]
 
     def queue_file(self, file_path: str, priority: str = "normal"):
         self.conn.execute("""
@@ -653,6 +758,45 @@ class ReviewDatabase:
             VALUES (?, ?, ?, ?, ?, ?)
         """, (session_id, file_path, file_hash, round_num, role, json.dumps(content)))
         self.conn.commit()
+
+    # session_query.py duplicates this method (and get_scoped_session, get_latest_debate_round,
+    # get_latest_consolidation below, plus scoped_session_report_path further down this file) as
+    # plain functions with no ai_council.py import - importing this module alone costs ~2.5s from
+    # the openai/anthropic SDK imports at the top of this file, unacceptable for a pure SQLite
+    # read the sidebar's session list/resume needs to feel instant. Keep both in sync.
+    def list_scoped_sessions(self, file_path: str = None, limit: int = 50) -> list:
+        # One row per session_id, keyed off its round-0 "user" row (the only round guaranteed to
+        # exist and to carry the original scope text) - MIN(id) picks that row without a second
+        # query per session_id. Filtering by file_path is optional: the sidebar's Scope panel
+        # wants "sessions for the file open right now" by default, but a session outlives the
+        # editor tab it was started from, so callers that want everything can omit it.
+        where = "WHERE file_path = ?" if file_path else ""
+        params = (file_path,) if file_path else ()
+        cursor = self.conn.execute(f"""
+            SELECT s.session_id, s.file_path, s.content, s.created_at,
+                   (SELECT MAX(round_num) FROM scoped_reviews WHERE session_id = s.session_id) AS max_round
+            FROM scoped_reviews s
+            INNER JOIN (
+                SELECT session_id, MIN(id) AS min_id
+                FROM scoped_reviews
+                WHERE role = 'user' AND round_num = 0
+                GROUP BY session_id
+            ) first_round ON first_round.min_id = s.id
+            {where}
+            ORDER BY s.created_at DESC
+            LIMIT ?
+        """, params + (limit,))
+        results = []
+        for row in cursor:
+            content = json.loads(row[2])
+            results.append({
+                "session_id": row[0],
+                "file_path": row[1],
+                "scope": content.get("scope", ""),
+                "created_at": row[3],
+                "max_round": row[4],
+            })
+        return results
 
     def get_scoped_session(self, session_id: str) -> list:
         cursor = self.conn.execute("""
@@ -728,11 +872,65 @@ class ReviewDatabase:
         result["consolidated_by"] = row[0]
         return result
 
+    def get_latest_consolidation(self, session_id: str, debate_round_num: int) -> Optional[dict]:
+        # Unlike get_cached_consolidation (exact consolidator match, used to detect a genuine
+        # cache hit before spending a call), this is for resuming a session where the caller has
+        # no prior idea which seat consolidated it last - auto-selection means that can vary
+        # between rounds. Most-recently-created row for the round is "current best answer."
+        cursor = self.conn.execute("""
+            SELECT consolidated_by, result_json FROM debate_consolidations
+            WHERE session_id = ? AND debate_round_num = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+        """, (session_id, debate_round_num))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        result = json.loads(row[1])
+        result["consolidated_by"] = row[0]
+        return result
+
     def save_consolidation(self, session_id: str, debate_round_num: int, consolidated_by: str, result: dict):
         self.conn.execute("""
             INSERT OR REPLACE INTO debate_consolidations (session_id, debate_round_num, consolidated_by, result_json)
             VALUES (?, ?, ?, ?)
         """, (session_id, debate_round_num, consolidated_by, json.dumps(result)))
+        self.conn.commit()
+
+    @staticmethod
+    def _consensus_input_key(review_rows: list) -> str:
+        """Fingerprints exactly WHICH review ROWS fed a consensus synthesis - not just which
+        model names. A bare model-name set is not a sufficient cache key: a forced re-review of
+        an unchanged file/hash can genuinely produce different findings (model update, rubric
+        change, ordinary nondeterministic response) while the file hash and the set of model
+        names contributing stay identical - reproduced this directly, a stale cached verdict
+        was served as current after a same-hash re-review changed content. Each review_row must
+        be a dict with "model" and "id" (that row's reviews.id, unique per insert - a re-review
+        is a NEW row with a new id, never an update to the old one) so the fingerprint changes
+        whenever the actual selected rows change, even if the model-name set does not."""
+        return ",".join(f"{r['model']}:{r['id']}" for r in sorted(review_rows, key=lambda r: (r["model"], r["id"])))
+
+    def get_cached_file_consensus(self, file_path: str, file_hash: str, synthesized_by: str, review_rows: list) -> Optional[dict]:
+        # Same seat's synthesis of the exact same review ROWS (same file revision, same
+        # specific reviews by id - not just the same model names) is the same answer -
+        # re-running it on every poll is pure re-spend for an identical result, not a refresh
+        # (nothing in the inputs changed, so there's nothing new for the model to produce).
+        # Keyed the same way debate consolidation caches its own AI-written result, plus the
+        # row-fingerprint guard above.
+        cursor = self.conn.execute("""
+            SELECT result_json, input_models FROM file_consensus
+            WHERE file_path = ? AND file_hash = ? AND synthesized_by = ?
+        """, (file_path, file_hash, synthesized_by))
+        row = cursor.fetchone()
+        if not row or row[1] != self._consensus_input_key(review_rows):
+            return None
+        return json.loads(row[0])
+
+    def save_file_consensus(self, file_path: str, file_hash: str, synthesized_by: str, review_rows: list, result: dict):
+        self.conn.execute("""
+            INSERT OR REPLACE INTO file_consensus (file_path, file_hash, synthesized_by, input_models, result_json)
+            VALUES (?, ?, ?, ?, ?)
+        """, (file_path, file_hash, synthesized_by, self._consensus_input_key(review_rows), json.dumps(result)))
         self.conn.commit()
 
 
@@ -799,8 +997,9 @@ class GPTReviewer:
 class GrokReviewer:
     """xAI Grok reviewer"""
 
-    # Max characters per chunk (Grok works better with smaller contexts)
-    MAX_CHUNK_SIZE = 15000
+    # Same chunk size as CliReviewer.CLI_CHUNK_CHARS so API Grok and CLI seats
+    # slice a long file the same way.
+    MAX_CHUNK_SIZE = 16000
 
     def __init__(self, api_key: str, model: str = "grok-3-mini"):
         if not HAS_HTTPX:
@@ -1044,6 +1243,14 @@ class GeminiReviewer:
 class OllamaReviewer:
     """Self-hosted Ollama reviewer (OpenAI-compatible API)"""
 
+    # A self-hosted model on local/on-prem hardware is genuinely slower than a hosted API under
+    # load, especially for a large scoped review under Power Mode (confirmed live: a Grok CLI
+    # timeout on a similar heavy request hit its own 240s ceiling comfortably). One shared
+    # constant, not two independently-hardcoded 180.0 literals, so review()'s and _call_api()'s
+    # timeouts can't drift apart from each other or from the sidebar hint text that quotes this
+    # ceiling to the user.
+    REQUEST_TIMEOUT_SECONDS = 600.0
+
     def __init__(self, base_url: str, model: str = "qwen3.6:35b-mlx", api_key: str = None):
         if not HAS_HTTPX:
             raise ImportError("httpx package not installed. Run: pip install httpx")
@@ -1087,7 +1294,7 @@ class OllamaReviewer:
                     endpoint,
                     headers=headers,
                     json=request_body,
-                    timeout=180.0
+                    timeout=self.REQUEST_TIMEOUT_SECONDS
                 )
                 if response.status_code != 200:
                     raise Exception(f"HTTP {response.status_code}: {response.text[:200]}")
@@ -1133,7 +1340,7 @@ class OllamaReviewer:
                     endpoint,
                     headers=headers,
                     json=request_body,
-                    timeout=180.0
+                    timeout=self.REQUEST_TIMEOUT_SECONDS
                 )
 
                 print(f"  [DEBUG] Ollama response status: {response.status_code}")
@@ -1340,31 +1547,37 @@ class AICouncil:
 
     def _setup_reviewers(self):
         """Enable API and CLI seats independently (both can sit on the same council)."""
+        # Every message here is setup diagnostics, not a command's actual result - it must never
+        # land on stdout, since several commands (any --json caller, and now the read-only
+        # scoped-sessions/scoped-resume commands that construct an AICouncil but need no
+        # reviewers at all) parse stdout expecting either pure JSON or "[+] MODEL Score:.../[!]
+        # MODEL ERROR" progress lines. This ran on stdout for a long time by oversight - it
+        # happened not to break the JSON parsers (which only ever read the last stdout line) or
+        # the live progress regexes (none of which match this method's specific message shapes),
+        # but that was luck, not a guarantee, so every print below is routed to stderr instead.
         models = self.config.get("models", {})
-        mode = "power" if self.power_mode else "standard"
-        model_names = MODEL_CONFIGS[mode]
 
         if self.power_mode:
-            print("\n[!] POWER MODE ENABLED - Using premium models (higher cost)")
-            print("    Estimated cost: ~$0.30-0.50 per review\n")
+            print("\n[!] POWER MODE ENABLED - Using premium models (higher cost)", file=sys.stderr)
+            print("    Estimated cost: ~$0.30-0.50 per review\n", file=sys.stderr)
 
         def _add_cli(seat: str, provider: str, label: str) -> bool:
             if not HAS_CLI_TRANSPORT:
-                print(f"[-] {label} CLI unavailable (cli_transport not loaded)")
+                print(f"[-] {label} CLI unavailable (cli_transport not loaded)", file=sys.stderr)
                 return False
             cli_name = PROVIDER_CLI[provider]
             binary = find_cli(cli_name)
             if not binary:
-                print(f"[-] {label} CLI not found on PATH ({cli_name})")
+                print(f"[-] {label} CLI not found on PATH ({cli_name})", file=sys.stderr)
                 return False
             try:
                 cli_model = resolve_cli_model(provider)
                 self.reviewers[seat] = CliReviewer(provider, binary, model=cli_model or None)
                 shown = cli_model or "default"
-                print(f"[+] {label} reviewer enabled (cli:{cli_name}/{shown} as {seat})")
+                print(f"[+] {label} reviewer enabled (cli:{cli_name}/{shown} as {seat})", file=sys.stderr)
                 return True
             except Exception as e:
-                print(f"[-] {label} CLI failed: {e}")
+                print(f"[-] {label} CLI failed: {e}", file=sys.stderr)
                 return False
 
         # GPT API
@@ -1372,13 +1585,13 @@ class AICouncil:
             api_key = os.environ.get(models["gpt-4"]["api_key_env"])
             if api_key:
                 try:
-                    model_name = model_names["gpt-4"]
+                    model_name = resolve_api_model("gpt-4", self.power_mode)
                     self.reviewers["gpt-4"] = GPTReviewer(api_key, model=model_name)
-                    print(f"[+] GPT-4 reviewer enabled (api:{model_name})")
+                    print(f"[+] GPT-4 reviewer enabled (api:{model_name})", file=sys.stderr)
                 except ImportError as e:
-                    print(f"[-] GPT-4 API disabled: {e}")
+                    print(f"[-] GPT-4 API disabled: {e}", file=sys.stderr)
             else:
-                print("[-] GPT-4 API disabled: no OPENAI_API_KEY")
+                print("[-] GPT-4 API disabled: no OPENAI_API_KEY", file=sys.stderr)
 
         if self.enable_gpt_cli:
             _add_cli("gpt-cli", "openai", "GPT/Codex")
@@ -1388,13 +1601,13 @@ class AICouncil:
             api_key = os.environ.get(models["grok"]["api_key_env"])
             if api_key:
                 try:
-                    model_name = model_names["grok"]
+                    model_name = resolve_api_model("grok", self.power_mode)
                     self.reviewers["grok"] = GrokReviewer(api_key, model=model_name)
-                    print(f"[+] Grok reviewer enabled (api:{model_name})")
+                    print(f"[+] Grok reviewer enabled (api:{model_name})", file=sys.stderr)
                 except Exception as e:
-                    print(f"[-] Grok API disabled: {e}")
+                    print(f"[-] Grok API disabled: {e}", file=sys.stderr)
             else:
-                print("[-] Grok API disabled: no XAI_API_KEY")
+                print("[-] Grok API disabled: no XAI_API_KEY", file=sys.stderr)
 
         if self.enable_grok_cli:
             _add_cli("grok-cli", "xai", "Grok")
@@ -1404,26 +1617,26 @@ class AICouncil:
             api_key = os.environ.get(models["gemini"]["api_key_env"])
             if api_key:
                 try:
-                    model_name = model_names["gemini"]
+                    model_name = resolve_api_model("gemini", self.power_mode)
                     self.reviewers["gemini"] = GeminiReviewer(api_key, model=model_name)
-                    print(f"[+] Gemini reviewer enabled (api:{model_name})")
+                    print(f"[+] Gemini reviewer enabled (api:{model_name})", file=sys.stderr)
                 except Exception as e:
-                    print(f"[-] Gemini disabled: {e}")
+                    print(f"[-] Gemini disabled: {e}", file=sys.stderr)
             else:
-                print("[-] Gemini disabled: no GOOGLE_API_KEY")
+                print("[-] Gemini disabled: no GOOGLE_API_KEY", file=sys.stderr)
 
         # Claude API
         if models.get("claude", {}).get("enabled"):
             api_key = os.environ.get(models["claude"]["api_key_env"])
             if api_key:
                 try:
-                    model_name = model_names["claude"]
+                    model_name = resolve_api_model("claude", self.power_mode)
                     self.reviewers["claude"] = ClaudeReviewer(api_key, model=model_name)
-                    print(f"[+] Claude reviewer enabled (api:{model_name})")
+                    print(f"[+] Claude reviewer enabled (api:{model_name})", file=sys.stderr)
                 except ImportError as e:
-                    print(f"[-] Claude API disabled: {e}")
+                    print(f"[-] Claude API disabled: {e}", file=sys.stderr)
             else:
-                print("[-] Claude API disabled: no ANTHROPIC_API_KEY")
+                print("[-] Claude API disabled: no ANTHROPIC_API_KEY", file=sys.stderr)
 
         if self.enable_claude_cli:
             _add_cli("claude-cli", "anthropic", "Claude")
@@ -1433,16 +1646,16 @@ class AICouncil:
             ollama_url = self.ollama_url or os.environ.get(
                 models.get("ollama", {}).get("url_env", "OLLAMA_URL"), ""
             )
-            model_name = self.ollama_model or model_names.get("ollama", "qwen3.6:35b-mlx")
+            model_name = self.ollama_model or "qwen3.6:35b-mlx"
             api_key = os.environ.get(models.get("ollama", {}).get("api_key_env", "OLLAMA_API_KEY"))
             try:
                 self.reviewers["ollama"] = OllamaReviewer(ollama_url, model=model_name, api_key=api_key)
-                print(f"[+] Ollama reviewer enabled ({model_name} @ {ollama_url})")
+                print(f"[+] Ollama reviewer enabled ({model_name} @ {ollama_url})", file=sys.stderr)
             except Exception as e:
-                print(f"[-] Ollama disabled: {e}")
+                print(f"[-] Ollama disabled: {e}", file=sys.stderr)
 
         if not self.reviewers:
-            print("[!] No reviewers configured. Turn on API and/or CLI seats (claude / codex / grok).")
+            print("[!] No reviewers configured. Turn on API and/or CLI seats (claude / codex / grok).", file=sys.stderr)
 
     def get_file_hash(self, content: str) -> str:
         return hashlib.sha256(content.encode()).hexdigest()
@@ -1538,10 +1751,19 @@ class AICouncil:
 
         return (model_name, review)
 
-    async def review_file_scoped(self, file_path: str, scope: str, session_id: str = None, show_progress: bool = True) -> dict:
+    async def review_file_scoped(self, file_path: str, scope: str, session_id: str = None, show_progress: bool = True,
+                                  preferred_synthesizer: str = None, nominated_arbiter: str = None) -> dict:
         """Round 0 of a 'Review with Scope' session: full council, layer1+2+3, no cache reuse
         (a scoped review is a distinct question from the file's canonical unscoped review, so
-        it neither reads nor writes the plain `reviews` cache) - persisted to scoped_reviews."""
+        it neither reads nor writes the plain `reviews` cache) - persisted to scoped_reviews.
+
+        nominated_arbiter: if this session will later run a Debate round in arbiter mode, the
+        arbiter seat must be chosen BEFORE any review happens and excluded from every review
+        round in the session (this one and any follow-up) - an arbiter that already produced
+        its own findings is ruling on a debate that can include its own claim, which is a real
+        conflict of interest, not just an appearance of one. Persisted on round 0 so later
+        rounds/debate read the SAME seat back rather than needing it re-specified (and
+        potentially inconsistently) at every call site."""
         path = Path(file_path)
         if not path.exists():
             return {"error": f"File not found: {file_path}"}
@@ -1550,17 +1772,32 @@ class AICouncil:
         file_hash = self.get_file_hash(content)
         session_id = session_id or str(uuid.uuid4())
 
-        enabled_models = list(self.reviewers.keys())
-        if not enabled_models:
+        # Validate the arbiter BEFORE any reviewer is called - the sidebar already prevents its
+        # own equivalent invalid states (arbiter picker only offered with 4+ enabled seats), but
+        # the raw CLI is an equally real, documented entry point and must not spend paid review
+        # calls on a session that is guaranteed to fail at debate time anyway. Reproduced both:
+        # nominating an unavailable seat name, and nominating one of only 3 enabled seats
+        # (leaving 2 debaters, below run_debate_round's own 3-debater minimum) - both silently
+        # ran a full round before failing later.
+        if nominated_arbiter:
+            if nominated_arbiter not in self.reviewers:
+                return {"error": f"Nominated arbiter '{nominated_arbiter}' is not an enabled seat"}
+            if len(self.reviewers) - 1 < 3:
+                return {"error": f"Nominating '{nominated_arbiter}' as arbiter would leave only "
+                                  f"{len(self.reviewers) - 1} reviewing seat(s) - Debate requires at least 3. "
+                                  f"Enable a 4th seat, or run without --arbiter."}
+
+        reviewing_seats = {m: r for m, r in self.reviewers.items() if m != nominated_arbiter}
+        if not reviewing_seats:
             return {"error": "No reviewers configured. Turn on API and/or CLI seats (claude / codex / grok)."}
 
-        tracker = ProgressTracker(enabled_models) if show_progress else None
+        tracker = ProgressTracker(list(reviewing_seats.keys())) if show_progress else None
         if tracker:
             tracker.start_spinner()
 
         tasks = [
             self._review_with_model(model_name, reviewer, content, file_path, tracker, scope=scope)
-            for model_name, reviewer in self.reviewers.items()
+            for model_name, reviewer in reviewing_seats.items()
         ]
         completed = await asyncio.gather(*tasks)
         results = dict(completed)
@@ -1569,12 +1806,19 @@ class AICouncil:
             tracker.stop_spinner()
             tracker.print_summary()
 
-        consensus = self.aggregate_reviews(results)
+        # A failed synthesis call (timeout/auth/parse) does NOT abort the round here - every
+        # seat already answered successfully, and aggregate_reviews always returns the full
+        # consensus shape (consensus_issues empty, synthesis_error set) rather than a bare
+        # error, so the round's real results are never discarded just because the extra
+        # grouping call on top of them failed.
+        consensus = await self.aggregate_reviews(file_path, content, results, preferred_synthesizer)
 
-        self.db.add_scoped_round(session_id, str(file_path), file_hash, 0, "user", {"scope": scope})
+        self.db.add_scoped_round(session_id, str(file_path), file_hash, 0, "user",
+                                  {"scope": scope, "nominated_arbiter": nominated_arbiter})
         self.db.add_scoped_round(session_id, str(file_path), file_hash, 0, "council", {"reviews": results, "consensus": consensus})
 
-        return {"session_id": session_id, "reviews": results, "consensus": consensus, "_tracker": tracker}
+        return {"session_id": session_id, "reviews": results, "consensus": consensus,
+                "arbiter": nominated_arbiter, "_tracker": tracker}
 
     @staticmethod
     def _summarize_scoped_round(round_num: int, entry_by_role: dict) -> str:
@@ -1619,7 +1863,33 @@ class AICouncil:
             "confirm, or add to earlier findings, but do not silently repeat them verbatim."
         )
 
-    async def review_file_scoped_followup(self, session_id: str, question: str, show_progress: bool = True) -> dict:
+    @staticmethod
+    def _get_nominated_arbiter(scoped_rounds: list) -> Optional[str]:
+        """Reads back round 0's nominated_arbiter (set once, at the start of the session, by
+        review_file_scoped) - a follow-up round must exclude the SAME seat from reviewing that
+        round 0 did, not silently let it back in because this call site doesn't re-specify it."""
+        for r in scoped_rounds:
+            if r["round_num"] == 0 and r["role"] == "user":
+                return r["content"].get("nominated_arbiter")
+        return None
+
+    @staticmethod
+    def _get_round0_roster(scoped_rounds: list) -> Optional[set]:
+        """The set of seats that actually reviewed in round 0 - each CLI/extension invocation
+        is a fresh process whose self.reviewers is built solely from THIS call's flags, with no
+        memory of what an earlier round ran with. A UI/flag change between rounds (a toggle
+        flipped, a key removed) would otherwise silently review a follow-up with a DIFFERENT
+        roster than round 0 - a seat that never saw the original findings answering a follow-up
+        about them, or a seat round 0 relied on quietly missing. Returns None if round 0's
+        roster can't be found (an older/malformed session) - callers should not enforce a match
+        against nothing."""
+        for r in scoped_rounds:
+            if r["round_num"] == 0 and r["role"] == "council":
+                return set(r["content"].get("reviews", {}).keys())
+        return None
+
+    async def review_file_scoped_followup(self, session_id: str, question: str, show_progress: bool = True,
+                                           preferred_synthesizer: str = None) -> dict:
         """Next round of an existing 'Review with Scope' session: full council answers again,
         with the prior rounds (compacted) plus the new question as context."""
         prior_rounds = self.db.get_scoped_session(session_id)
@@ -1635,19 +1905,41 @@ class AICouncil:
         file_hash = self.get_file_hash(content)
         next_round = self.db.get_scoped_session_max_round(session_id) + 1
 
-        enabled_models = list(self.reviewers.keys())
-        if not enabled_models:
+        nominated_arbiter = self._get_nominated_arbiter(prior_rounds)
+        reviewing_seats = {m: r for m, r in self.reviewers.items() if m != nominated_arbiter}
+        if not reviewing_seats:
             return {"error": "No reviewers configured. Turn on API and/or CLI seats (claude / codex / grok)."}
+
+        # Enforce this at the actual trust boundary (the process about to spend real calls),
+        # not only in the sidebar's own pre-send check - this process is a fresh invocation
+        # whose self.reviewers reflects only THIS call's flags, with no memory of round 0's
+        # roster on its own. A live toggle/key change between rounds (any client of this
+        # method, sidebar or raw CLI) must not silently review a follow-up with a roster round
+        # 0 never had - one round's findings would then be missing a seat that answers the
+        # follow-up, or a seat that never saw round 0 responds as though it had context it
+        # doesn't. Fail clearly before any reviewer call, matching --arbiter's own up-front
+        # validation in review_file_scoped.
+        round0_roster = self._get_round0_roster(prior_rounds)
+        if round0_roster is not None and set(reviewing_seats.keys()) != round0_roster:
+            missing = round0_roster - set(reviewing_seats.keys())
+            added = set(reviewing_seats.keys()) - round0_roster
+            detail = []
+            if missing:
+                detail.append(f"missing: {', '.join(sorted(missing))}")
+            if added:
+                detail.append(f"newly added: {', '.join(sorted(added))}")
+            return {"error": f"Enabled seats have changed since round 0 ({', '.join(sorted(round0_roster))}) - "
+                              f"{'; '.join(detail)}. Restore the original seats, or start a new Review with Scope session."}
 
         followup_scope = self.build_scoped_followup_context(prior_rounds, question)
 
-        tracker = ProgressTracker(enabled_models) if show_progress else None
+        tracker = ProgressTracker(list(reviewing_seats.keys())) if show_progress else None
         if tracker:
             tracker.start_spinner()
 
         tasks = [
             self._review_with_model(model_name, reviewer, content, file_path, tracker, scope=followup_scope)
-            for model_name, reviewer in self.reviewers.items()
+            for model_name, reviewer in reviewing_seats.items()
         ]
         completed = await asyncio.gather(*tasks)
         results = dict(completed)
@@ -1656,7 +1948,9 @@ class AICouncil:
             tracker.stop_spinner()
             tracker.print_summary()
 
-        consensus = self.aggregate_reviews(results)
+        # See review_file_scoped's identical comment: a failed synthesis call does not abort
+        # this round either - the successful per-seat results are kept regardless.
+        consensus = await self.aggregate_reviews(file_path, content, results, preferred_synthesizer)
 
         self.db.add_scoped_round(session_id, file_path, file_hash, next_round, "user", {"question": question})
         self.db.add_scoped_round(session_id, file_path, file_hash, next_round, "council", {"reviews": results, "consensus": consensus})
@@ -1759,10 +2053,12 @@ not omit a genuine finding to make the report shorter. Return ONLY the markdown 
 no preamble, no meta-commentary about this task, no markdown code fences around the whole thing."""
 
         try:
+            call_start = time.monotonic()
             if HAS_CLI_TRANSPORT and isinstance(writer, CliReviewer):
-                doc, _usage = await writer._call_api(doc_prompt, mode="fix")
+                doc, usage = await writer._call_api(doc_prompt, mode="fix")
             else:
-                doc, _usage = await writer._call_api(doc_prompt)
+                doc, usage = await writer._call_api(doc_prompt)
+            usage = {**(usage or {}), "elapsed_seconds": round(time.monotonic() - call_start, 1)}
         except Exception as e:
             return {"error": f"Failed to generate review doc: {e}"}
 
@@ -1784,37 +2080,86 @@ no preamble, no meta-commentary about this task, no markdown code fences around 
 
         Path(output_path).write_text(doc, encoding="utf-8")
 
-        return {"session_id": session_id, "writer": writer_name, "output_path": output_path, "doc": doc}
+        return {"session_id": session_id, "writer": writer_name, "output_path": output_path, "doc": doc,
+                "usage": {writer_name: usage}}
 
-    def aggregate_reviews(self, reviews: dict) -> dict:
-        """Combine reviews into consensus"""
-        all_issues = []
-        scores = []
+    @staticmethod
+    def _finding_id(model: str, index_1based: int) -> str:
+        """Stable per-finding ID (e.g. "gpt-4:2") - the join key between a raw issue in a
+        review dict and that same finding as cited in a synthesizer's consensus cluster
+        source_ids. Must compute identically wherever a finding needs an ID: synthesize_reviews
+        assigns these when building its prompt (1-based, in review["issues"] order), and
+        aggregate_reviews recomputes the same IDs (same enumerate(..., 1) order) to check which
+        raw issues a cluster's source_ids actually covers - the two must never drift apart."""
+        return f"{model}:{index_1based}"
 
-        for model, review in reviews.items():
-            if "error" in review:
-                continue
-            scores.append(review.get("quality_score", 5))
-            for issue in review.get("issues", []):
-                issue["model"] = model
-                all_issues.append(issue)
+    async def aggregate_reviews(self, file_path: str, code_content: str, reviews: dict,
+                                 preferred_synthesizer: str = None) -> dict:
+        """Combine reviews into consensus. Grouping "the same issue across models" by MEANING
+        needs actual language understanding - a local text-similarity heuristic was tried and
+        rejected (it scored two DIFFERENT bugs that happened to share wording as more similar
+        than genuine paraphrases of the SAME bug, which is worse than not grouping at all) - so
+        this delegates to the nominated doer seat via synthesize_reviews(), the same seat the
+        user already picks for Council Verdict, rather than approximate it locally.
 
-        # Find consensus issues (mentioned by multiple models)
-        issue_map = {}
-        for issue in all_issues:
-            key = issue.get("description", "")[:50].lower()
-            if key not in issue_map:
-                issue_map[key] = []
-            issue_map[key].append(issue)
+        On synthesis failure, this still returns the normal consensus-dict shape (empty
+        consensus_issues, every raised issue folded into unique_insights, a `synthesis_error`
+        key set) rather than an {"error": ...}-only dict - a caller that already has real,
+        successful per-seat review results (the common failure case: every seat answered fine,
+        only the EXTRA grouping call died) must be able to keep and persist those results
+        instead of discarding a fully successful round because one additional call failed.
+        Callers that truly cannot proceed without grouping (e.g. --issues consensus-only mode)
+        check `synthesis_error` themselves rather than this method silently choosing for them."""
+        scores = [r.get("quality_score", 5) for r in reviews.values() if "error" not in r]
+        successful = {m: r for m, r in reviews.items() if "error" not in r}
+        all_raised_issues = [i for r in successful.values() for i in r.get("issues", [])]
 
-        consensus = [issues[0] for issues in issue_map.values() if len(issues) > 1]
-        unique = [issues[0] for issues in issue_map.values() if len(issues) == 1]
+        if len(successful) < 2:
+            return {
+                "consensus_issues": [],
+                "unique_insights": all_raised_issues,
+                "average_score": sum(scores) / len(scores) if scores else 0,
+                "model_count": len(reviews),
+            }
+
+        synthesis = await self.synthesize_reviews(file_path, code_content, successful, preferred_synthesizer)
+        if "error" in synthesis:
+            return {
+                "consensus_issues": [],
+                "unique_insights": all_raised_issues,
+                "average_score": sum(scores) / len(scores) if scores else 0,
+                "model_count": len(reviews),
+                "synthesis_error": synthesis["error"],
+            }
+
+        consensus_issues = synthesis.get("consensus_issues", [])
+        # unique_insights = every raised issue whose stable "model:index" ID (same scheme
+        # synthesize_reviews assigned in its prompt, recomputed here in the same enumeration
+        # order) doesn't appear in any cluster's validated source_ids. NOT a (model, line) key
+        # (one model can raise two distinct findings on the same line - a line-only key wrongly
+        # marks both "covered" when only one belongs to the cluster - and two models can cite
+        # different nearby lines for the same real defect, wrongly leaving a genuinely-covered
+        # finding as "unique") and NOT a text match against the synthesizer's own description
+        # (it writes a fresh summary sentence per cluster, not an echo of the original wording,
+        # so a string-equality check would almost never match even issues it DID group).
+        covered_ids = {sid for c in consensus_issues for sid in c.get("source_ids", [])}
+        unique = [
+            issue for model, r in successful.items()
+            for i, issue in enumerate(r.get("issues", []), 1)
+            if self._finding_id(model, i) not in covered_ids
+        ]
 
         return {
-            "consensus_issues": consensus,
+            "consensus_issues": consensus_issues,
             "unique_insights": unique,
+            "disputed_findings": synthesis.get("disputed_findings", []),
+            "priority_ranking": synthesis.get("priority_ranking", []),
+            "false_positives": synthesis.get("false_positives", []),
+            "council_verdict": synthesis.get("council_verdict", ""),
+            "final_score": synthesis.get("final_score"),
             "average_score": sum(scores) / len(scores) if scores else 0,
-            "model_count": len(reviews)
+            "model_count": len(reviews),
+            "synthesized_by": synthesis.get("synthesized_by"),
         }
 
     async def synthesize_reviews(self, file_path: str, code_content: str, reviews: dict, preferred_synthesizer: str = None) -> dict:
@@ -1841,7 +2186,16 @@ no preamble, no meta-commentary about this task, no markdown code fences around 
         # Build the synthesis prompt
         filename = Path(file_path).name
 
-        # Format individual reviews
+        # Format individual reviews - each finding gets a stable "model:index" ID (e.g.
+        # "gpt-4:2") shown to the synthesizer, which must cite exact IDs in consensus_issues.
+        # (model, line) was tried as the join key for "which findings does this cluster cover"
+        # and rejected: one model can raise two distinct findings on the same line (only one
+        # belongs to a cluster, but a line-only key marks both "covered", silently dropping the
+        # unrelated one from unique_insights), and two models can cite different nearby lines
+        # for the same real defect (a genuinely-covered finding then wrongly stays "unique"
+        # because its own line differs from the cluster's single representative line). An
+        # explicit ID the synthesizer must echo back has neither failure mode.
+        valid_ids = set()
         reviews_text = ""
         for model, review in reviews.items():
             if "error" in review:
@@ -1854,10 +2208,12 @@ no preamble, no meta-commentary about this task, no markdown code fences around 
 
             if issues:
                 for i, issue in enumerate(issues, 1):
+                    finding_id = self._finding_id(model, i)
+                    valid_ids.add(finding_id)
                     sev = issue.get("severity", "?")
                     line = issue.get("line", "?")
                     desc = issue.get("description", "")
-                    reviews_text += f"{i}. [{sev}] Line {line}: {desc}\n"
+                    reviews_text += f"[{finding_id}] [{sev}] Line {line}: {desc}\n"
             else:
                 reviews_text += "No issues found.\n"
 
@@ -1874,12 +2230,16 @@ no preamble, no meta-commentary about this task, no markdown code fences around 
 ```
 
 ## Individual Model Reviews:
+Each finding is tagged with a bracketed ID like [gpt-4:2] - that exact ID (not the model name
+or line number alone) is how you must reference it below.
 {reviews_text}
 
 ## Your Synthesis Task:
 Analyze all reviews and provide a unified Council Verdict:
 
-1. **Consensus Issues** - Issues flagged by 2+ models (most important to fix)
+1. **Consensus Issues** - Issues flagged by 2+ DIFFERENT models describing the SAME underlying
+   defect (most important to fix). List every finding ID that belongs to the cluster in
+   "source_ids" - use the exact bracketed IDs from above, not model names or line numbers.
 2. **Disputed Findings** - Where models disagree, and your judgment on who's correct
 3. **Priority Ranking** - Top 3 issues to fix first, with reasoning
 4. **Potential False Positives** - Any issues that seem incorrect or overly pedantic
@@ -1888,7 +2248,7 @@ Analyze all reviews and provide a unified Council Verdict:
 Respond in JSON format:
 {{
     "consensus_issues": [
-        {{"description": "...", "severity": "high/medium/low", "models_agreed": ["gpt-4", "claude"], "line": 123}}
+        {{"description": "...", "severity": "high/medium/low", "source_ids": ["gpt-4:2", "claude:1"], "line": 123}}
     ],
     "disputed_findings": [
         {{"issue": "...", "models_for": ["gpt-4"], "models_against": ["claude"], "verdict": "...", "correct_assessment": "..."}}
@@ -1918,12 +2278,38 @@ Respond in JSON format:
                 response, _usage = await synthesizer._call_api(synthesis_prompt)
 
             synthesis = self._extract_wrapped_json(response, required_key="council_verdict")
-            if synthesis is not None:
-                synthesis["synthesized_by"] = synthesizer_name
-                print(f"[+] Synthesis complete by {synthesizer_name.upper()}")
-                return synthesis
-            else:
+            if synthesis is None:
                 return {"error": "Failed to parse synthesis response", "raw": response[:500]}
+
+            # Validate source_ids against what was actually offered: a hallucinated or
+            # malformed ID must not silently pass through and corrupt unique_insights'
+            # coverage check downstream. A source_id may belong to at most ONE cluster - the
+            # contract is a partition of findings, not many-to-many - so a later cluster that
+            # reuses an id an earlier (already-accepted) cluster claimed has that id STRIPPED
+            # rather than the whole cluster dropped: e.g. gpt:1+claude:1 accepted first,
+            # gpt:1+grok:1+ollama:1 seen next - gpt:1 is already spoken for, but claude:1's
+            # 2-model finding shouldn't blind the result to grok+ollama's SEPARATE 2-model
+            # agreement on the same underlying issue just because they both also cited gpt's
+            # already-claimed finding. Only after stripping is the remainder checked for the
+            # 2-distinct-models bar (one model can't agree with itself - drop rather than trust
+            # the model's own "consensus" label if the remainder doesn't clear it).
+            used_source_ids = set()
+            valid_clusters = []
+            for cluster in synthesis.get("consensus_issues", []):
+                source_ids = [sid for sid in cluster.get("source_ids", []) if sid in valid_ids and sid not in used_source_ids]
+                models_in_cluster = {sid.rsplit(":", 1)[0] for sid in source_ids}
+                if len(models_in_cluster) < 2:
+                    continue
+                cluster = dict(cluster)
+                cluster["source_ids"] = source_ids
+                cluster["models_agreed"] = sorted(models_in_cluster)
+                valid_clusters.append(cluster)
+                used_source_ids.update(source_ids)
+            synthesis["consensus_issues"] = valid_clusters
+
+            synthesis["synthesized_by"] = synthesizer_name
+            print(f"[+] Synthesis complete by {synthesizer_name.upper()}")
+            return synthesis
         except Exception as e:
             return {"error": f"Synthesis failed: {describe_exception(e)}"}
 
@@ -2050,19 +2436,25 @@ Every finding number from 1 to {finding_index} must appear in exactly one cluste
 findings no other reviewer raised (a cluster can have just one finding_number). Omit
 "same_as_prior" or set it to null for a genuinely new cluster."""
 
+        print(f"[DEBATE] {clusterer_key.upper()} clustering {finding_index} finding(s)...", file=sys.stderr, flush=True)
         try:
             # See synthesize_reviews for why mode="fix" is required for CLI transports here:
             # the clustering JSON shape ({"clusters": [...]}) isn't the review schema, so
             # without it the real answer gets wrapped inside the forced schema's "summary"
             # field instead of returned directly.
+            call_start = time.monotonic()
             if HAS_CLI_TRANSPORT and isinstance(clusterer, CliReviewer):
                 response, usage = await clusterer._call_api(cluster_prompt, mode="fix")
             else:
                 response, usage = await clusterer._call_api(cluster_prompt)
+            usage = {**(usage or {}), "elapsed_seconds": round(time.monotonic() - call_start, 1)}
             parsed = self._extract_wrapped_json(response, required_key="clusters")
             if parsed is None:
+                print(f"[DEBATE] {clusterer_key.upper()} failed to return a parseable clustering response", file=sys.stderr, flush=True)
                 return {"error": "Failed to parse clustering response", "raw": response[:500]}
+            print(f"[DEBATE] {clusterer_key.upper()} formed {len(parsed.get('clusters', []))} cluster(s)", file=sys.stderr, flush=True)
         except Exception as e:
+            print(f"[DEBATE] {clusterer_key.upper()} clustering failed: {describe_exception(e)}", file=sys.stderr, flush=True)
             return {"error": f"Clustering failed: {describe_exception(e)}"}
 
         prior_by_id = {c["cluster_id"]: c for c in (prior_clusters or [])}
@@ -2148,17 +2540,27 @@ Respond with ONLY this JSON:
 Every cluster_id listed above must have an entry."""
 
         try:
+            call_start = time.monotonic()
             if HAS_CLI_TRANSPORT and isinstance(reviewer, CliReviewer):
                 response, usage = await reviewer._call_api(prompt, mode="fix")
             else:
                 response, usage = await reviewer._call_api(prompt)
+            usage = {**(usage or {}), "elapsed_seconds": round(time.monotonic() - call_start, 1)}
             parsed = self._extract_wrapped_json(response, required_key="positions")
             if parsed is None:
+                print(f"[DEBATE] {model_name.upper()} failed to return a parseable position", file=sys.stderr, flush=True)
                 return (model_name, {"error": "Failed to parse debate position", "raw": response[:300]})
             positions = parsed.get("positions", {})
             positions["_usage"] = usage
+            # Each seat's own completion, printed as soon as ITS call finishes rather than
+            # after the whole asyncio.gather() batch - without this, debate's only visible
+            # progress was one static "gathering positions from X, Y, Z..." line and an
+            # elapsed-seconds clock for the entire wait, with no way to tell which seat (if
+            # any) had actually responded until everything finished or the whole round failed.
+            print(f"[DEBATE] {model_name.upper()} responded ({len(positions) - 1} position(s))", file=sys.stderr, flush=True)
             return (model_name, positions)
         except Exception as e:
+            print(f"[DEBATE] {model_name.upper()} failed: {describe_exception(e)}", file=sys.stderr, flush=True)
             return (model_name, {"error": describe_exception(e)})
 
     @staticmethod
@@ -2192,15 +2594,19 @@ Every cluster_id listed above must have an entry."""
                 agreed += 1
         return round(100.0 * agreed / len(clusters), 1)
 
-    async def run_debate_round(self, session_id: str, mode: str = None, arbiter_name: str = None) -> dict:
+    async def run_debate_round(self, session_id: str, mode: str = None) -> dict:
         """Runs one debate round for a scoped-review session: cluster findings (or reuse the
         latest clustering if positions already exist and clusters haven't changed), gather
         each debating seat's position, compute consensus %, persist.
 
-        mode: 'all_to_all' (every enabled seat debates every cluster) or 'arbiter' (one seat
-        is excluded from debating and instead rules on disputes). Auto-selected from seat count
-        if not given: 3 seats -> all_to_all, 4+ seats -> arbiter (arbiter_name required then).
-        """
+        mode: 'all_to_all' (every reviewing seat debates every cluster) or 'arbiter' (the seat
+        nominated back in review_file_scoped rules on disputes instead of debating). Auto: if
+        round 0 nominated an arbiter, mode is 'arbiter'; otherwise 'all_to_all'. The arbiter
+        seat is NOT an argument here - it was fixed once, before any review ran, specifically
+        so it could never have produced findings of its own to be judging. Accepting a fresh
+        arbiter_name at debate time would let a seat that already reviewed the code become
+        arbiter after the fact, exactly the conflict of interest nominating it up front exists
+        to prevent."""
         scoped_rounds = self.db.get_scoped_session(session_id)
         if not scoped_rounds:
             return {"error": f"No scoped review session found: {session_id}"}
@@ -2212,6 +2618,8 @@ Every cluster_id listed above must have an entry."""
         code_content = path.read_text(encoding="utf-8", errors="ignore")
 
         # Merge all rounds' reviews (round 0 + any follow-ups) into one findings set to debate.
+        # The nominated arbiter (if any) was already excluded from every review round, so it's
+        # never a key in here - nothing further to filter out at this step.
         merged_reviews: dict = {}
         for r in scoped_rounds:
             if r["role"] != "council":
@@ -2219,18 +2627,41 @@ Every cluster_id listed above must have an entry."""
             for model, review in r["content"].get("reviews", {}).items():
                 merged_reviews[model] = review  # later rounds supersede earlier ones per model
 
-        enabled_seats = list(self.reviewers.keys())
-        if len(enabled_seats) < 3:
-            return {"error": f"Debate requires at least 3 enabled seats (have {len(enabled_seats)}): review findings independently instead"}
+        arbiter_name = self._get_nominated_arbiter(scoped_rounds)
+
+        # Same enforcement as review_file_scoped_followup, same reasoning: this invocation's
+        # self.reviewers reflects only whatever flags THIS process got, not round 0's roster.
+        # A seat that never reviewed debating positions on findings it never independently
+        # investigated (or a seat round 0 relied on silently missing from the debate) is the
+        # same class of bug as the followup case - fail clearly before any debate/clustering
+        # call, rather than let a live toggle change quietly reshape who debates.
+        round0_roster = self._get_round0_roster(scoped_rounds)
+        current_reviewing = {m for m in self.reviewers.keys() if m != arbiter_name}
+        if round0_roster is not None and current_reviewing != round0_roster:
+            missing = round0_roster - current_reviewing
+            added = current_reviewing - round0_roster
+            detail = []
+            if missing:
+                detail.append(f"missing: {', '.join(sorted(missing))}")
+            if added:
+                detail.append(f"newly added: {', '.join(sorted(added))}")
+            return {"error": f"Enabled seats have changed since round 0 ({', '.join(sorted(round0_roster))}) - "
+                              f"{'; '.join(detail)}. Restore the original seats, or start a new Review with Scope session."}
+
+        debating_seats = list(self.reviewers.keys())
+        if arbiter_name in debating_seats:
+            debating_seats.remove(arbiter_name)
+        if len(debating_seats) < 3:
+            return {"error": f"Debate requires at least 3 reviewing seats (have {len(debating_seats)}" +
+                    (f", plus arbiter {arbiter_name}" if arbiter_name else "") +
+                    "): review findings independently instead"}
 
         if not mode:
-            mode = "arbiter" if len(enabled_seats) >= 4 else "all_to_all"
+            mode = "arbiter" if arbiter_name else "all_to_all"
         if mode == "arbiter" and not arbiter_name:
-            return {"error": "Arbiter mode requires --arbiter (which enabled seat should NOT debate and instead rule on disputes)"}
+            return {"error": "Arbiter mode requires a seat nominated as arbiter when Review with Scope started - restart the session and pick one"}
         if mode == "arbiter" and arbiter_name not in self.reviewers:
-            return {"error": f"Arbiter '{arbiter_name}' is not an enabled seat"}
-
-        debating_seats = [s for s in enabled_seats if s != arbiter_name] if mode == "arbiter" else enabled_seats
+            return {"error": f"Nominated arbiter '{arbiter_name}' is not an enabled seat"}
         # In all_to_all mode there is no seat outside the debate to cluster unbiased - with
         # the 3-seat minimum, every enabled seat is a debate participant. Clustering there is
         # necessarily done by one of the debating seats (picked deterministically via seat
@@ -2250,9 +2681,13 @@ Every cluster_id listed above must have an entry."""
         # Some seats (self-hosted Ollama in particular) don't report usage at all - _call_api
         # returns None rather than a fabricated 0 for those, so accumulation must not assume
         # every call contributes a real number, and the total is marked partial rather than
-        # silently understating it as a confirmed small number.
+        # silently understating it as a confirmed small number. elapsed_seconds is tracked
+        # independently of token counts (every _call_api site times itself, unconditionally) -
+        # a seat with no token usage at all (Ollama) still has a real, worth-showing call time.
         def _add_usage(seat: str, usage: dict):
-            bucket = token_usage.setdefault(seat, {"input_tokens": 0, "output_tokens": 0, "partial": False})
+            bucket = token_usage.setdefault(seat, {"input_tokens": 0, "output_tokens": 0, "partial": False, "elapsed_seconds": 0})
+            if usage.get("elapsed_seconds") is not None:
+                bucket["elapsed_seconds"] += usage["elapsed_seconds"]
             if usage.get("input_tokens") is None or usage.get("output_tokens") is None:
                 bucket["partial"] = True
                 return
@@ -2324,6 +2759,7 @@ Every cluster_id listed above must have an entry."""
             "clusters": clusters,
             "positions": positions_by_model,
             "consensus_pct": consensus_pct,
+            "token_usage": token_usage,
         }
 
     async def _arbiter_rule_on_debate(self, arbiter_name: str, clusters: list, positions_by_model: dict,
@@ -2381,16 +2817,21 @@ Respond with ONLY this JSON:
 Every cluster_id must have a ruling."""
 
         try:
+            call_start = time.monotonic()
             if HAS_CLI_TRANSPORT and isinstance(arbiter, CliReviewer):
                 response, usage = await arbiter._call_api(prompt, mode="fix")
             else:
                 response, usage = await arbiter._call_api(prompt)
+            usage = {**(usage or {}), "elapsed_seconds": round(time.monotonic() - call_start, 1)}
             parsed = self._extract_wrapped_json(response, required_key="rulings")
             if parsed is None:
+                print(f"[DEBATE] Arbiter ({arbiter_name}) failed to return a parseable ruling", file=sys.stderr, flush=True)
                 return {"error": "Failed to parse arbiter ruling", "raw": response[:300]}
             rulings.update(parsed.get("rulings", {}))
+            print(f"[DEBATE] Arbiter ({arbiter_name}) ruled on {len(contested)} contested cluster(s)", file=sys.stderr, flush=True)
             return {"rulings": rulings, "usage": usage}
         except Exception as e:
+            print(f"[DEBATE] Arbiter ({arbiter_name}) failed: {describe_exception(e)}", file=sys.stderr, flush=True)
             return {"error": describe_exception(e)}
 
     @staticmethod
@@ -2537,10 +2978,12 @@ Order findings by severity, most severe first. Do not include a finding or open 
 isn't backed by the debate material above."""
 
         try:
+            call_start = time.monotonic()
             if HAS_CLI_TRANSPORT and isinstance(consolidator, CliReviewer):
                 response, usage = await consolidator._call_api(prompt, mode="fix")
             else:
                 response, usage = await consolidator._call_api(prompt)
+            usage = {**(usage or {}), "elapsed_seconds": round(time.monotonic() - call_start, 1)}
             parsed = self._extract_wrapped_json(response, required_key="findings")
             if parsed is None:
                 return {"error": "Failed to parse consolidation response", "raw": response[:500]}
@@ -2630,12 +3073,26 @@ Return the complete fixed file content:"""
         print(f"[*] Fixing code with {fixer_name.upper()}...", file=sys.stderr)
 
         try:
+            # Deviation from every other timed call site (cluster/debate/arbiter/consolidate/
+            # finalize): those all return a dict a "usage" field can be added to. fix_code's
+            # contract is `print(fixed_code)` straight to stdout with NOTHING else - sidePanel.ts
+            # takes stdout verbatim as the literal fixed file content (const fixedContent =
+            # stdout), so returning {"code": ..., "usage": ...} or appending timing text would
+            # corrupt the file being fixed. Timing goes to stderr instead, the same channel
+            # [DEBATE]/[CONSOLIDATE] already use for progress that must never land in a
+            # command's actual output - visible in the dev console, not silently dropped, without
+            # changing what this command returns.
+            call_start = time.monotonic()
             if HAS_CLI_TRANSPORT and isinstance(fixer, CliReviewer):
                 # CLI transports default to the review JSON-schema pipeline; fix needs
                 # free-text code back, not a JSON-constrained response.
-                fixed_code, _usage = await fixer._call_api(fix_prompt, mode="fix")
+                fixed_code, usage = await fixer._call_api(fix_prompt, mode="fix")
             else:
-                fixed_code, _usage = await fixer._call_api(fix_prompt)
+                fixed_code, usage = await fixer._call_api(fix_prompt)
+            elapsed = round(time.monotonic() - call_start, 1)
+            usage = usage or {}
+            usage_text = f"{usage['input_tokens']} in / {usage['output_tokens']} out" if usage.get("input_tokens") is not None else "usage not reported"
+            print(f"[FIX] {fixer_name.upper()} done in {elapsed}s ({usage_text})", file=sys.stderr, flush=True)
 
             # Clean up the response - remove any markdown code fences
             fixed_code = fixed_code.strip()
@@ -2705,6 +3162,23 @@ Return the complete fixed file content:"""
             print()
 
 
+# session_query.py duplicates this function too (no import of this module) - keep in sync.
+def scoped_session_report_path(db_path: str, file_path: str, session_id: str) -> str:
+    """One deterministic HTML report path per scoped-review session - <file-stem>-<session_id>
+    - computed identically by round 0, every follow-up, debate, and consolidate, all of which
+    write (overwrite) the SAME file rather than each producing its own new timestamped one.
+    The report is meant to always reflect the session's CURRENT state (latest round's findings,
+    live consensus, debate positions, the consolidated result once one exists) - a fresh file
+    per round defeats that, since "open the report" then means finding whichever file happens
+    to be newest instead of one place that is always current. Deterministic from session_id
+    alone (no timestamp, no counter) so every call site - which independently reads session_id
+    back from the database rather than passing a path around - computes the exact same string."""
+    reports_dir = Path(db_path).parent / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    clean_name = Path(file_path).stem[:30]
+    return str(reports_dir / f"scoped-review-{clean_name}-{session_id}.html")
+
+
 def esc(value) -> str:
     """Escapes model-generated/reviewed-file-derived text before it lands in HTML markup - a
     review target or a model's own output is not trusted content, and this report is opened in
@@ -2713,38 +3187,37 @@ def esc(value) -> str:
     return html_module.escape(str(value), quote=True)
 
 
-def generate_html_report(file_path: str, reviews: dict, output_path: str = None, power_mode: bool = False, synthesis: dict = None) -> str:
-    """Generate a beautiful HTML report for the review results"""
+def generate_html_report(file_path: str, reviews: dict, output_path: str = None, power_mode: bool = False,
+                          synthesis: dict = None, debate_result: dict = None, consolidation_result: dict = None) -> str:
+    """Generate a beautiful HTML report for the review results. Consensus grouping is done by
+    the nominated doer seat (see aggregate_reviews/synthesize_reviews), never approximated
+    locally here - `synthesis` is that seat's already-computed result, passed in by the caller
+    (None only when consensus genuinely wasn't requested for this report, e.g. `review --html`
+    without `--synthesize` - a real "not requested" state, not an error to paper over).
+
+    debate_result/consolidation_result: the latest debate round (clusters, positions, consensus
+    %) and the latest consolidated review, when a scoped-review session has run either - passed
+    through so ONE evolving report (see scoped_session_report_path) always shows the session's
+    current state end to end, not just round 0's raw findings. Both None for a plain (non-scoped)
+    review, which has no debate/consolidate concept at all."""
     from datetime import datetime
 
     filename = esc(Path(file_path).name)
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # Calculate consensus and collect token usage
-    all_issues = []
+    # Collect token usage
     scores = []
     usage_by_model = {}
     for model, review in reviews.items():
         if isinstance(review, dict) and "error" not in review:
             scores.append(review.get("quality_score", 0))
-            for issue in review.get("issues", []):
-                issue["model"] = model
-                all_issues.append(issue)
-            # Collect token usage
             if "_usage" in review:
                 usage_by_model[model] = review["_usage"]
 
     avg_score = sum(scores) / len(scores) if scores else 0
 
-    # Find consensus (issues mentioned by multiple models)
-    issue_map = {}
-    for issue in all_issues:
-        key = issue.get("description", "")[:50].lower()
-        if key not in issue_map:
-            issue_map[key] = []
-        issue_map[key].append(issue)
-
-    consensus_issues = [issues[0] for issues in issue_map.values() if len(issues) > 1]
+    consensus_requested = synthesis is not None
+    consensus_issues = (synthesis or {}).get("consensus_issues", [])
 
     # Generate HTML
     html = f'''<!DOCTYPE html>
@@ -2990,16 +3463,24 @@ def generate_html_report(file_path: str, reviews: dict, output_path: str = None,
     # Add score cards for each model
     for model, review in reviews.items():
         if isinstance(review, dict):
-            score = review.get("quality_score", 0) if "error" not in review else "ERR"
-            issues_count = len(review.get("issues", [])) if "error" not in review else 0
+            has_error = "error" in review
+            score = review.get("quality_score", 0) if not has_error else "ERR"
+            issues_count = len(review.get("issues", [])) if not has_error else 0
             model_class = "gpt" if "gpt" in model.lower() else ("grok" if "grok" in model.lower() else ("claude" if "claude" in model.lower() else ("ollama" if "ollama" in model.lower() else "gemini")))
             score_class = "good" if isinstance(score, (int, float)) and score >= 7 else ("medium" if isinstance(score, (int, float)) and score >= 5 else "bad")
+            # A failed seat's real error (CLI timeout, auth failure, parse error, etc.) must be
+            # visible on its own card - a bare "ERR/10" with no message told a user nothing more
+            # than the sidebar's own bare "Error" card did (that gap was reproduced live: a
+            # Grok CLI timeout produced only "ERR/10, 0 issues" here, the actual "grok-cli CLI
+            # timed out after 240s" text was recoverable only by reading the SQLite row by hand).
+            error_line = f'<div style="color: var(--rose-500); font-size: 0.75rem; margin-top: 4px;">{esc(review.get("error", ""))}</div>' if has_error else ""
 
             html += f'''
             <div class="score-card {model_class}">
                 <h3>{model.upper()}</h3>
                 <div class="score {score_class}">{score}/10</div>
                 <div style="color: var(--zinc-400); font-size: 0.8rem;">{issues_count} issues</div>
+                {error_line}
             </div>
 '''
 
@@ -3033,9 +3514,34 @@ def generate_html_report(file_path: str, reviews: dict, output_path: str = None,
             </div>
 '''
         html += '        </div>\n'
+    elif not consensus_requested:
+        html += '''
+        <div class="section">
+            <h2>🎯 Consensus Issues (flagged by multiple models)</h2>
+            <p style="color: var(--zinc-400);">Not computed for this report - re-run with --synthesize to have the nominated AI seat group findings into consensus.</p>
+        </div>
+'''
 
-    # Add Council Verdict section if synthesis is available
-    if synthesis and not synthesis.get("error"):
+    # Add Council Verdict section if synthesis actually succeeded. Two different failure
+    # shapes can reach `synthesis` here (it's the raw synthesize_reviews() result for a plain
+    # review, or aggregate_reviews()'s wrapping result for a scoped review/follow-up): a hard
+    # failure uses "error" with no council_verdict key at all, and aggregate_reviews' "seats
+    # succeeded but the extra grouping call failed" case uses "synthesis_error" with likewise
+    # no council_verdict key. Checking for the presence of council_verdict itself (rather than
+    # the absence of one specific error key) correctly treats both failure shapes the same way,
+    # instead of `not synthesis.get("error")` silently passing a synthesis_error-only dict
+    # through as if it were a real (but blank) verdict - "?/10" and an empty summary looked
+    # like success, not like the failure it actually was.
+    synthesis_failed = bool(synthesis) and "council_verdict" not in synthesis
+    if synthesis_failed:
+        failure_reason = synthesis.get("synthesis_error") or synthesis.get("error") or "Unknown error"
+        html += f'''
+        <div class="council-verdict">
+            <h2>⚖️ Council Verdict</h2>
+            <p style="color: var(--rose-500);">⚠️ Synthesis failed - the individual seat reviews above are unaffected, but no consolidated verdict or consensus grouping could be produced: {esc(failure_reason)}</p>
+        </div>
+'''
+    elif synthesis and "council_verdict" in synthesis:
         final_score = synthesis.get("final_score", "?")
         verdict = synthesis.get("council_verdict", "")
         priority_ranking = synthesis.get("priority_ranking", [])
@@ -3154,6 +3660,63 @@ def generate_html_report(file_path: str, reviews: dict, output_path: str = None,
 '''
         html += '        </div>\n'
 
+    if debate_result and "error" not in debate_result:
+        mode_label = f"Arbiter ({esc(debate_result.get('arbiter', ''))})" if debate_result.get("mode") == "arbiter" else "All-to-all"
+        html += f'''
+        <div class="section">
+            <h2>&#9878; Debate Round {debate_result.get("debate_round_num", "?")} - {mode_label}</h2>
+            <div style="margin-bottom: 1rem; color: var(--zinc-400);">Consensus: {debate_result.get("consensus_pct", 0)}%</div>
+'''
+        positions_by_model = debate_result.get("positions", {})
+        arbiter_rulings = positions_by_model.get("_arbiter_ruling", {})
+        for c in debate_result.get("clusters", []):
+            html += f'''
+            <div class="issue info">
+                <div class="issue-desc"><strong>{esc(c.get("summary", ""))}</strong></div>
+                <div style="font-size: 0.8rem; color: var(--zinc-400); margin: 0.25rem 0;">Raised by: {esc(", ".join(m.get("model", "?") for m in c.get("members", [])))}</div>
+'''
+            for model, positions in positions_by_model.items():
+                if model == "_arbiter_ruling" or not isinstance(positions, dict) or "error" in positions:
+                    continue
+                pos = positions.get(c.get("cluster_id"))
+                if not pos:
+                    continue
+                html += f'''                <div style="font-size: 0.85rem; margin: 0.25rem 0;"><strong>{esc(model.upper())}</strong>: {esc(pos.get("stance", ""))} - {esc(pos.get("reasoning", ""))}</div>
+'''
+            ruling = arbiter_rulings.get(c.get("cluster_id"))
+            if ruling:
+                html += f'''                <div style="font-size: 0.85rem; margin-top: 0.5rem; color: var(--amber-500);"><strong>ARBITER</strong>: {esc(ruling.get("verdict", ""))} ({esc(ruling.get("final_severity", ""))}) - {esc(ruling.get("reasoning", ""))}</div>
+'''
+            html += '            </div>\n'
+        html += '        </div>\n'
+
+    if consolidation_result and "error" not in consolidation_result:
+        html += f'''
+        <div class="section">
+            <h2>&#9989; Consolidated Review (by {esc(consolidation_result.get("consolidated_by", "?").upper())})</h2>
+            <p>{esc(consolidation_result.get("summary", ""))}</p>
+'''
+        for f in consolidation_result.get("findings", []):
+            sev = esc(str(f.get("severity", "INFO")).lower())
+            html += f'''
+            <div class="issue {sev}">
+                <div class="issue-header"><span class="badge {sev}">{esc(f.get("severity", "INFO"))}</span></div>
+                <div class="issue-desc">{esc(f.get("description", ""))}</div>
+                {"<div class='issue-rec'>&#128161; " + esc(f.get("fix", "")) + "</div>" if f.get("fix") else ""}
+            </div>
+'''
+        open_questions = consolidation_result.get("open_questions", [])
+        if open_questions:
+            html += '            <h3 style="margin-top: 1.5rem;">Open Questions</h3>\n'
+            for q in open_questions:
+                html += f'''
+            <div class="issue medium">
+                <div class="issue-desc">{esc(q.get("question", ""))}</div>
+                <div style="font-size: 0.8rem; color: var(--zinc-400); margin-top: 0.25rem;">{esc(q.get("why_unresolved", ""))}</div>
+            </div>
+'''
+        html += '        </div>\n'
+
     html += '''
         <div class="footer">
             Generated by AI Council &bull; Multi-Model Code Review System<br>
@@ -3253,6 +3816,8 @@ def main():
     scoped_review_parser.add_argument("--no-gpt", action="store_true", help="Disable GPT-4 reviewer")
     scoped_review_parser.add_argument("--no-claude", action="store_true", help="Disable Claude reviewer")
     scoped_review_parser.add_argument("--no-grok", action="store_true", help="Disable Grok reviewer")
+    scoped_review_parser.add_argument("--synthesizer", choices=['claude', 'claude-cli', 'gpt-4', 'gpt-cli', 'gemini', 'grok', 'grok-cli', 'ollama'], help="Nominated AI seat to group findings into consensus (default: auto/best available)")
+    scoped_review_parser.add_argument("--arbiter", choices=['claude', 'claude-cli', 'gpt-4', 'gpt-cli', 'gemini', 'grok', 'grok-cli', 'ollama'], help="Nominate this seat as the session's debate arbiter NOW - it is excluded from reviewing (this round and any follow-up) so it never has prior findings of its own to be judging later. Fixed for the whole session; cannot be changed once nominated.")
     scoped_review_parser.add_argument("--html", action="store_true", help="Generate HTML report")
     scoped_review_parser.add_argument("--output", "-o", help="Output path for HTML report")
     scoped_review_parser.add_argument("--json-output", help="Write the JSON result to this file (stdout still carries live progress, like `review` does)")
@@ -3269,6 +3834,7 @@ def main():
     scoped_followup_parser.add_argument("--no-gpt", action="store_true", help="Disable GPT-4 reviewer")
     scoped_followup_parser.add_argument("--no-claude", action="store_true", help="Disable Claude reviewer")
     scoped_followup_parser.add_argument("--no-grok", action="store_true", help="Disable Grok reviewer")
+    scoped_followup_parser.add_argument("--synthesizer", choices=['claude', 'claude-cli', 'gpt-4', 'gpt-cli', 'gemini', 'grok', 'grok-cli', 'ollama'], help="Nominated AI seat to group findings into consensus (default: auto/best available)")
     scoped_followup_parser.add_argument("--html", action="store_true", help="Generate HTML report")
     scoped_followup_parser.add_argument("--output", "-o", help="Output path for HTML report")
     scoped_followup_parser.add_argument("--json-output", help="Write the JSON result to this file (stdout still carries live progress, like `review` does)")
@@ -3288,11 +3854,22 @@ def main():
     scoped_finalize_parser.add_argument("--no-grok", action="store_true", help="Disable Grok reviewer")
     scoped_finalize_parser.add_argument("--json", action="store_true", help="Print a single JSON result object instead of human-readable output")
 
+    # Session history/resume - the sidebar's Scope panel loses all in-memory state whenever the
+    # webview is hidden and recreated (VS Code disposes it without retainContextWhenHidden), so
+    # these two commands let it rebuild a session's full view from SQLite instead of the session
+    # only ever being reachable while its original webview instance stayed alive.
+    scoped_sessions_parser = subparsers.add_parser("scoped-sessions", help="List past scoped-review sessions (most recent first)")
+    scoped_sessions_parser.add_argument("--file", help="Only list sessions for this file path (default: all files)")
+    scoped_sessions_parser.add_argument("--limit", type=int, default=50, help="Max sessions to return (default: 50)")
+
+    scoped_resume_parser = subparsers.add_parser("scoped-resume", help="Rebuild a session's full state (rounds, latest debate round, latest consolidation) for redisplay")
+    scoped_resume_parser.add_argument("--session", required=True, help="Session ID to resume")
+
     # Debate command (cross-seat exchange over a scoped review session's clustered findings)
     debate_parser = subparsers.add_parser("debate", help="Run one debate round over a scoped review session's findings")
     debate_parser.add_argument("--session", required=True, help="Session ID from scoped-review")
-    debate_parser.add_argument("--mode", choices=["all_to_all", "arbiter"], help="Debate mode (default: auto from seat count - 3 seats = all_to_all, 4+ = arbiter)")
-    debate_parser.add_argument("--arbiter", help="Seat that rules on disputes instead of debating (required for --mode arbiter or when auto-selecting arbiter mode with 4+ seats)")
+    debate_parser.add_argument("--mode", choices=["all_to_all", "arbiter"], help="Debate mode (default: auto - arbiter if scoped-review nominated one, else all_to_all). The arbiter seat itself is NOT set here - it was fixed by --arbiter on scoped-review, before any review ran, so an already-reviewing seat can never become arbiter after the fact.")
+    debate_parser.add_argument("--consolidator", choices=['claude', 'claude-cli', 'gpt-4', 'gpt-cli', 'gemini', 'grok', 'grok-cli', 'ollama'], help="AI to write the consolidated review that automatically runs right after this debate round (default: auto/best available)")
     debate_parser.add_argument("--power", "-p", action="store_true", help="Use premium models (higher cost, better results)")
     debate_parser.add_argument("--gemini", "-g", action="store_true", help="Include Gemini in review")
     debate_parser.add_argument("--no-gpt", action="store_true", help="Disable GPT-4 reviewer")
@@ -3403,12 +3980,13 @@ def main():
         print(f"Pending reviews: {len(pending)}")
 
     elif args.command == "review":
-        # Get actual model names being used
-        mode = "power" if power_mode else "standard"
-        model_names = MODEL_CONFIGS[mode]
+        # Get actual model names being used - each reviewer's own .model already reflects
+        # whatever resolve_api_model()/resolve_cli_model() actually resolved it to (settings
+        # override or fallback default), so there is nothing left to re-derive from
+        # MODEL_CONFIGS here; a reviewer with no real model to report just shows its seat key.
         active_models = []
         for k, reviewer in council.reviewers.items():
-            display = getattr(reviewer, "model", None) or model_names.get(k, k)
+            display = getattr(reviewer, "model", None) or k
             active_models.append((k, display))
 
         print(f"\n{'='*60}")
@@ -3509,47 +4087,101 @@ def main():
         if (create_issues or create_all_issues) and reviews_data:
             target_repo = getattr(args, 'repo', None)
 
-            # Collect issues from all reviews
-            all_issues = []
-            for model, review in reviews_data.items():
-                if isinstance(review, dict) and "error" not in review:
-                    for issue in review.get("issues", []):
-                        issue_copy = issue.copy()
-                        issue_copy["model"] = model
-                        all_issues.append(issue_copy)
-
             if create_all_issues:
-                # Create issues for all findings
-                issues_to_create = all_issues
-            else:
-                # Find consensus issues (mentioned by multiple models)
-                issue_map = {}
-                for issue in all_issues:
-                    key = issue.get("description", "")[:50].lower()
-                    if key not in issue_map:
-                        issue_map[key] = {"issue": issue, "models": []}
-                    issue_map[key]["models"].append(issue.get("model", "unknown"))
-
-                # Only include issues found by multiple models
+                # Create issues for all findings - no consensus grouping needed
                 issues_to_create = []
-                for key, data in issue_map.items():
-                    if len(data["models"]) > 1:
-                        issue = data["issue"].copy()
-                        issue["models"] = data["models"]
-                        issues_to_create.append(issue)
+                for model, review in reviews_data.items():
+                    if isinstance(review, dict) and "error" not in review:
+                        for issue in review.get("issues", []):
+                            issue_copy = issue.copy()
+                            issue_copy["model"] = model
+                            issues_to_create.append(issue_copy)
+            else:
+                # Consensus-only mode needs the nominated doer seat's grouping - reuse the
+                # --synthesize run above if one already happened, otherwise run one now. No
+                # silent fallback to a local heuristic: a failed synthesis means --issues fails
+                # clearly rather than filing issues from a broken/absent consensus.
+                issues_synthesis = synthesis_result
+                if issues_synthesis is None:
+                    if len(successful_reviews) < 2:
+                        issues_synthesis = {"error": "Need 2+ successful reviews to determine consensus"}
+                    else:
+                        code_content = Path(args.file).read_text(encoding="utf-8", errors="ignore")
+                        preferred_synth = getattr(args, 'synthesizer', None)
+                        issues_synthesis = asyncio.run(council.synthesize_reviews(args.file, code_content, successful_reviews, preferred_synth))
+
+                if "error" in issues_synthesis:
+                    print(f"\n[!] Cannot create consensus GitHub issues: {issues_synthesis['error']}", file=sys.stderr)
+                    issues_to_create = None
+                else:
+                    # create_github_issues reads issue["models"] (see create_github_issues
+                    # above); the synthesizer's own JSON contract calls that field
+                    # models_agreed - normalize the key rather than have two names for the
+                    # same thing across the codebase.
+                    issues_to_create = []
+                    for issue in issues_synthesis.get("consensus_issues", []):
+                        issue_copy = issue.copy()
+                        issue_copy["models"] = issue_copy.pop("models_agreed", [])
+                        issues_to_create.append(issue_copy)
 
             if issues_to_create:
                 create_github_issues(args.file, issues_to_create, target_repo)
-            else:
+            elif issues_to_create is not None:
                 print("\n[*] No consensus issues found to create GitHub issues for.")
                 if not create_all_issues:
                     print("    Use --issues-all to create issues for all findings.")
+
+    # scoped-sessions/scoped-resume are kept here as standalone CLI commands (someone may run
+    # this script directly from a terminal), but sidePanel.ts does NOT call this file for
+    # either - it calls session_query.py, a duplicate implementation with no SDK-import cost.
+    # Keep both in sync if this logic changes.
+    elif args.command == "scoped-sessions":
+        sessions = council.db.list_scoped_sessions(getattr(args, 'file', None), args.limit)
+        print(json.dumps({"sessions": sessions}))
+
+    elif args.command == "scoped-resume":
+        scoped_rounds = council.db.get_scoped_session(args.session)
+        if not scoped_rounds:
+            print(json.dumps({"error": f"No session found with ID {args.session}"}))
+            sys.exit(1)
+
+        file_path = scoped_rounds[0]["file_path"]
+        first_round = next((r for r in scoped_rounds if r["role"] == "user" and r["round_num"] == 0), None)
+        nominated_arbiter = (first_round["content"].get("nominated_arbiter") if first_round else None)
+        latest_council_round = max(
+            (r for r in scoped_rounds if r["role"] == "council"), key=lambda r: r["round_num"], default=None
+        )
+        debate_round = council.db.get_latest_debate_round(args.session)
+        consolidation_result = None
+        if debate_round:
+            consolidation_result = council.db.get_latest_consolidation(args.session, debate_round["debate_round_num"])
+
+        report_path = None
+        if latest_council_round:
+            report_path = scoped_session_report_path(council.config["db_path"], file_path, args.session)
+            if not Path(report_path).exists():
+                report_path = None
+
+        print(json.dumps({
+            "session_id": args.session,
+            "file_path": file_path,
+            "scope": first_round["content"].get("scope", "") if first_round else "",
+            "arbiter": nominated_arbiter,
+            "rounds": scoped_rounds,
+            "latest_reviews": latest_council_round["content"]["reviews"] if latest_council_round else None,
+            "latest_consensus": latest_council_round["content"]["consensus"] if latest_council_round else None,
+            "debate_round": debate_round,
+            "consolidation": consolidation_result,
+            "report_path": report_path,
+        }))
 
     elif args.command == "scoped-review":
         # Progress always prints live to stdout, exactly like `review` - JSON (when requested)
         # goes to a separate file so the VS Code extension can stream progress AND get
         # structured output, instead of one or the other.
-        result = asyncio.run(council.review_file_scoped(args.file, args.scope, show_progress=True))
+        result = asyncio.run(council.review_file_scoped(args.file, args.scope, show_progress=True,
+                                                          preferred_synthesizer=getattr(args, 'synthesizer', None),
+                                                          nominated_arbiter=getattr(args, 'arbiter', None)))
         result.pop("_tracker", None)
 
         if "error" in result:
@@ -3561,7 +4193,9 @@ def main():
             print_scoped_round_results(result)
 
             if getattr(args, 'html', False):
-                report_path = generate_html_report(args.file, result["reviews"], getattr(args, 'output', None), power_mode)
+                output_path = getattr(args, 'output', None) or scoped_session_report_path(
+                    council.config["db_path"], args.file, result["session_id"])
+                report_path = generate_html_report(args.file, result["reviews"], output_path, power_mode, result["consensus"])
                 result["report_path"] = report_path
                 print(f"\n[+] HTML report generated: {report_path}")
 
@@ -3574,7 +4208,8 @@ def main():
             sys.exit(1)
 
     elif args.command == "scoped-followup":
-        result = asyncio.run(council.review_file_scoped_followup(args.session, args.question, show_progress=True))
+        result = asyncio.run(council.review_file_scoped_followup(args.session, args.question, show_progress=True,
+                                                                   preferred_synthesizer=getattr(args, 'synthesizer', None)))
         result.pop("_tracker", None)
 
         if "error" in result:
@@ -3589,7 +4224,9 @@ def main():
                 # The followup round's file_path isn't on args - read it back from the session.
                 session_rows = council.db.get_scoped_session(args.session)
                 file_path = session_rows[0]["file_path"] if session_rows else args.session
-                report_path = generate_html_report(file_path, result["reviews"], getattr(args, 'output', None), power_mode)
+                output_path = getattr(args, 'output', None) or scoped_session_report_path(
+                    council.config["db_path"], file_path, args.session)
+                report_path = generate_html_report(file_path, result["reviews"], output_path, power_mode, result["consensus"])
                 result["report_path"] = report_path
                 print(f"\n[+] HTML report generated: {report_path}")
 
@@ -3615,10 +4252,40 @@ def main():
             sys.exit(1)
 
     elif args.command == "debate":
-        result = asyncio.run(council.run_debate_round(args.session, mode=args.mode, arbiter_name=args.arbiter))
+        result = asyncio.run(council.run_debate_round(args.session, mode=args.mode))
+
+        # Debate on its own only produces positions/consensus %, not a settled answer - the
+        # user asked for one continuous action: clicking/running Debate should also produce the
+        # actual consolidated result, not require a second separate command to get anything
+        # usable. Always auto-consolidates after a successful round (every re-convene re-runs
+        # this too, so the session's "current best answer" keeps improving as debate continues
+        # rather than needing a second manual step each time).
+        consolidation_result = None
+        if "error" not in result:
+            consolidation_result = asyncio.run(council.consolidate_debate(args.session, getattr(args, 'consolidator', None)))
+
+        # One evolving report per session (see scoped_session_report_path) always overwritten
+        # with the LATEST round's reviews + this debate round + the just-run consolidation -
+        # "open the report" always shows current state, not whichever round happened to write a
+        # file most recently. Runs regardless of --json (the sidebar always uses --json and
+        # still needs the report kept current + its path to offer "Open Full Report").
+        report_path = None
+        if "error" not in result:
+            scoped_rounds = council.db.get_scoped_session(args.session)
+            if scoped_rounds:
+                file_path = scoped_rounds[0]["file_path"]
+                latest_council_round = max(
+                    (r for r in scoped_rounds if r["role"] == "council"), key=lambda r: r["round_num"], default=None
+                )
+                if latest_council_round:
+                    output_path = scoped_session_report_path(council.config["db_path"], file_path, args.session)
+                    report_path = generate_html_report(
+                        file_path, latest_council_round["content"]["reviews"], output_path, power_mode,
+                        latest_council_round["content"]["consensus"], result, consolidation_result,
+                    )
 
         if args.json:
-            print(json.dumps(result))
+            print(json.dumps({**result, "consolidation": consolidation_result, "report_path": report_path}))
         elif "error" in result:
             print(f"[!] {result['error']}", file=sys.stderr)
         else:
@@ -3645,14 +4312,46 @@ def main():
             print(f"  Consensus: {result['consensus_pct']}%")
             print(f"{'='*60}")
 
+            if consolidation_result and "error" not in consolidation_result:
+                cached_note = " [cached]" if consolidation_result.get("cached") else ""
+                print(f"\n  Consolidated Review (by {consolidation_result['consolidated_by'].upper()}){cached_note}")
+                print(f"\n{consolidation_result['summary']}\n")
+                for f in consolidation_result["findings"]:
+                    print(f"  [{f.get('severity', '?')}] {f.get('description', '')}")
+            elif consolidation_result:
+                print(f"\n[!] Consolidation failed: {consolidation_result.get('error', 'unknown error')}", file=sys.stderr)
+
+            if report_path:
+                print(f"\n[+] HTML report updated: {report_path}")
+
         if "error" in result:
             sys.exit(1)
 
     elif args.command == "consolidate":
         result = asyncio.run(council.consolidate_debate(args.session, args.consolidator, force=args.force))
 
+        # Re-running consolidate directly (e.g. --force to re-roll) still changes the session's
+        # current state, so the one evolving report needs the same refresh the
+        # auto-consolidate-after-debate path already does - runs regardless of --json, same
+        # reasoning as the debate handler.
+        report_path = None
+        if "error" not in result:
+            scoped_rounds = council.db.get_scoped_session(args.session)
+            debate_round = council.db.get_latest_debate_round(args.session)
+            if scoped_rounds and debate_round:
+                file_path = scoped_rounds[0]["file_path"]
+                latest_council_round = max(
+                    (r for r in scoped_rounds if r["role"] == "council"), key=lambda r: r["round_num"], default=None
+                )
+                if latest_council_round:
+                    output_path = scoped_session_report_path(council.config["db_path"], file_path, args.session)
+                    report_path = generate_html_report(
+                        file_path, latest_council_round["content"]["reviews"], output_path, power_mode,
+                        latest_council_round["content"]["consensus"], debate_round, result,
+                    )
+
         if args.json:
-            print(json.dumps(result))
+            print(json.dumps({**result, "report_path": report_path}))
         elif "error" in result:
             print(f"[!] {result['error']}", file=sys.stderr)
         else:
@@ -3670,6 +4369,9 @@ def main():
                 for q in result["open_questions"]:
                     print(f"\n  - {q.get('question', '')}")
                     print(f"    Why unresolved: {q.get('why_unresolved', '')}")
+
+            if report_path:
+                print(f"\n[+] HTML report updated: {report_path}")
 
         if "error" in result:
             sys.exit(1)
