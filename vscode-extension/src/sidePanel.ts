@@ -2015,8 +2015,10 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             return { loggedIn: false, error: (combined || `exit ${code}`).substring(0, 200) };
         }
 
-        // xai (grok): "grok models" itself states login status on its first line and lists the
-        // account's actual default model - the same real signal used elsewhere, not guessed.
+        // xai (grok): a real "(default)" model entry + exit 0 is the actual proof of being
+        // logged in - the first line's wording isn't stable ("You are using XAI_API_KEY."
+        // instead of "You are logged in..." when that env var is set, e.g. Grok API also
+        // enabled), so match on the model list, not a specific sentence.
         const { code, stdout, stderr } = await this._grokModels();
         if (timedOut(code, stderr)) {
             // Cold-start leader missed the window - that is not a logout. Leave the seat on.
@@ -2025,12 +2027,13 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         if (code !== 0 || !stdout.trim()) {
             return { loggedIn: false, error: (stderr || 'grok models returned no output').substring(0, 200) };
         }
-        const loggedIn = /you are logged in/i.test(stdout);
-        if (!loggedIn) {
+        const defaultMatch = stdout.match(/^\s*[*-]\s*([\w.-]+)\s*\(default\)/m);
+        if (!defaultMatch) {
+            // No real model list came back despite exit 0 - genuinely not logged in/configured,
+            // whatever the first line happened to say.
             return { loggedIn: false, error: stdout.trim().split('\n')[0] || 'Not logged in' };
         }
-        const defaultMatch = stdout.match(/^\s*[*-]\s*([\w.-]+)\s*\(default\)/m);
-        return { loggedIn: true, model: defaultMatch ? defaultMatch[1] : undefined };
+        return { loggedIn: true, model: defaultMatch[1] };
     }
 
     // silent=true skips the interruptive popup (used for restoreToggles' bulk re-validation of
