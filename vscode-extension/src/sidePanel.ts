@@ -1987,7 +1987,9 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             code === -1 && /timed out/i.test(stderr || '');
 
         if (key === 'anthropic') {
-            const { code, stdout, stderr } = await run(['auth', 'status', '--json']);
+            // No --json: an older Claude CLI rejects it ("unknown option"). JSON is the default
+            // output anyway, confirmed against a current install, so dropping it is more compatible.
+            const { code, stdout, stderr } = await run(['auth', 'status']);
             if (timedOut(code, stderr)) {
                 return { loggedIn: true, detail: 'status check timed out - leaving seat enabled' };
             }

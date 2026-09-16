@@ -479,13 +479,8 @@ class CliReviewer:
                 return await self._run(argv, work_dir, plain_text=plain_text)
 
             if self.provider == "xai":
-                # Live probe (tiny.py): grok --output-format json returns
-                #   {"text": "<stringified review JSON>", "thought": "...", "usage": {...}}
-                # `--prompt-file` is single-turn. A 40k-char architecture doc made that one
-                # turn a status sentence, so extract_json_object on the envelope found no
-                # `issues` and the seat died as "unparseable". Do not pass --tools / --json-schema
-                # (wander / stub-in-schema). --no-plan only. Unwrap is Grok-specific in
-                # _parse_grok_envelope; body is capped in review() so one turn can finish.
+                # --output-format json returns {"text": "<stringified review JSON>", ...}.
+                # --verbatim: without it, the model can stall on large prompts suspecting truncation.
                 argv = [
                     self.binary,
                     "--prompt-file", str(prompt_path),
@@ -493,6 +488,7 @@ class CliReviewer:
                     "--permission-mode", "dontAsk",
                     "--no-plan",
                     "--disable-web-search",
+                    "--verbatim",
                     "--cwd", str(work_dir),
                 ]
                 if self.cli_model:
@@ -590,96 +586,13 @@ class CliReviewer:
         parsed["_usage"] = {"input_tokens": usage["input_tokens"], "output_tokens": usage["output_tokens"]}
         return parsed
 
-    # Same excerpt and same chunking for every CLI seat. 40k is the council picture;
-    # 16k is one review call so a long file is covered in parts and merged, not
-    # truncated for one seat and full for another.
-    CLI_REVIEW_MAX_CHARS = 40000
-    CLI_CHUNK_CHARS = 16000
-
-    # A boundary-seeking split is allowed to overrun `limit` a bit while it waits for a real
-    # class/def/# line (keeps a chunk from cutting a function in half) - but that wait cannot be
-    # unbounded. This is the actual hard ceiling: once a chunk has grown past HARD_CAP_MULTIPLIER
-    # times the limit with still no boundary in sight, it force-splits at the current line
-    # regardless. A file with NO class/def/# markers anywhere (a config file, a long generated
-    # data file, a single giant expression) previously never split at all past this point -
-    # size + line_size > limit alone was gated on `boundary`, so no boundary ever meant no split,
-    # for any total file length. Reproduced: a file made entirely of non-boundary lines whose
-    # total length exceeded `limit` returned exactly one over-limit chunk.
-    _CHUNK_HARD_CAP_MULTIPLIER = 2
-
-    def _chunk_body(self, code: str, limit: int) -> list:
-        # Returns [(chunk_text, start_line_1based), ...] - callers need each chunk's starting
-        # line to translate a model's own "line N" (always relative to the chunk it was shown,
-        # never the whole file) back to an absolute file line.
-        #
-        # Two distinct over-limit cases, both now hard-capped (previously neither was):
-        #  1. A single line longer than `limit` (a 40k-character minified/generated line, or one
-        #     huge string literal) never matches a boundary marker - force-split mid-line by
-        #     character count (reproduced: a single 40,001-character line stayed one
-        #     40,001-character chunk against a 16,000-character limit).
-        #  2. Many lines, none of them a boundary, whose ACCUMULATED size keeps growing with no
-        #     boundary ever arriving to trigger a split - force-split at the hard cap
-        #     (_CHUNK_HARD_CAP_MULTIPLIER * limit) regardless of boundary status, rather than
-        #     waiting forever for a class/def/# line that may never come.
-        hard_cap = limit * self._CHUNK_HARD_CAP_MULTIPLIER
-        if len(code) <= limit:
-            return [(code, 1)]
-        chunks, current, size = [], [], 0
-        current_start_line = 1
-        line_num = 1
-        for line in code.split("\n"):
-            line_size = len(line) + 1
-            boundary = line.strip().startswith(("class ", "def ", "async def ", "# ", "## "))
-            # line_size > limit MUST be checked before the boundary branch, not after it as an
-            # elif - an oversized line that also happens to start with "def "/"class "/"# " (a
-            # very long single-line function signature, or a long comment) matched the boundary
-            # condition first, so it was accepted whole into `current` as a brand new chunk of
-            # just that one line - which then never got the oversized-single-line hard-split, and
-            # skipped this branch entirely as if it belonged in the OTHER `elif` chain below,
-            # bypassing both the plain limit and the accumulated-size hard cap. Reproduced (real
-            # sanity-review regression): "x\n" + "def " + "x"*40000 against limit=16000 produced
-            # one 40,004-character chunk - the exact "boundary line, but also oversized" case this
-            # reordering fixes. This branch now applies unconditionally to any line whose OWN
-            # size exceeds the limit, whether or not it looks like a boundary.
-            if line_size > limit:
-                # This single line alone is bigger than the whole limit - no boundary split can
-                # ever apply to it. Flush whatever was accumulated so far, then hard-split the
-                # oversized line itself into limit-sized character slices so no chunk this
-                # function returns can ever exceed `limit`, regardless of line structure.
-                if current:
-                    chunks.append(("\n".join(current), current_start_line))
-                    current, size = [], 0
-                for i in range(0, len(line), limit):
-                    piece = line[i:i + limit]
-                    chunks.append((piece, line_num))
-                current_start_line = line_num + 1
-            elif size + line_size > limit and boundary and current:
-                chunks.append(("\n".join(current), current_start_line))
-                current, size = [line], line_size
-                current_start_line = line_num
-            elif size + line_size > hard_cap:
-                # No boundary line has shown up for a long time - stop waiting and split here,
-                # even mid-function, rather than letting the chunk grow without bound.
-                chunks.append(("\n".join(current), current_start_line))
-                current, size = [line], line_size
-                current_start_line = line_num
-            else:
-                if not current:
-                    current_start_line = line_num
-                current.append(line)
-                size += line_size
-            line_num += 1
-        if current:
-            chunks.append(("\n".join(current), current_start_line))
-        return chunks or [(code, 1)]
-
-    async def _review_one_body(self, body: str, file_name: str, scope: str = None, chunk_note: str = "") -> dict:
+    async def _review_one_body(self, body: str, file_name: str, scope: str = None) -> dict:
         if self.provider == "xai":
-            prompt = self._review_prompt(file_name + chunk_note, body, scope)
+            prompt = self._review_prompt(file_name, body, scope)
         else:
             prompt = (
                 f"{build_review_prompt(scope)}\n\n"
-                f"File: {file_name}{chunk_note}\n\n"
+                f"File: {file_name}\n\n"
                 f"```\n{body}\n```\n\n"
                 "IMPORTANT: Respond with ONLY valid JSON matching the schema above. "
                 "No markdown fences, no preamble."
@@ -687,71 +600,15 @@ class CliReviewer:
         raw, usage = await self._call_api(prompt)
         result = self._parse_cli_review(raw, usage)
         if result.get("error") and self.provider == "xai":
-            raw2, usage2 = await self._call_api(self._review_prompt(file_name + chunk_note, body, scope, strict=True))
+            raw2, usage2 = await self._call_api(self._review_prompt(file_name, body, scope, strict=True))
             retry = self._parse_cli_review(raw2, usage2)
             if not retry.get("error"):
                 return retry
         return result
 
     async def review(self, code: str, file_path: str, scope: str = None) -> dict:
-        body = code if len(code) <= self.CLI_REVIEW_MAX_CHARS else code[:self.CLI_REVIEW_MAX_CHARS] + "\n...(truncated for CLI review)..."
         file_name = Path(file_path).name
         try:
-            parts = self._chunk_body(body, self.CLI_CHUNK_CHARS)
-            if len(parts) == 1:
-                return await self._review_one_body(parts[0][0], file_name, scope)
-            issues, summaries, scores = [], [], []
-            in_tok = out_tok = 0
-            # Every failed part used to be silently dropped as long as ONE part succeeded, while
-            # the summary still said "Reviewed in N parts" - indistinguishable from a genuinely
-            # complete review even though real findings in the failed part(s) were missing
-            # entirely with no indication anything was wrong. failed_parts tracks which 1-based
-            # part indexes failed and why, surfaced in both the summary text and a dedicated
-            # field, so a partial result is explicit rather than presented as complete.
-            failed_parts = []
-            for i, (part_text, start_line) in enumerate(parts):
-                note = f" (part {i + 1}/{len(parts)} of the same file, starting at line {start_line}; report each issue's \"line\" relative to THIS excerpt, i.e. line 1 = line {start_line} of the real file - review this part fully)"
-                result = await self._review_one_body(part_text, file_name, scope, note)
-                usage = result.get("_usage") or {}
-                in_tok += usage.get("input_tokens") or 0
-                out_tok += usage.get("output_tokens") or 0
-                if result.get("error"):
-                    failed_parts.append({"part": i + 1, "error": result["error"]})
-                    continue
-                # The model is asked to report lines relative to the excerpt it was shown (a
-                # chunk boundary is not something it can see past), so translate back to an
-                # absolute file line here: chunk-relative line L becomes (start_line - 1) + L.
-                offset = start_line - 1
-                for issue in (result.get("issues") or []):
-                    issue = dict(issue)
-                    raw_line = issue.get("line")
-                    if isinstance(raw_line, (int, float)):
-                        issue["line"] = int(raw_line) + offset
-                    issues.append(issue)
-                if result.get("summary"):
-                    summaries.append(result["summary"])
-                scores.append(float(result.get("quality_score") or 0))
-            if not scores:
-                return {
-                    "error": failed_parts[0]["error"] if failed_parts else f"CLI returned unparseable review ({self.model})",
-                    "issues": [],
-                    "quality_score": 0,
-                    "_transport": "cli",
-                }
-            succeeded = len(parts) - len(failed_parts)
-            partial_note = (
-                f" [INCOMPLETE - {len(failed_parts)}/{len(parts)} part(s) failed, findings from those parts are MISSING]"
-                if failed_parts else ""
-            )
-            return {
-                "issues": issues,
-                "summary": f"Reviewed in {succeeded}/{len(parts)} part(s).{partial_note} " + " ".join(summaries[:3]),
-                "quality_score": round(sum(scores) / len(scores), 1),
-                "_transport": "cli",
-                "_cli_model": self.cli_model,
-                "_usage": {"input_tokens": in_tok, "output_tokens": out_tok},
-                "_partial": bool(failed_parts),
-                "_failed_parts": failed_parts,
-            }
+            return await self._review_one_body(code, file_name, scope)
         except Exception as e:
             return {"error": str(e), "issues": [], "quality_score": 0, "_transport": "cli"}

@@ -997,8 +997,6 @@ class GPTReviewer:
 class GrokReviewer:
     """xAI Grok reviewer"""
 
-    # Same chunk size as CliReviewer.CLI_CHUNK_CHARS so API Grok and CLI seats
-    # slice a long file the same way.
     MAX_CHUNK_SIZE = 16000
 
     def __init__(self, api_key: str, model: str = "grok-3-mini"):
@@ -2124,12 +2122,13 @@ no preamble, no meta-commentary about this task, no markdown code fences around 
 
         synthesis = await self.synthesize_reviews(file_path, code_content, successful, preferred_synthesizer)
         if "error" in synthesis:
+            detail = f" - model returned: {synthesis['raw']}" if synthesis.get("raw") else ""
             return {
                 "consensus_issues": [],
                 "unique_insights": all_raised_issues,
                 "average_score": sum(scores) / len(scores) if scores else 0,
                 "model_count": len(reviews),
-                "synthesis_error": synthesis["error"],
+                "synthesis_error": f"{synthesis['error']}{detail}",
             }
 
         consensus_issues = synthesis.get("consensus_issues", [])
