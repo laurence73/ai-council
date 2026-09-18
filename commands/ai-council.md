@@ -1,36 +1,30 @@
 # AI Council Review
 
-Run multi-model code review with GPT-4, Grok, Claude, Gemini, and Ollama.
-
-**Independent seats:** each provider's API key and CLI subscription login (`claude` / `codex` / `grok`) are separate seats, not an either/or choice — both can run in the same review. Reviews still run in parallel, then consensus / Council Verdict / fix — identical JSON shape regardless of which seat produced it.
+Run multi-model code review using GPT-4, Grok, Gemini, Ollama, and Claude (via your subscription).
 
 **Arguments:** `<file_path> [flags]`
 
 **Flags:**
-- `--force` / `-f` — re-review (bypass cache)
-- `--gemini` / `-g` — include Gemini
-- `--ollama` — include Ollama
-- `--ollama-url <url>` / `--ollama-model <model>`
-- `--power` / `-p` — premium API model names (affects API seats only; CLI seats always use whatever model that CLI login already resolves to)
-- `--html` / `-o <path>` — HTML report
-- `--synthesize` / `-s` — Council Verdict
-- `--synthesizer <model>` — claude | gpt-4 | gemini | grok | ollama
-- `--gpt-cli` / `--claude-cli` / `--grok-cli` — enable that provider's CLI seat (global flags, must precede `review`)
-- `--no-gpt` / `--no-claude` / `--no-grok` — disable that provider's API seat (all three API seats are on by default)
+- `--force` or `-f` - Force re-review (bypass cache)
+- `--gemini` or `-g` - Include Gemini in the review
+- `--ollama` - Include Ollama (self-hosted model)
+- `--ollama-url <url>` - Ollama server URL (default: wowai-api)
+- `--ollama-model <model>` - Ollama model name (default: qwen3.6:35b-mlx)
+- `--power` or `-p` - Use premium models (higher cost, better results)
+- `--html` - Generate a beautiful HTML report (DEFAULT: always on)
+- `--no-html` - Skip HTML report generation
+- `--synthesize` or `-s` - Generate AI Council Verdict (consensus synthesis)
+- `--synthesizer <model>` - Model for synthesis (claude, claude-cli, gpt-4, gpt-cli, gemini, grok, grok-cli, ollama)
+- `--output <path>` or `-o <path>` - Custom output path (default: `C:\AI COUNCIL\reports`)
+- `--no-claude-direct` - Skip Claude Code direct review (use API key instead)
+- `--scoped "<focus>"` - Run a scoped review with custom focus
 
-**Examples (PowerShell):**
-```powershell
-cd C:\z\ai-council\vscode-extension
-
-# Claude via subscription CLI only; GPT/Grok API seats stay on if keys are set
-python ai_council.py --claude-cli review "C:\path\to\File.cs" --synthesize --html
-
-# Claude API + Claude CLI as two separate seats, skip GPT
-python ai_council.py --claude-cli review ".\file.cs" --no-gpt --force
-
-# API-only (needs keys), all three providers
-python ai_council.py review ".\file.cs"
-```
+**Examples:**
+- `/ai-council src/MyComponent.razor --html`
+- `/ai-council src/MyComponent.razor --gemini --ollama` - All 5 models
+- `/ai-council src/MyComponent.razor --power` - Premium models
+- `/ai-council src/MyComponent.razor --scoped "security vulnerabilities"` - Focused review
+- `/ai-council` - Reviews last edited file in session
 
 ---
 
@@ -38,47 +32,148 @@ python ai_council.py review ".\file.cs"
 
 When the user runs this skill:
 
-1. **Pick the file** (argument, or last edited in session, or ask).
+1. **Determine the file to review:**
+   - If a file path is provided as argument, use that
+   - If no argument, look at the most recently edited file in this session
+   - If still unclear, ask the user which file to review
 
-2. **Prefer one council run** through `ai_council.py` so every seat shares the same pipeline (parallel review → aggregate → optional synthesize → optional fix).
+2. **Read the file content** so you can do the Claude review directly.
 
-3. **Choose seats** (do not invent a second Claude-only path outside the script unless the user asks):
-   - GPT/Claude/Grok API seats are on by default if a key is configured; disable with `--no-gpt` / `--no-claude` / `--no-grok`.
-   - Add a CLI seat for a provider with `--gpt-cli` / `--claude-cli` / `--grok-cli` when that CLI is installed and logged in - this is additive, not a replacement for the API seat.
-   - Gemini / Ollama stay API / self-hosted (no subscription CLI).
+3. **Run the Python script WITHOUT Claude** (other models use API keys):
 
-4. **Run (Windows):**
-   ```powershell
-   python "C:\z\ai-council\vscode-extension\ai_council.py" [GLOBAL_FLAGS] review "<FILE_PATH>" [REVIEW_FLAGS]
+   **Script location:** `C:/AI COUNCIL/vscode-extension/ai_council.py`
+
+   ```bash
+   python "C:/AI COUNCIL/vscode-extension/ai_council.py" [GLOBAL_FLAGS] review "<FILE_PATH>" --no-claude [OTHER_FLAGS]
    ```
-   Global flags **before** `review`: `--ollama`, `--ollama-url`, `--ollama-model`, `--gpt-cli`, `--claude-cli`, `--grok-cli`, `--db`.
 
-5. **Present results** from the script (scores, issues, consensus, verdict). Same format whether a seat used CLI or API.
+   **IMPORTANT:** Global flags (--ollama, --ollama-url, --ollama-model, --claude-cli, --gpt-cli, --grok-cli) must come BEFORE the "review" subcommand!
 
-6. **Offer to fix** from consensus / verdict priorities (`fix` subcommand or extension "Fix with AI").
+   Build the command:
+   - Global flags (before "review"):
+     - If ollama: add `--ollama`
+     - If ollama-url: add `--ollama-url "<URL>"`
+     - If ollama-model: add `--ollama-model "<MODEL>"`
+   - Then add: `review "<FILE_PATH>" --no-claude --html --output "C:/AI COUNCIL/reports"` (HTML always goes to standard reports folder)
+   - Review flags (after file path):
+     - If force: add `--force`
+     - If gemini: add `--gemini`
+     - If power: add `--power`
+     - If --no-html flag specified: remove `--html` from command
+     - If synthesize: add `--synthesize`
+     - If synthesizer: add `--synthesizer <MODEL>`
+     - If output path: add `--output "<PATH>"`
+
+   **For scoped reviews** (focused on specific concerns):
+   ```bash
+   python "C:/AI COUNCIL/vscode-extension/ai_council.py" [GLOBAL_FLAGS] scoped-review "<FILE_PATH>" --scope "<FOCUS>" --no-claude --html --output "C:/AI COUNCIL/reports" [OTHER_FLAGS]
+   ```
+
+4. **Perform Claude review directly** (uses your Claude subscription - FREE):
+
+   Review the file you read in step 2 using this prompt:
+
+   ```
+   Review this code file and provide a JSON response with:
+   - quality_score: 1-10
+   - summary: Brief overview of the code quality
+   - issues: Array of issues found, each with:
+     - severity: "critical", "high", "medium", "low", or "info"
+     - line: Line number (or null if general)
+     - description: What the issue is
+     - recommendation: How to fix it
+
+   Focus on: security vulnerabilities, bugs, performance issues, code quality, best practices.
+   ```
+
+5. **Present combined results:**
+
+```
+## AI Council Review: <filename>
+
+| Model | Score | Issues |
+|-------|-------|--------|
+| GPT-4 | X/10 | N issues |
+| Grok  | X/10 | N issues |
+| Gemini | X/10 | N issues |  (if --gemini)
+| Ollama | X/10 | N issues |  (if --ollama)
+| Claude | X/10 | N issues |  (via subscription)
+
+### Consensus Issues (High Confidence)
+Issues flagged by multiple models - prioritize fixing these!
+
+### Claude Review (Your Subscription)
+[Your direct review findings here]
+
+### GPT-4 Insights
+[From Python script output]
+
+### Grok Insights
+[From Python script output]
+
+### Gemini Insights (if enabled)
+[From Python script output]
+
+### Ollama Insights (if enabled)
+[From Python script output]
+
+---
+HTML Report: <path>
+```
+
+6. **Offer to fix issues:**
+   After showing results, ask: "Would you like me to address any of these issues?"
 
 ---
 
-## Cost notes
+## Advanced Commands
 
-| Seat | CLI (subscription login) | API key |
-|------|--------------------------|---------|
-| Claude | Uses Claude Code login — no Anthropic API credits | `ANTHROPIC_API_KEY` |
-| GPT | Uses `codex` login — no OpenAI API credits | `OPENAI_API_KEY` |
-| Grok | Uses `grok login` — no xAI API credits | `XAI_API_KEY` |
-| Gemini | n/a | Free-tier key |
-| Ollama | n/a | Self-hosted |
+The AI Council supports additional workflow commands:
 
-CLI usage still counts against the product subscription; it just avoids a second metered API bill.
+| Command | Description |
+|---------|-------------|
+| `scoped-review` | Start a focused review session with custom scope |
+| `scoped-followup` | Ask follow-up questions in an existing session |
+| `debate` | Run a debate round over session findings |
+| `consolidate` | Generate final pruned review from debate |
+| `scoped-finalize` | Have an AI write up session as review document |
+| `scoped-sessions` | List past scoped review sessions |
+| `scoped-resume` | Resume/display a previous session |
+
+---
+
+## Cost Breakdown
+
+| Model | Cost | Source |
+|-------|------|--------|
+| Claude | **FREE** | Your Claude subscription (direct) |
+| GPT-4 | ~$0.03 | API key |
+| Grok | ~$0.02 | API key |
+| Gemini | FREE | API key (free tier) |
+| Ollama | FREE | Self-hosted |
+
+**Total with all 5 models: ~$0.05** (vs ~$0.08 if Claude used API)
 
 ---
 
 ## Notes
 
-- CLI seats need the binary on PATH (`claude`, `codex`, `grok`) and a prior login. A CLI seat always uses that login's own default model - there is no model override from this skill or the extension.
-- Reviews are cached by file hash, power mode, resolved model ID, and rubric hash; `--force` refreshes.
-- Independent-seat logic lives in `vscode-extension/cli_transport.py`.
+- **Claude is FREE** when using this skill - it uses your Claude Code subscription directly
+- Other models still require API keys (GPT-4, Grok) or are free (Gemini, Ollama)
+- Use `--no-claude-direct` flag if you want to use Claude API key instead
+- Reviews are cached by file hash - unchanged files return cached results instantly
+- Use `--force` to bypass cache and get fresh reviews
 
-## Self-hosted (Ollama)
+## Self-Hosted Models (Ollama)
 
-No default endpoint is bundled - pass `--ollama-url` and `--ollama-model` explicitly (or configure `ai-council.ollamaUrl` / `ai-council.ollamaModel` in VS Code settings).
+WoW AI is pre-configured as the default Ollama endpoint:
+- URL: `https://wowai-api.worldofworkflows.com:9443`
+- Model: `qwen3.6:35b-mlx`
+
+## Required Environment Variables
+
+For the non-Claude models (set in `.env` or system):
+- `OPENAI_API_KEY` - For GPT-4 reviews
+- `XAI_API_KEY` - For Grok reviews
+- `GOOGLE_API_KEY` - For Gemini reviews (optional, free)
+- Ollama auth configured in VS Code settings
