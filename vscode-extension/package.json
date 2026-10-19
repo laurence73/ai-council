@@ -184,11 +184,11 @@
           "scope": "machine",
           "description": "Ollama / OpenAI-compatible self-hosted server URL. Machine-scoped: a workspace's own .vscode/settings.json cannot redirect this to an attacker-controlled endpoint - see design-decisions.md."
         },
-        "ai-council.ollamaModel": {
+        "ai-council.ollamaModels": {
           "type": "string",
           "default": "qwen3.6:35b-mlx",
           "scope": "machine",
-          "description": "Model name to request from your Ollama/self-hosted endpoint. Type any model your server actually has pulled/available - not validated against a fixed list, since that list would only ever reflect one specific setup's models, not yours. Machine-scoped: a workspace's own .vscode/settings.json cannot force your already-machine-scoped Ollama server to run a model you did not choose - see design-decisions.md."
+          "description": "Comma-separated list of model names for your Ollama/self-hosted endpoint. Each model appears as a separate toggleable seat in the UI. Example: 'llama3.1:70b,qwen2.5:32b,mistral:7b'. Machine-scoped: a workspace's own .vscode/settings.json cannot force your already-machine-scoped Ollama server to run models you did not choose."
         },
         "ai-council.autoReviewOnSave": {
           "type": "boolean",

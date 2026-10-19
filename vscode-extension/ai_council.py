@@ -1513,12 +1513,12 @@ class ClaudeReviewer:
 class AICouncil:
     """Main orchestrator for multi-model reviews"""
 
-    def __init__(self, config: dict = None, enable_gemini: bool = False, enable_gpt: bool = True, enable_claude: bool = True, enable_grok: bool = True, enable_ollama: bool = False, enable_gpt_cli: bool = False, enable_claude_cli: bool = False, enable_grok_cli: bool = False, ollama_url: str = None, ollama_model: str = None, power_mode: bool = False, db_path: str = None):
+    def __init__(self, config: dict = None, enable_gemini: bool = False, enable_gpt: bool = True, enable_claude: bool = True, enable_grok: bool = True, enable_ollama: bool = False, enable_gpt_cli: bool = False, enable_claude_cli: bool = False, enable_grok_cli: bool = False, ollama_url: str = None, ollama_models: list = None, power_mode: bool = False, db_path: str = None):
         import copy
         self.config = config or copy.deepcopy(DEFAULT_CONFIG)
         self.power_mode = power_mode
         self.ollama_url = ollama_url
-        self.ollama_model = ollama_model
+        self.ollama_models = ollama_models or []  # List of model names
         self.enable_gpt_cli = enable_gpt_cli
         self.enable_claude_cli = enable_claude_cli
         self.enable_grok_cli = enable_grok_cli
@@ -1639,18 +1639,21 @@ class AICouncil:
         if self.enable_claude_cli:
             _add_cli("claude-cli", "anthropic", "Claude")
 
-        # Ollama
+        # Ollama - support multiple models, each as a separate seat
         if models.get("ollama", {}).get("enabled"):
             ollama_url = self.ollama_url or os.environ.get(
                 models.get("ollama", {}).get("url_env", "OLLAMA_URL"), ""
             )
-            model_name = self.ollama_model or "qwen3.6:35b-mlx"
             api_key = os.environ.get(models.get("ollama", {}).get("api_key_env", "OLLAMA_API_KEY"))
-            try:
-                self.reviewers["ollama"] = OllamaReviewer(ollama_url, model=model_name, api_key=api_key)
-                print(f"[+] Ollama reviewer enabled ({model_name} @ {ollama_url})", file=sys.stderr)
-            except Exception as e:
-                print(f"[-] Ollama disabled: {e}", file=sys.stderr)
+            # Use provided models list, or fall back to default
+            model_list = self.ollama_models if self.ollama_models else ["qwen3.6:35b-mlx"]
+            for model_name in model_list:
+                seat_key = f"ollama:{model_name}" if len(model_list) > 1 else "ollama"
+                try:
+                    self.reviewers[seat_key] = OllamaReviewer(ollama_url, model=model_name, api_key=api_key)
+                    print(f"[+] Ollama reviewer enabled ({model_name} @ {ollama_url})", file=sys.stderr)
+                except Exception as e:
+                    print(f"[-] Ollama ({model_name}) disabled: {e}", file=sys.stderr)
 
         if not self.reviewers:
             print("[!] No reviewers configured. Turn on API and/or CLI seats (claude / codex / grok).", file=sys.stderr)
@@ -3772,7 +3775,7 @@ def main():
     # Global model flags - work for all commands
     parser.add_argument("--ollama", action="store_true", help="Include Ollama (self-hosted) in review")
     parser.add_argument("--ollama-url", help="Ollama server URL")
-    parser.add_argument("--ollama-model", help="Ollama model to use")
+    parser.add_argument("--ollama-model", action="append", dest="ollama_models", help="Ollama model to use (can specify multiple)")
     
     parser.add_argument("--claude-cli", action="store_true",
                         help="Add Claude CLI seat (subscription) alongside any Claude API seat")
@@ -3921,7 +3924,7 @@ def main():
     power_mode = getattr(args, 'power', False)
     db_path = getattr(args, 'db', None)
     ollama_url = getattr(args, 'ollama_url', None)
-    ollama_model = getattr(args, 'ollama_model', None)
+    ollama_models = getattr(args, 'ollama_models', None) or []  # List of model names
 
     # Optional CLI model overrides via flags -> env consumed by CliReviewer
     if getattr(args, "claude_cli_model", None):
@@ -3956,7 +3959,7 @@ def main():
             enable_claude_cli=enable_claude_cli,
             enable_grok_cli=enable_grok_cli,
             ollama_url=ollama_url,
-            ollama_model=ollama_model,
+            ollama_models=ollama_models,  # Now a list
             power_mode=power_mode,
             db_path=db_path,
         )

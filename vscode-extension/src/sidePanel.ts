@@ -26,7 +26,8 @@ interface ReviewOptions {
     enableClaudeCli: boolean;
     enableGrokCli: boolean;
     enableGemini: boolean;
-    enableOllama: boolean;
+    enableOllama: boolean;  // Legacy: true if ANY Ollama model enabled
+    enabledOllamaModels: string[];  // List of enabled Ollama model names
     powerMode: boolean;
     synthesizer: string;
     arbiter: string;
@@ -48,6 +49,8 @@ function normalizeModelKey(rawName: string): string {
     if (modelName.includes('claude')) { return 'claude'; }
     if (modelName.includes('grok')) { return 'grok'; }
     if (modelName.includes('gemini')) { return 'gemini'; }
+    // Keep ollama:modelname format for multi-model support
+    if (modelName.startsWith('ollama:')) { return modelName; }
     return modelName;
 }
 
@@ -280,6 +283,7 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                         enableGrokCli: !!message.enableGrokCli,
                         enableGemini: message.enableGemini,
                         enableOllama: message.enableOllama,
+                        enabledOllamaModels: message.enabledOllamaModels || [],
                         powerMode: message.powerMode,
                         synthesizer: message.synthesizer || 'auto',
                         arbiter: 'none'
@@ -340,6 +344,8 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                     this._webviewReady = true;
                     this._sendApiKeyStatus();
                     this._sendCacheSize();
+                    // Send Ollama models list (must come before restoreToggles so toggles exist)
+                    this._sendOllamaModels();
                     // Send saved toggle states
                     const savedToggles = this._getToggleStates();
                     this._view?.webview.postMessage({ type: 'restoreToggles', toggles: savedToggles });
@@ -366,6 +372,7 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                         enableGrokCli: !!message.enableGrokCli,
                         enableGemini: message.enableGemini,
                         enableOllama: message.enableOllama,
+                        enabledOllamaModels: message.enabledOllamaModels || [],
                         powerMode: message.powerMode,
                         synthesizer: message.synthesizer || 'auto',
                         arbiter: 'none'
@@ -469,6 +476,7 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
 
     private _reviewOptionsFromToggles(): ReviewOptions {
         const toggles = this._getToggleStates();
+        const ollamaModels = Array.isArray(toggles.enabledOllamaModels) ? toggles.enabledOllamaModels : [];
         return {
             enableGpt: !!toggles.enableGpt,
             enableClaude: !!toggles.enableClaude,
@@ -477,7 +485,8 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             enableClaudeCli: !!toggles.enableClaudeCli,
             enableGrokCli: !!toggles.enableGrokCli,
             enableGemini: !!toggles.enableGemini,
-            enableOllama: !!toggles.enableOllama,
+            enableOllama: ollamaModels.length > 0,
+            enabledOllamaModels: ollamaModels,
             powerMode: !!toggles.powerMode,
             synthesizer: 'auto',
             arbiter: 'none'
@@ -1223,11 +1232,13 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
     // previous session (persisted via saveToggleStates/restoreToggles) never re-triggers it, so
     // every actual review launch needs its own check too, not just the toggle-click path.
     private async _guardOllamaConfigured(modelConfig?: Partial<ReviewOptions>): Promise<boolean> {
-        if (!modelConfig?.enableOllama) { return true; }
+        // Check if any Ollama models are enabled (new array-based check)
+        const enabledModels = modelConfig?.enabledOllamaModels || [];
+        if (enabledModels.length === 0 && !modelConfig?.enableOllama) { return true; }
         const ollamaUrl = vscode.workspace.getConfiguration('ai-council').get<string>('ollamaUrl') || '';
         if (ollamaUrl.trim()) { return true; }
         const result = await vscode.window.showWarningMessage(
-            'Ollama is enabled but ai-council.ollamaUrl is not set - this review would silently run without that seat. Configure it or turn Ollama off.',
+            'Ollama models are enabled but ai-council.ollamaUrl is not set - this review would silently run without those seats. Configure it or disable the Ollama models.',
             'Open Settings'
         );
         if (result === 'Open Settings') {
@@ -1239,12 +1250,16 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
     private _modelSeatGlobalArgs(modelConfig?: Partial<ReviewOptions>): string[] {
         const args: string[] = [];
         const config = vscode.workspace.getConfiguration('ai-council');
-        if (modelConfig?.enableOllama) {
+        // Support multiple Ollama models - each enabled model becomes a separate seat
+        const enabledOllamaModels = modelConfig?.enabledOllamaModels || [];
+        if (enabledOllamaModels.length > 0) {
             args.push('--ollama');
             const ollamaUrl = config.get<string>('ollamaUrl');
             if (ollamaUrl) { args.push('--ollama-url', ollamaUrl); }
-            const ollamaModel = config.get<string>('ollamaModel');
-            if (ollamaModel) { args.push('--ollama-model', ollamaModel); }
+            // Pass each enabled model as a separate --ollama-model argument
+            for (const model of enabledOllamaModels) {
+                args.push('--ollama-model', model);
+            }
         }
         if (modelConfig?.enableGptCli) { args.push('--gpt-cli'); }
         if (modelConfig?.enableClaudeCli) { args.push('--claude-cli'); }
@@ -1647,7 +1662,24 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         }
     }
 
-    private async _showStatus(toggles?: { gpt: boolean; claude: boolean; grok: boolean; gptCli?: boolean; claudeCli?: boolean; grokCli?: boolean; gemini: boolean; ollama: boolean }) {
+    private _sendOllamaModels() {
+        const config = vscode.workspace.getConfiguration('ai-council');
+        const ollamaModelsStr = config.get<string>('ollamaModels') || '';
+        // Parse comma-separated models, trim whitespace, filter empty
+        const models = ollamaModelsStr.split(',').map(m => m.trim()).filter(m => m.length > 0);
+        // Get saved enabled models from toggle states
+        const savedToggles = this._getToggleStates();
+        const enabledModels = savedToggles?.enabledOllamaModels || [];
+        if (this._view) {
+            this._view.webview.postMessage({
+                type: 'ollamaModels',
+                models: models,
+                enabledModels: enabledModels
+            });
+        }
+    }
+
+    private async _showStatus(toggles?: { gpt: boolean; claude: boolean; grok: boolean; gptCli?: boolean; claudeCli?: boolean; grokCli?: boolean; gemini: boolean; ollama: boolean; enabledOllamaModels?: string[] }) {
         const config = vscode.workspace.getConfiguration('ai-council');
         const pythonPath = config.get<string>('pythonPath') || 'python';
         const scriptPath = this._getScriptPath();
@@ -1668,7 +1700,8 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
 
         // Build args - global flags must come BEFORE the subcommand
         const ollamaUrl = config.get<string>('ollamaUrl');
-        const ollamaModel = config.get<string>('ollamaModel');
+        const ollamaModelsStr = config.get<string>('ollamaModels') || '';
+        const ollamaModelsList = ollamaModelsStr.split(',').map(m => m.trim()).filter(m => m.length > 0);
         let args = [scriptPath];
 
         // Add db path if available
@@ -1677,12 +1710,11 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         }
 
         // Add ollama flags BEFORE the subcommand (ollama is global)
-        if (ollamaUrl && apiKeys.OLLAMA_API_KEY) {
+        // Note: For status, we just check first model if available
+        if (ollamaUrl && ollamaModelsList.length > 0) {
             args.push('--ollama');
             args.push('--ollama-url', ollamaUrl);
-            if (ollamaModel) {
-                args.push('--ollama-model', ollamaModel);
-            }
+            args.push('--ollama-model', ollamaModelsList[0]);
         }
 
         // Add subcommand LAST
@@ -1699,8 +1731,12 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         if (toggles?.claudeCli) selectedReviewers.push('claude-cli');
         if (toggles?.grokCli) selectedReviewers.push('grok-cli');
         if (toggles?.gemini && apiKeys.GOOGLE_API_KEY) selectedReviewers.push('gemini');
-        if (toggles?.ollama && ollamaUrl && apiKeys.OLLAMA_API_KEY) {
-            selectedReviewers.push(`ollama (${ollamaModel || 'default'})`);
+        // Add enabled Ollama models
+        const enabledOllamaModels = toggles?.enabledOllamaModels || [];
+        if (enabledOllamaModels.length > 0 && ollamaUrl) {
+            enabledOllamaModels.forEach((model: string) => {
+                selectedReviewers.push(`ollama (${model})`);
+            });
         }
 
         // Wrap process in a promise
@@ -3656,12 +3692,9 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                         <span class="toggle-slider"></span>
                     </label>
                 </div>
-                <div class="toggle-item" id="toggle-enableOllama">
-                    <span class="toggle-label"><span class="model-name-text" data-standard="Ollama" data-power="Ollama">Ollama</span> <span class="model-badge badge-free">Self-hosted</span><span class="key-status" id="key-ollama" title="Ollama Server Status"></span></span>
-                    <label class="toggle-switch ollama">
-                        <input type="checkbox" id="enableOllama">
-                        <span class="toggle-slider"></span>
-                    </label>
+                <!-- Ollama models container - populated dynamically from comma-separated ollamaModels setting -->
+                <div id="ollamaModelsContainer">
+                    <!-- Dynamic Ollama model toggles inserted here -->
                 </div>
             </div>
             <div style="margin-top: 12px;">
@@ -3941,7 +3974,7 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
     <script>
         const vscode = acquireVsCodeApi();
 
-        // Model to API key mapping
+        // Model to API key mapping (non-Ollama seats - Ollama models are dynamic)
         const modelApiKeys = {
             'enableGpt': { name: 'GPT-4 API', key: 'openai', url: 'https://platform.openai.com/api-keys', kind: 'api' },
             'enableClaude': { name: 'Claude API', key: 'anthropic', url: 'https://console.anthropic.com/', kind: 'api' },
@@ -3949,12 +3982,27 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             'enableGptCli': { name: 'Codex CLI', key: 'openai', url: '', kind: 'cli' },
             'enableClaudeCli': { name: 'Claude CLI', key: 'anthropic', url: '', kind: 'cli' },
             'enableGrokCli': { name: 'Grok CLI', key: 'xai', url: '', kind: 'cli' },
-            'enableGemini': { name: 'Gemini', key: 'google', url: 'https://aistudio.google.com/app/apikey', free: true, kind: 'api' },
-            'enableOllama': { name: 'Ollama', key: 'ollama', url: '', free: true, kind: 'api' }
+            'enableGemini': { name: 'Gemini', key: 'google', url: 'https://aistudio.google.com/app/apikey', free: true, kind: 'api' }
         };
+
+        // Track available Ollama models (populated from settings)
+        let ollamaModels = [];
+
+        // Get enabled Ollama models from checkboxes
+        function getEnabledOllamaModels() {
+            const enabled = [];
+            ollamaModels.forEach(model => {
+                const el = document.getElementById('enableOllama_' + model.replace(/[^a-zA-Z0-9]/g, '_'));
+                if (el && el.checked) {
+                    enabled.push(model);
+                }
+            });
+            return enabled;
+        }
 
         // Save toggle states to persist across sessions
         function saveToggleStates() {
+            const enabledOllamaModels = getEnabledOllamaModels();
             const toggles = {
                 enableGpt: document.getElementById('enableGpt')?.checked || false,
                 enableClaude: document.getElementById('enableClaude')?.checked || false,
@@ -3963,10 +4011,66 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                 enableClaudeCli: document.getElementById('enableClaudeCli')?.checked || false,
                 enableGrokCli: document.getElementById('enableGrokCli')?.checked || false,
                 enableGemini: document.getElementById('enableGemini')?.checked || false,
-                enableOllama: document.getElementById('enableOllama')?.checked || false,
+                enableOllama: enabledOllamaModels.length > 0,  // Legacy compat
+                enabledOllamaModels: enabledOllamaModels,  // New: array of enabled model names
                 powerMode: document.getElementById('powerMode')?.checked || false
             };
             vscode.postMessage({ command: 'saveToggles', toggles: toggles });
+        }
+
+        // Populate Ollama model toggles from the comma-separated ollamaModels setting
+        function populateOllamaModels(models, enabledModels) {
+            ollamaModels = models;
+            const container = document.getElementById('ollamaModelsContainer');
+            if (!container) return;
+
+            if (models.length === 0) {
+                container.innerHTML = '<div class="toggle-item" style="opacity: 0.5;"><span class="toggle-label">No Ollama models configured</span></div>';
+                return;
+            }
+
+            container.innerHTML = models.map(model => {
+                const safeId = 'enableOllama_' + model.replace(/[^a-zA-Z0-9]/g, '_');
+                const displayName = model.length > 20 ? model.substring(0, 18) + '...' : model;
+                const isEnabled = enabledModels && enabledModels.includes(model);
+                return '<div class="toggle-item" id="toggle-' + safeId + '">' +
+                    '<span class="toggle-label"><span class="model-name-text">' + displayName + '</span> ' +
+                    '<span class="model-badge badge-free">Self-hosted</span>' +
+                    '<span class="key-status" id="key-' + safeId + '" title="Ollama Server Status"></span></span>' +
+                    '<label class="toggle-switch ollama">' +
+                    '<input type="checkbox" id="' + safeId + '"' + (isEnabled ? ' checked' : '') + '>' +
+                    '<span class="toggle-slider"></span>' +
+                    '</label></div>';
+            }).join('');
+
+            // Add event listeners for Ollama model toggles
+            models.forEach(model => {
+                const safeId = 'enableOllama_' + model.replace(/[^a-zA-Z0-9]/g, '_');
+                const toggle = document.getElementById(safeId);
+                if (toggle) {
+                    toggle.addEventListener('change', function() {
+                        if (this.checked) {
+                            // Check if Ollama URL is configured
+                            vscode.postMessage({
+                                command: 'checkApiKey',
+                                modelId: safeId,
+                                name: 'Ollama (' + model + ')',
+                                key: 'ollama',
+                                url: '',
+                                free: true,
+                                kind: 'api'
+                            });
+                        }
+                        saveToggleStates();
+                        refreshSeatSelects();
+                        const scopedPanel = document.getElementById('scopedReviewPanel');
+                        if (scopedPanel && scopedPanel.style.display === 'block') {
+                            refreshScopedPickers();
+                        }
+                        checkModelSelectionAutoOpen(getEnabledSeats());
+                    });
+                }
+            });
         }
 
         // Initialize immediately since script is at bottom of body (DOM is ready)
@@ -4037,6 +4141,7 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
         }
 
         function getModelConfig() {
+            const enabledOllamaModels = getEnabledOllamaModels();
             return {
                 enableGpt: document.getElementById('enableGpt').checked,
                 enableClaude: document.getElementById('enableClaude').checked,
@@ -4045,7 +4150,8 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                 enableClaudeCli: document.getElementById('enableClaudeCli')?.checked || false,
                 enableGrokCli: document.getElementById('enableGrokCli')?.checked || false,
                 enableGemini: document.getElementById('enableGemini').checked,
-                enableOllama: document.getElementById('enableOllama').checked,
+                enableOllama: enabledOllamaModels.length > 0,  // Legacy compat
+                enabledOllamaModels: enabledOllamaModels,  // Array of enabled model names
                 powerMode: document.getElementById('powerMode').checked,
                 synthesizer: document.getElementById('synthesizerSelect').value,
                 arbiter: document.getElementById('arbiterSelect')?.value || 'none'
@@ -4138,7 +4244,12 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             if (config.enableClaudeCli) enabledModels.push('Claude-CLI');
             if (config.enableGrokCli) enabledModels.push('Grok-CLI');
             if (config.enableGemini) enabledModels.push('Gemini');
-            if (config.enableOllama) enabledModels.push('Ollama');
+            // Add each enabled Ollama model
+            if (config.enabledOllamaModels && config.enabledOllamaModels.length > 0) {
+                config.enabledOllamaModels.forEach(function(model) {
+                    enabledModels.push('Ollama:' + model);
+                });
+            }
 
             if (enabledModels.length === 0) {
                 updateStatus('Enable at least one model!', false);
@@ -4502,7 +4613,12 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             if (config.enableClaudeCli) seats.push('claude-cli');
             if (config.enableGrokCli) seats.push('grok-cli');
             if (config.enableGemini) seats.push('gemini');
-            if (config.enableOllama) seats.push('ollama');
+            // Add each enabled Ollama model as a separate seat
+            if (config.enabledOllamaModels && config.enabledOllamaModels.length > 0) {
+                config.enabledOllamaModels.forEach(model => {
+                    seats.push('ollama:' + model);
+                });
+            }
             return seats;
         }
 
@@ -5091,7 +5207,7 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
 
         // Shared model display metadata - single source of truth for name/icon/class across
         // the review panel's cards and the scoped-review UI (writer picker, round rendering).
-        const MODEL_DISPLAY = {
+        const MODEL_DISPLAY_STATIC = {
             'gpt-4': { name: 'GPT-4 API', icon: 'G', class: 'gpt' },
             'claude': { name: 'Claude API', icon: 'C', class: 'claude' },
             'grok': { name: 'Grok API', icon: 'X', class: 'grok' },
@@ -5101,17 +5217,49 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
             'gemini': { name: 'Gemini', icon: 'G', class: 'gemini' },
             'ollama': { name: 'Ollama', icon: 'O', class: 'ollama' }
         };
+        // Dynamic MODEL_DISPLAY that handles ollama:modelname keys
+        function getModelDisplay(key) {
+            if (MODEL_DISPLAY_STATIC[key]) { return MODEL_DISPLAY_STATIC[key]; }
+            // Handle ollama:modelname format
+            if (key.startsWith('ollama:')) {
+                const modelName = key.substring(7);
+                const shortName = modelName.length > 15 ? modelName.substring(0, 13) + '...' : modelName;
+                return { name: 'Ollama: ' + shortName, icon: 'O', class: 'ollama' };
+            }
+            return { name: key, icon: '?', class: '' };
+        }
+        // For compatibility: MODEL_DISPLAY as a Proxy that handles dynamic ollama keys
+        const MODEL_DISPLAY = new Proxy(MODEL_DISPLAY_STATIC, {
+            get: function(target, prop) {
+                return getModelDisplay(String(prop));
+            }
+        });
 
         // getEnabledSeats()/the Review Options dropdowns use these short seat names (gpt-4,
         // gpt-cli, ...); the toggle checkbox ids modelToKey/toggle-<id>/.no-key are keyed on
         // (enableGpt, ...) are a DIFFERENT naming scheme for the same seats. This is the one
         // missing link between the two - everything else a "is this seat broken" check needs
         // (the no-key class, cliErrors) is already reachable from the checkbox id.
-        const SEAT_TO_TOGGLE_ID = {
+        const SEAT_TO_TOGGLE_ID_STATIC = {
             'gpt-4': 'enableGpt', 'claude': 'enableClaude', 'grok': 'enableGrok',
             'gpt-cli': 'enableGptCli', 'claude-cli': 'enableClaudeCli', 'grok-cli': 'enableGrokCli',
             'gemini': 'enableGemini', 'ollama': 'enableOllama',
         };
+        // Dynamic SEAT_TO_TOGGLE_ID that handles ollama:modelname keys
+        function getSeatToggleId(seat) {
+            if (SEAT_TO_TOGGLE_ID_STATIC[seat]) { return SEAT_TO_TOGGLE_ID_STATIC[seat]; }
+            // Handle ollama:modelname - map to the dynamic toggle ID
+            if (seat.startsWith('ollama:')) {
+                const modelName = seat.substring(7);
+                return 'enableOllama_' + modelName.replace(/[^a-zA-Z0-9]/g, '_');
+            }
+            return null;
+        }
+        const SEAT_TO_TOGGLE_ID = new Proxy(SEAT_TO_TOGGLE_ID_STATIC, {
+            get: function(target, prop) {
+                return getSeatToggleId(String(prop));
+            }
+        });
 
         // True if "seat" (a short seat name, e.g. "claude-cli") currently shows as broken: no
         // API key/URL configured (toggle-item.no-key, set by updateKeyStatus) or a CLI seat
@@ -5679,6 +5827,12 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                         clearCache();
                     }
                     break;
+                case 'ollamaModels':
+                    // Populate Ollama model toggles from settings (sent before restoreToggles)
+                    if (message.models) {
+                        populateOllamaModels(message.models, message.enabledModels || []);
+                    }
+                    break;
                 case 'restoreToggles':
                     // Restore saved toggle states
                     if (message.toggles) {
@@ -5690,7 +5844,6 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                             'enableClaudeCli': 'enableClaudeCli',
                             'enableGrokCli': 'enableGrokCli',
                             'enableGemini': 'enableGemini',
-                            'enableOllama': 'enableOllama',
                             'powerMode': 'powerMode'
                         };
                         for (const [key, id] of Object.entries(toggleMap)) {
@@ -5698,6 +5851,14 @@ export class AiCouncilSidebarProvider implements vscode.WebviewViewProvider {
                             if (el && message.toggles[key] !== undefined) {
                                 el.checked = message.toggles[key];
                             }
+                        }
+                        // Restore Ollama model toggles (dynamic IDs)
+                        if (message.toggles.enabledOllamaModels) {
+                            message.toggles.enabledOllamaModels.forEach(model => {
+                                const safeId = 'enableOllama_' + model.replace(/[^a-zA-Z0-9]/g, '_');
+                                const el = document.getElementById(safeId);
+                                if (el) { el.checked = true; }
+                            });
                         }
                         // Update power mode display
                         if (message.toggles.powerMode) {

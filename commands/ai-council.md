@@ -16,7 +16,6 @@ Run multi-model code review using GPT-4, Grok, Gemini, Ollama, and Claude (via y
 - `--synthesize` or `-s` - Generate AI Council Verdict (consensus synthesis)
 - `--synthesizer <model>` - Model for synthesis (claude, claude-cli, gpt-4, gpt-cli, gemini, grok, grok-cli, ollama)
 - `--output <path>` or `-o <path>` - Custom output path (default: `C:\AI COUNCIL\reports`)
-- `--no-claude-direct` - Skip Claude Code direct review (use API key instead)
 - `--scoped "<focus>"` - Run a scoped review with custom focus
 
 **Examples:**
@@ -39,22 +38,23 @@ When the user runs this skill:
 
 2. **Read the file content** so you can do the Claude review directly.
 
-3. **Run the Python script WITHOUT Claude** (other models use API keys):
+3. **Run the Python script with Claude CLI subscription:**
 
    **Script location:** `C:/AI COUNCIL/vscode-extension/ai_council.py`
 
    ```bash
-   python "C:/AI COUNCIL/vscode-extension/ai_council.py" [GLOBAL_FLAGS] review "<FILE_PATH>" --no-claude [OTHER_FLAGS]
+   python "C:/AI COUNCIL/vscode-extension/ai_council.py" --claude-cli [OTHER_GLOBAL_FLAGS] review "<FILE_PATH>" --html --output "C:/AI COUNCIL/reports" [OTHER_FLAGS]
    ```
 
-   **IMPORTANT:** Global flags (--ollama, --ollama-url, --ollama-model, --claude-cli, --gpt-cli, --grok-cli) must come BEFORE the "review" subcommand!
+   **IMPORTANT:** Global flags (--claude-cli, --ollama, --ollama-url, --ollama-model, --gpt-cli, --grok-cli) must come BEFORE the "review" subcommand!
 
    Build the command:
-   - Global flags (before "review"):
+   - Global flags (before "review") - ALWAYS include `--claude-cli`:
+     - Always add: `--claude-cli` (uses Claude subscription - FREE)
      - If ollama: add `--ollama`
      - If ollama-url: add `--ollama-url "<URL>"`
      - If ollama-model: add `--ollama-model "<MODEL>"`
-   - Then add: `review "<FILE_PATH>" --no-claude --html --output "C:/AI COUNCIL/reports"` (HTML always goes to standard reports folder)
+   - Then add: `review "<FILE_PATH>" --html --output "C:/AI COUNCIL/reports"`
    - Review flags (after file path):
      - If force: add `--force`
      - If gemini: add `--gemini`
@@ -62,31 +62,14 @@ When the user runs this skill:
      - If --no-html flag specified: remove `--html` from command
      - If synthesize: add `--synthesize`
      - If synthesizer: add `--synthesizer <MODEL>`
-     - If output path: add `--output "<PATH>"`
+     - If custom output path: replace `--output` value
 
    **For scoped reviews** (focused on specific concerns):
    ```bash
-   python "C:/AI COUNCIL/vscode-extension/ai_council.py" [GLOBAL_FLAGS] scoped-review "<FILE_PATH>" --scope "<FOCUS>" --no-claude --html --output "C:/AI COUNCIL/reports" [OTHER_FLAGS]
+   python "C:/AI COUNCIL/vscode-extension/ai_council.py" --claude-cli [OTHER_GLOBAL_FLAGS] scoped-review "<FILE_PATH>" --scope "<FOCUS>" --html --output "C:/AI COUNCIL/reports" [OTHER_FLAGS]
    ```
 
-4. **Perform Claude review directly** (uses your Claude subscription - FREE):
-
-   Review the file you read in step 2 using this prompt:
-
-   ```
-   Review this code file and provide a JSON response with:
-   - quality_score: 1-10
-   - summary: Brief overview of the code quality
-   - issues: Array of issues found, each with:
-     - severity: "critical", "high", "medium", "low", or "info"
-     - line: Line number (or null if general)
-     - description: What the issue is
-     - recommendation: How to fix it
-
-   Focus on: security vulnerabilities, bugs, performance issues, code quality, best practices.
-   ```
-
-5. **Present combined results:**
+4. **Present combined results:**
 
 ```
 ## AI Council Review: <filename>
@@ -97,13 +80,13 @@ When the user runs this skill:
 | Grok  | X/10 | N issues |
 | Gemini | X/10 | N issues |  (if --gemini)
 | Ollama | X/10 | N issues |  (if --ollama)
-| Claude | X/10 | N issues |  (via subscription)
+| Claude | X/10 | N issues |  (via CLI subscription - FREE)
 
 ### Consensus Issues (High Confidence)
 Issues flagged by multiple models - prioritize fixing these!
 
-### Claude Review (Your Subscription)
-[Your direct review findings here]
+### Claude Insights
+[From Python script output - uses CLI subscription]
 
 ### GPT-4 Insights
 [From Python script output]
@@ -121,7 +104,7 @@ Issues flagged by multiple models - prioritize fixing these!
 HTML Report: <path>
 ```
 
-6. **Offer to fix issues:**
+5. **Offer to fix issues:**
    After showing results, ask: "Would you like me to address any of these issues?"
 
 ---
@@ -146,7 +129,7 @@ The AI Council supports additional workflow commands:
 
 | Model | Cost | Source |
 |-------|------|--------|
-| Claude | **FREE** | Your Claude subscription (direct) |
+| Claude | **FREE** | CLI subscription (`claude` binary) |
 | GPT-4 | ~$0.03 | API key |
 | Grok | ~$0.02 | API key |
 | Gemini | FREE | API key (free tier) |
@@ -158,9 +141,10 @@ The AI Council supports additional workflow commands:
 
 ## Notes
 
-- **Claude is FREE** when using this skill - it uses your Claude Code subscription directly
-- Other models still require API keys (GPT-4, Grok) or are free (Gemini, Ollama)
-- Use `--no-claude-direct` flag if you want to use Claude API key instead
+- **Claude is FREE** - uses `--claude-cli` flag which runs via your `claude` CLI subscription
+- GPT-4 and Grok require API keys (`OPENAI_API_KEY`, `XAI_API_KEY`)
+- Gemini and Ollama are free (API key for Gemini, self-hosted for Ollama)
+- To use Claude API instead of CLI subscription, remove `--claude-cli` from the command
 - Reviews are cached by file hash - unchanged files return cached results instantly
 - Use `--force` to bypass cache and get fresh reviews
 
